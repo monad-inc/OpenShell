@@ -126,6 +126,21 @@ data:
     {{- end }}
     {{- end }}
 
+    {{- if .Values.server.otlp.endpoint }}
+
+    [openshell.gateway.otlp]
+    endpoint          = {{ .Values.server.otlp.endpoint | quote }}
+    {{- if .Values.server.otlp.serviceName }}
+    service_name      = {{ .Values.server.otlp.serviceName | quote }}
+    {{- end }}
+    {{- if .Values.server.otlp.exportLogs }}
+    export_logs       = true
+    {{- end }}
+    {{- if .Values.server.otlp.ocsfFullPayload }}
+    ocsf_full_payload = true
+    {{- end }}
+    {{- end }}
+
     [openshell.drivers.kubernetes]
     grpc_endpoint                = {{ include "openshell.grpcEndpoint" . | quote }}
     service_account_name         = {{ include "openshell.sandboxServiceAccountName" . | quote }}

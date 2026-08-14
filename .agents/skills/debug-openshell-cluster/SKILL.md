@@ -130,6 +130,18 @@ Inspect sandbox OCSF configuration and finding events for the validation
 rationale, configured and effective modes, active generation, and the explicit
 `previous_policy_active` state.
 
+OpenTelemetry export is diagnostic and never blocks startup or serving. The
+`[openshell.gateway.otlp]` table (Helm `server.otlp.*`) decides whether and
+where to export; `endpoint` is required, `export_logs = true` additionally ships
+logs and OCSF events as OTLP log records, and `ocsf_full_payload` carries
+structured OCSF fields. A malformed endpoint or unreachable collector only logs
+an error and disables export — check gateway logs for OTLP export failures
+rather than expecting a startup crash.
+
+```shell
+rg -n 'otlp|endpoint|export_logs' /etc/openshell/gateway.toml
+```
+
 ### Step 4: Check Docker-Backed Gateways
 
 ```bash

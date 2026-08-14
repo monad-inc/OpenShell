@@ -203,14 +203,16 @@ Local Docker, Podman, and VM gateways can also set `[openshell.gateway.mtls_auth
 
 ## OTLP Export
 
-`[openshell.gateway.otlp]` enables OpenTelemetry export over OTLP/gRPC. Omit the table to disable export; there is no separate `enabled` flag.
+`[openshell.gateway.otlp]` enables OpenTelemetry export over OTLP/gRPC. Omit the table to disable export; there is no separate `enabled` flag. The table's presence enables **trace** export. **Log** export is opt-in on the same endpoint through `export_logs`.
 
-The gateway already uses the Rust `tracing` framework for structured logs sent to stdout and the sandbox log stream. Enabling this section adds an OpenTelemetry layer to the same tracing subscriber. It exports span trees to an OTLP collector without exporting, replacing, or redirecting the existing log events.
+The gateway already uses the Rust `tracing` framework for structured logs sent to stdout and the sandbox log stream. Enabling this section adds OpenTelemetry layers to the same tracing subscriber. It exports span trees to an OTLP collector without replacing or redirecting the existing log events. Set `export_logs` to additionally ship those logs — the gateway's own events and the log lines pushed from every sandbox, including OCSF security events — as OTLP log records to the same collector.
 
 ```toml
 [openshell.gateway.otlp]
-endpoint     = "http://otel-collector.observability.svc:4317"
-service_name = "openshell-gateway"
+endpoint          = "http://otel-collector.observability.svc:4317"
+service_name      = "openshell-gateway"
+export_logs       = true    # also export logs/OCSF as OTLP log records (default false)
+ocsf_full_payload = false   # carry structured OCSF fields on exported records
 ```
 
 `endpoint` is required and must be a valid URI. If it is malformed, the gateway logs the configuration error and continues with export disabled. It does not connect at startup: an unreachable collector produces export failures, never a failure to serve.
@@ -221,9 +223,15 @@ The OpenTelemetry SDK logs export failures after startup. Spans in a failed batc
 
 `service_name` sets the gateway's `service.name` resource attribute and defaults to `openshell-gateway`. The gateway also reports `service.version`.
 
-Only OpenTelemetry traces are exported. Inbound gRPC and HTTP requests produce server spans named for the RPC or HTTP method. Store and compute-driver operations appear as child spans. Internal reconciliation, credential-refresh, and driver-watch loops create operation roots for their store work because no inbound request supplies a parent. The gateway continues valid W3C `traceparent` context and starts a new trace when none is supplied. Request spans carry `method`, `path`, and the `request_id` that also appears in gateway logs. Health endpoint spans use DEBUG level and are not exported by the default INFO filter.
+By default only OpenTelemetry traces are exported. Inbound gRPC and HTTP requests produce server spans named for the RPC or HTTP method. Store and compute-driver operations appear as child spans. Internal reconciliation, credential-refresh, and driver-watch loops create operation roots for their store work because no inbound request supplies a parent. The gateway continues valid W3C `traceparent` context and starts a new trace when none is supplied. Request spans carry `method`, `path`, and the `request_id` that also appears in gateway logs. Health endpoint spans use DEBUG level and are not exported by the default INFO filter.
 
 The gateway forwards the OTLP configuration to managed external drivers. Each driver exports under its own service name.
+
+### Log export
+
+`export_logs` ships the gateway's aggregated log stream — its own `tracing` events and the log lines pushed from every sandbox — to the collector as OTLP log records, one record per line, on the same endpoint and resource identity as traces. It is off by default. Each record carries `sandbox.id`, `log.source`, `log.target`, `log.level`, and `log.ocsf` attributes; OCSF security events appear with `log.ocsf` set to `true`. Export is diagnostic like traces: records queue in memory and drain to the collector, and export failures never stop the gateway. Buffered records flush on `SIGTERM`.
+
+`ocsf_full_payload` carries the structured OCSF fields on exported records rather than only the human-readable summary. It has no effect unless `export_logs` is set, and it increases per-record size, so leave it off unless the collector or SIEM consumes the OCSF schema directly.
 
 ### Tuning
 

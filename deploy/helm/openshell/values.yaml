@@ -370,6 +370,22 @@ server:
     # issuer uses a non-public CA (e.g. OpenShift ingress, private PKI).
     caConfigMapName: ""
 
+  # OpenTelemetry export over OTLP/gRPC. Renders the [openshell.gateway.otlp]
+  # table only when endpoint is set.
+  otlp:
+    # -- OTLP/gRPC collector endpoint (e.g.
+    # http://otel-collector.observability.svc:4317). Empty disables all
+    # OpenTelemetry export.
+    endpoint: ""
+    # -- `service.name` resource attribute. Empty defaults to "openshell-gateway".
+    serviceName: ""
+    # -- Also export the gateway's aggregated logs and OCSF security events as
+    # OTLP log records, in addition to traces. Requires endpoint.
+    exportLogs: false
+    # -- Carry structured OCSF fields on exported log records rather than only
+    # the human-readable summary. No effect unless exportLogs is true.
+    ocsfFullPayload: false
+
 # NetworkPolicy restricting SSH ingress on sandbox pods to the gateway only.
 networkPolicy:
   # -- Create a NetworkPolicy restricting SSH ingress on sandbox pods to the gateway.
