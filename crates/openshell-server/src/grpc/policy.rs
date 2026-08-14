@@ -3271,7 +3271,11 @@ pub(super) async fn handle_push_sandbox_logs(
         )
         .await?;
 
-        for log in batch.logs.into_iter().take(100) {
+        // Ingest the whole batch — no silent truncation. The sandbox bounds
+        // each batch it sends (≤50 lines, ≤200 on reconnect flush), so this is
+        // memory-safe, and dropping security telemetry here would defeat the
+        // reliability guarantee the export pipeline exists to provide.
+        for log in batch.logs {
             let mut log = log;
             log.source = "sandbox".to_string();
             log.sandbox_id.clone_from(&batch.sandbox_id);

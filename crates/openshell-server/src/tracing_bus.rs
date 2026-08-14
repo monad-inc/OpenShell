@@ -4,7 +4,7 @@
 //! Capture openshell-server tracing logs for streaming over gRPC.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use openshell_core::proto::{SandboxLogLine, SandboxStreamEvent};
 use openshell_ocsf::OCSF_TARGET;
@@ -18,6 +18,9 @@ use tracing_subscriber::layer::Context;
 pub struct TracingLogBus {
     inner: Arc<Mutex<Inner>>,
     pub(crate) platform_event_bus: PlatformEventBus,
+    /// Off-box OTLP log export sink. Installed once at startup when
+    /// `[openshell.gateway.otlp] export_logs` is set; `None` disables export.
+    export: Arc<OnceLock<crate::log_export::LogExportHandle>>,
 }
 
 #[derive(Debug)]
@@ -41,7 +44,17 @@ impl TracingLogBus {
                 tails: HashMap::new(),
             })),
             platform_event_bus: PlatformEventBus::new(),
+            export: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// Install the off-box log-export sink.
+    ///
+    /// Every log line published after this call is forwarded for OTLP export in
+    /// addition to the in-memory tail/broadcast used by the CLI/TUI. Idempotent:
+    /// the first handle installed wins.
+    pub(crate) fn set_export(&self, handle: crate::log_export::LogExportHandle) {
+        let _ = self.export.set(handle);
     }
 
     pub(crate) fn layer<S: Subscriber>(&self) -> impl Layer<S> {
@@ -107,6 +120,16 @@ impl TracingLogBus {
     const DEFAULT_TAIL: usize = 2000;
 
     fn publish(&self, sandbox_id: &str, event: SandboxStreamEvent, tail_cap: usize) {
+        // Tap for off-box export: forward log payloads (gateway-origin and
+        // sandbox-pushed alike, since both reach the bus through here) into the
+        // non-dropping export queue before they enter the bounded in-memory tail.
+        if let Some(export) = self.export.get()
+            && let Some(openshell_core::proto::sandbox_stream_event::Payload::Log(log)) =
+                &event.payload
+        {
+            export.enqueue(log.clone());
+        }
+
         let tx = self.sender_for(sandbox_id);
         let _ = tx.send(event.clone());
 

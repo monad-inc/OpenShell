@@ -34,6 +34,7 @@ mod gateway_listener;
 mod grpc;
 mod http;
 mod inference;
+mod log_export;
 mod middleware;
 mod multiplex;
 mod otel_tracing;

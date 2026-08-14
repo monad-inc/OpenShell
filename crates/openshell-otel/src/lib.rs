@@ -4,9 +4,12 @@
 //! Shared OpenTelemetry trace export support for `OpenShell` services.
 
 mod grpc;
+mod logs;
 mod propagation;
 
 pub use grpc::RecordGrpcFailure;
+pub use logs::{OtlpLogConfig, build_log_provider, log_provider_for, logger};
+pub use opentelemetry_sdk::logs::SdkLoggerProvider;
 pub use propagation::{HeaderMapExtractor, MetadataMapInjector, TraceContextInterceptor};
 
 use opentelemetry::KeyValue;

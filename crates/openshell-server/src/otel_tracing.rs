@@ -86,6 +86,19 @@ pub fn provider_for(cfg: Option<&OtlpConfig>) -> (Option<SdkTracerProvider>, Opt
     openshell_otel::provider_for(cfg.map(trace_config))
 }
 
+/// Resolve the OTLP **log** provider for a gateway config.
+///
+/// Returns `None` unless the `[openshell.gateway.otlp]` table is present *and*
+/// `export_logs` is set — log export is opt-in on top of the same endpoint the
+/// tracer uses. Like [`provider_for`], a broken exporter never stops the
+/// gateway; the error is returned for the caller to report.
+pub fn log_provider_for(
+    cfg: Option<&OtlpConfig>,
+) -> (Option<openshell_otel::SdkLoggerProvider>, Option<SetupError>) {
+    let cfg = cfg.filter(|c| c.export_logs);
+    openshell_otel::log_provider_for(cfg.map(trace_config))
+}
+
 /// Build the `tracing` layer that forwards spans to `provider`.
 ///
 /// Events stay on the gateway's logging layers. Spans emitted by the
@@ -250,6 +263,8 @@ mod tests {
         OtlpConfig {
             endpoint: "http://127.0.0.1:4317".into(),
             service_name: None,
+            export_logs: false,
+            ocsf_full_payload: false,
         }
     }
 

@@ -24,6 +24,9 @@ tower-http = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+# `testing` exposes the in-memory span/log exporters the unit tests build
+# against, so the crate is self-testable without workspace feature unification.
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 
 [lints]
 workspace = true

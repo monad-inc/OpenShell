@@ -7,6 +7,9 @@
 //! channel to a background task. The task batches lines and streams them to
 //! the server using the `PushSandboxLogs` client-streaming RPC.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use openshell_core::grpc_client::CachedOpenShellClient;
 use openshell_core::proto::{PushSandboxLogsRequest, SandboxLogLine};
 use tokio::sync::mpsc;
@@ -14,27 +17,83 @@ use tracing::{Event, Subscriber};
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
 
+/// Default upper bound on how long an event may block waiting for queue space
+/// before it is accounted as a dropped line. Overridable via
+/// `OPENSHELL_LOG_PUSH_BLOCK_MS`.
+const DEFAULT_BLOCK_TIMEOUT_MS: u64 = 25;
+
+/// Poll interval while blocking for queue space.
+const ENQUEUE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(2);
+
 /// Tracing layer that pushes log events to the `OpenShell` server.
 ///
-/// Events are sent best-effort via `try_send` — if the channel is full the
-/// event is dropped. Logging must never block the sandbox.
+/// Delivery is reliable-with-accounting rather than silently best-effort: an
+/// event first tries the queue without blocking, and if the queue is full it
+/// blocks briefly (bounded by `block_timeout`) before giving up. A give-up
+/// increments a shared drop counter that the push task drains into an
+/// accounted `telemetry_gap` event, so security telemetry is never lost
+/// silently. Blocking is bounded because `on_event` must never hang the
+/// sandbox.
 #[derive(Clone)]
 pub struct LogPushLayer {
     sandbox_id: String,
     tx: mpsc::Sender<SandboxLogLine>,
     max_level: tracing::Level,
+    block_timeout: std::time::Duration,
+    dropped: Arc<AtomicU64>,
 }
 
 impl LogPushLayer {
-    pub fn new(sandbox_id: String, tx: mpsc::Sender<SandboxLogLine>) -> Self {
+    pub fn new(
+        sandbox_id: String,
+        tx: mpsc::Sender<SandboxLogLine>,
+        dropped: Arc<AtomicU64>,
+    ) -> Self {
         let max_level = std::env::var("OPENSHELL_LOG_PUSH_LEVEL")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(tracing::Level::INFO);
+        let block_timeout = std::env::var("OPENSHELL_LOG_PUSH_BLOCK_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .map_or(
+                std::time::Duration::from_millis(DEFAULT_BLOCK_TIMEOUT_MS),
+                |ms: u64| std::time::Duration::from_millis(ms),
+            );
         Self {
             sandbox_id,
             tx,
             max_level,
+            block_timeout,
+            dropped,
+        }
+    }
+
+    /// Enqueue a line: fast non-blocking attempt, then a bounded block, then an
+    /// accounted drop. Never blocks longer than `block_timeout`.
+    fn enqueue(&self, line: SandboxLogLine) {
+        let mut line = match self.tx.try_send(line) {
+            Ok(()) => return,
+            Err(mpsc::error::TrySendError::Full(line)) => line,
+            Err(mpsc::error::TrySendError::Closed(_)) => return,
+        };
+
+        // `on_event` is synchronous and may run on a runtime worker, so we
+        // bound-block this thread instead of awaiting.
+        let deadline = std::time::Instant::now() + self.block_timeout;
+        loop {
+            std::thread::sleep(ENQUEUE_RETRY_INTERVAL);
+            match self.tx.try_send(line) {
+                Ok(()) => return,
+                Err(mpsc::error::TrySendError::Closed(_)) => return,
+                Err(mpsc::error::TrySendError::Full(unsent)) => {
+                    if std::time::Instant::now() >= deadline {
+                        self.dropped.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                    line = unsent;
+                }
+            }
         }
     }
 }
@@ -84,25 +143,64 @@ impl<S: Subscriber> Layer<S> for LogPushLayer {
             fields,
         };
 
-        // Best-effort: drop if the channel is full (don't block tracing).
-        let _ = self.tx.try_send(log);
+        // Reliable-with-accounting: try, block briefly, then count the drop so
+        // the push task can emit an accounted `telemetry_gap`.
+        self.enqueue(log);
     }
 }
 
 /// Spawn a background task that batches and pushes log lines to the server.
 ///
-/// Returns the sender half of the channel (for the [`LogPushLayer`]) and the
-/// task handle. The task runs until the sender is dropped or the gRPC stream
-/// breaks.
+/// Returns the sender half of the channel (for the [`LogPushLayer`]), the
+/// shared drop counter (also for the layer), and the task handle. The task runs
+/// until the sender is dropped or the gRPC stream breaks.
 pub fn spawn_log_push_task(
     endpoint: String,
     sandbox_id: String,
-) -> (mpsc::Sender<SandboxLogLine>, tokio::task::JoinHandle<()>) {
+) -> (
+    mpsc::Sender<SandboxLogLine>,
+    Arc<AtomicU64>,
+    tokio::task::JoinHandle<()>,
+) {
     let (tx, rx) = mpsc::channel::<SandboxLogLine>(1024);
+    let dropped = Arc::new(AtomicU64::new(0));
 
-    let handle = tokio::spawn(run_push_loop(endpoint, sandbox_id, rx));
+    let handle = tokio::spawn(run_push_loop(
+        endpoint,
+        sandbox_id,
+        rx,
+        Arc::clone(&dropped),
+    ));
 
-    (tx, handle)
+    (tx, dropped, handle)
+}
+
+/// Build an accounted `telemetry_gap` line describing lines dropped under
+/// backpressure since the last report. The push task injects this directly into
+/// its outbound batch, bypassing the congested channel that caused the drops.
+fn telemetry_gap_line(sandbox_id: &str, dropped: u64) -> SandboxLogLine {
+    let mut fields = std::collections::HashMap::new();
+    fields.insert("dropped".to_string(), dropped.to_string());
+    SandboxLogLine {
+        sandbox_id: sandbox_id.to_string(),
+        timestamp_ms: openshell_core::time::now_ms(),
+        level: "WARN".to_string(),
+        target: "telemetry_gap".to_string(),
+        message: format!(
+            "telemetry gap: {dropped} sandbox log line(s) dropped under backpressure"
+        ),
+        source: "sandbox".to_string(),
+        fields,
+    }
+}
+
+/// If any lines were dropped since the last check, reset the counter and push a
+/// single accounted gap line onto `batch`.
+fn record_gap_if_any(sandbox_id: &str, dropped: &AtomicU64, batch: &mut Vec<SandboxLogLine>) {
+    let n = dropped.swap(0, Ordering::Relaxed);
+    if n > 0 {
+        batch.push(telemetry_gap_line(sandbox_id, n));
+    }
 }
 
 /// Maximum backoff delay between reconnection attempts.
@@ -114,6 +212,7 @@ async fn run_push_loop(
     endpoint: String,
     sandbox_id: String,
     mut rx: mpsc::Receiver<SandboxLogLine>,
+    dropped: Arc<AtomicU64>,
 ) {
     let mut batch = Vec::with_capacity(50);
     let mut backoff = INITIAL_BACKOFF;
@@ -192,7 +291,8 @@ async fn run_push_loop(
                 line = rx.recv() => {
                     let Some(line) = line else {
                         // Tracing layer dropped — sandbox is shutting down.
-                        // Flush remaining and exit entirely.
+                        // Flush remaining (including any final gap) and exit.
+                        record_gap_if_any(&sandbox_id, &dropped, &mut batch);
                         if !batch.is_empty() {
                             let lines = std::mem::take(&mut batch);
                             let _ = push_tx.send(PushSandboxLogsRequest {
@@ -214,6 +314,9 @@ async fn run_push_loop(
                     }
                 }
                 _ = timer.tick() => {
+                    // Report any backpressure drops as an accounted gap line on
+                    // the periodic flush, even while the channel is congested.
+                    record_gap_if_any(&sandbox_id, &dropped, &mut batch);
                     if !batch.is_empty() {
                         let lines = std::mem::take(&mut batch);
                         if push_tx.send(PushSandboxLogsRequest {
@@ -307,5 +410,83 @@ impl tracing::field::Visit for LogVisitor {
             self.fields
                 .push((field.name().to_string(), format!("{value:?}")));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_line() -> SandboxLogLine {
+        SandboxLogLine {
+            sandbox_id: "sb-1".to_string(),
+            timestamp_ms: 1,
+            level: "INFO".to_string(),
+            target: "t".to_string(),
+            message: "m".to_string(),
+            source: "sandbox".to_string(),
+            fields: std::collections::HashMap::new(),
+        }
+    }
+
+    fn test_layer(tx: mpsc::Sender<SandboxLogLine>, dropped: Arc<AtomicU64>) -> LogPushLayer {
+        LogPushLayer {
+            sandbox_id: "sb-1".to_string(),
+            tx,
+            max_level: tracing::Level::INFO,
+            block_timeout: std::time::Duration::from_millis(5),
+            dropped,
+        }
+    }
+
+    #[test]
+    fn telemetry_gap_line_carries_count() {
+        let line = telemetry_gap_line("sb-1", 7);
+        assert_eq!(line.target, "telemetry_gap");
+        assert_eq!(line.level, "WARN");
+        assert_eq!(line.source, "sandbox");
+        assert_eq!(line.fields.get("dropped").map(String::as_str), Some("7"));
+    }
+
+    #[test]
+    fn record_gap_resets_counter_and_pushes_once() {
+        let dropped = AtomicU64::new(3);
+        let mut batch = Vec::new();
+        record_gap_if_any("sb-1", &dropped, &mut batch);
+        assert_eq!(batch.len(), 1);
+        assert_eq!(dropped.load(Ordering::Relaxed), 0);
+        // Nothing dropped since — no additional gap line.
+        record_gap_if_any("sb-1", &dropped, &mut batch);
+        assert_eq!(batch.len(), 1);
+    }
+
+    #[test]
+    fn enqueue_delivers_when_space_available() {
+        let (tx, mut rx) = mpsc::channel::<SandboxLogLine>(1);
+        let dropped = Arc::new(AtomicU64::new(0));
+        test_layer(tx, Arc::clone(&dropped)).enqueue(sample_line());
+        assert_eq!(dropped.load(Ordering::Relaxed), 0);
+        assert!(rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn enqueue_accounts_drop_when_full() {
+        let (tx, _rx) = mpsc::channel::<SandboxLogLine>(1);
+        tx.try_send(sample_line()).expect("fill the single slot");
+        let dropped = Arc::new(AtomicU64::new(0));
+        // Receiver is held but never drains, so the block times out and the
+        // line is accounted as a drop rather than silently discarded.
+        test_layer(tx, Arc::clone(&dropped)).enqueue(sample_line());
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn enqueue_on_closed_channel_is_silent_noop() {
+        let (tx, rx) = mpsc::channel::<SandboxLogLine>(1);
+        drop(rx);
+        let dropped = Arc::new(AtomicU64::new(0));
+        // A closed channel means shutdown, not backpressure — not a gap.
+        test_layer(tx, Arc::clone(&dropped)).enqueue(sample_line());
+        assert_eq!(dropped.load(Ordering::Relaxed), 0);
     }
 }
