@@ -73,9 +73,10 @@ impl LogPushLayer {
     /// accounted drop. Never blocks longer than `block_timeout`.
     fn enqueue(&self, line: SandboxLogLine) {
         let mut line = match self.tx.try_send(line) {
-            Ok(()) => return,
+            // A closed receiver means export has shut down; drop silently
+            // rather than account it as a gap.
+            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => return,
             Err(mpsc::error::TrySendError::Full(line)) => line,
-            Err(mpsc::error::TrySendError::Closed(_)) => return,
         };
 
         // `on_event` is synchronous and may run on a runtime worker, so we
@@ -84,8 +85,7 @@ impl LogPushLayer {
         loop {
             std::thread::sleep(ENQUEUE_RETRY_INTERVAL);
             match self.tx.try_send(line) {
-                Ok(()) => return,
-                Err(mpsc::error::TrySendError::Closed(_)) => return,
+                Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => return,
                 Err(mpsc::error::TrySendError::Full(unsent)) => {
                     if std::time::Instant::now() >= deadline {
                         self.dropped.fetch_add(1, Ordering::Relaxed);
@@ -186,9 +186,7 @@ fn telemetry_gap_line(sandbox_id: &str, dropped: u64) -> SandboxLogLine {
         timestamp_ms: openshell_core::time::now_ms(),
         level: "WARN".to_string(),
         target: "telemetry_gap".to_string(),
-        message: format!(
-            "telemetry gap: {dropped} sandbox log line(s) dropped under backpressure"
-        ),
+        message: format!("telemetry gap: {dropped} sandbox log line(s) dropped under backpressure"),
         source: "sandbox".to_string(),
         fields,
     }

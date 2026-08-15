@@ -219,6 +219,14 @@ ocsf_full_payload = false   # carry structured OCSF fields on exported records
 
 The transport is **OTLP over gRPC only**. HTTP/protobuf and HTTP/JSON are not supported, and `OTEL_EXPORTER_OTLP_PROTOCOL` has no effect. Point `endpoint` at a collector's gRPC receiver, conventionally port `4317`, not the HTTP receiver on `4318`. A URI alone cannot distinguish the two, so an HTTP endpoint is accepted at startup and then fails on export.
 
+An `https://` endpoint exports over TLS, so a hosted collector can be named directly without a local relay. The gateway verifies the collector against public roots compiled into the binary rather than the host trust store, so it behaves the same on a minimal image as on a full distribution. A collector fronted by a private CA is not reachable over `https://`; put a local collector in front of it instead. Use `http://` for plaintext collectors.
+
+Send per-collector credentials as gRPC metadata through `OTEL_EXPORTER_OTLP_HEADERS`, which applies to both the trace and log streams:
+
+```shell
+OTEL_EXPORTER_OTLP_HEADERS="authorization=Bearer <token>"
+```
+
 The OpenTelemetry SDK logs export failures after startup. Spans in a failed batch are dropped rather than retried.
 
 `service_name` sets the gateway's `service.name` resource attribute and defaults to `openshell-gateway`. The gateway also reports `service.version`.

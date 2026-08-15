@@ -94,7 +94,10 @@ pub fn provider_for(cfg: Option<&OtlpConfig>) -> (Option<SdkTracerProvider>, Opt
 /// gateway; the error is returned for the caller to report.
 pub fn log_provider_for(
     cfg: Option<&OtlpConfig>,
-) -> (Option<openshell_otel::SdkLoggerProvider>, Option<SetupError>) {
+) -> (
+    Option<openshell_otel::SdkLoggerProvider>,
+    Option<SetupError>,
+) {
     let cfg = cfg.filter(|c| c.export_logs);
     openshell_otel::log_provider_for(cfg.map(trace_config))
 }

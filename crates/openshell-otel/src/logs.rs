@@ -16,10 +16,10 @@
 //! OCSF attributes) and control delivery accounting.
 
 use opentelemetry::logs::LoggerProvider as _;
-use opentelemetry_otlp::{LogExporter, WithExportConfig as _};
+use opentelemetry_otlp::{LogExporter, WithExportConfig as _, WithTonicConfig as _};
 use opentelemetry_sdk::logs::SdkLoggerProvider;
 
-use crate::{OtlpTraceConfig, SetupError, resource_for};
+use crate::{OtlpTraceConfig, SetupError, resource_for, tls_config_for, validated_endpoint};
 
 /// Inputs for an OTLP/gRPC log provider.
 ///
@@ -33,21 +33,13 @@ pub type OtlpLogConfig<'a> = OtlpTraceConfig<'a>;
 /// current reactor as it is constructed. It does not connect — an unreachable
 /// collector produces export failures, never a construction failure.
 pub fn build_log_provider(config: &OtlpLogConfig<'_>) -> Result<SdkLoggerProvider, SetupError> {
-    let endpoint = config.endpoint.trim();
-    if endpoint.is_empty() {
-        return Err(SetupError::EmptyEndpoint);
-    }
-    endpoint
-        .parse::<http::Uri>()
-        .map_err(|source| SetupError::InvalidEndpoint {
-            endpoint: endpoint.to_string(),
-            source,
-        })?;
+    let (endpoint, uri) = validated_endpoint(config.endpoint)?;
 
-    let exporter = LogExporter::builder()
-        .with_tonic()
-        .with_endpoint(endpoint)
-        .build()?;
+    let mut builder = LogExporter::builder().with_tonic().with_endpoint(endpoint);
+    if let Some(tls_config) = tls_config_for(&uri) {
+        builder = builder.with_tls_config(tls_config);
+    }
+    let exporter = builder.build()?;
 
     Ok(SdkLoggerProvider::builder()
         .with_batch_exporter(exporter)
@@ -112,6 +104,19 @@ mod tests {
         provider.force_flush().unwrap();
         let emitted = exporter.get_emitted_logs().unwrap();
         assert_eq!(emitted.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn https_endpoint_builds_a_log_provider_with_public_roots() {
+        let (provider, error) = log_provider_for(Some(OtlpLogConfig {
+            endpoint: "https://collector.example.com:4317",
+            service_name: ServiceName::Fixed("openshell-gateway"),
+            service_version: None,
+            resource_attributes: Vec::new(),
+        }));
+
+        assert!(error.is_none(), "unexpected setup error: {error:?}");
+        assert!(provider.is_some());
     }
 
     #[tokio::test]

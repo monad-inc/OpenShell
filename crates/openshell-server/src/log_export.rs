@@ -70,7 +70,7 @@ fn emit_line(logger: &SdkLogger, line: &SandboxLogLine, ocsf_full_payload: bool)
     record.set_body(AnyValue::String(line.message.clone().into()));
 
     if line.timestamp_ms > 0 {
-        record.set_timestamp(UNIX_EPOCH + Duration::from_millis(line.timestamp_ms as u64));
+        record.set_timestamp(UNIX_EPOCH + Duration::from_millis(line.timestamp_ms.cast_unsigned()));
     }
 
     record.add_attribute(Key::from_static_str("sandbox.id"), line.sandbox_id.clone());
@@ -94,7 +94,7 @@ fn emit_line(logger: &SdkLogger, line: &SandboxLogLine, ocsf_full_payload: bool)
     logger.emit(record);
 }
 
-/// Map an OpenShell log level string onto an OTLP severity number.
+/// Map an `OpenShell` log level string onto an OTLP severity number.
 fn severity_of(level: &str) -> Severity {
     match level {
         "TRACE" => Severity::Trace,
@@ -110,6 +110,7 @@ fn severity_of(level: &str) -> Severity {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn severity_mapping_covers_known_levels() {
@@ -141,7 +142,7 @@ mod tests {
             target: "test".into(),
             message: "hello".into(),
             source: "sandbox".into(),
-            fields: Default::default(),
+            fields: HashMap::default(),
         });
     }
 }
