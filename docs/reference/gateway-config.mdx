@@ -241,6 +241,17 @@ The gateway forwards the OTLP configuration to managed external drivers. Each dr
 
 `ocsf_full_payload` carries the structured OCSF fields on exported records rather than only the human-readable summary. It has no effect unless `export_logs` is set, and it increases per-record size, so leave it off unless the collector or SIEM consumes the OCSF schema directly.
 
+Sandboxes push OCSF events with the schema flattened into dotted `ocsf.*` attributes alongside the rendered summary, so a SIEM can match a field instead of pattern-matching the line:
+
+```text
+ocsf.class_uid          4001
+ocsf.severity_id        3
+ocsf.dst_endpoint.port  443
+ocsf.actor.process.name curl
+```
+
+Nested objects join with `.`, arrays of scalars join with `,` on one key, arrays of objects are indexed (`ocsf.affected.0.name`), absent fields are omitted rather than exported empty, and a single value is truncated at 256 characters. `severity_id` also sets the record's OTLP severity, so denials and findings outrank routine events regardless of this flag.
+
 ### Tuning
 
 This table decides whether and where to export. How the SDK exports is controlled by the standard OpenTelemetry environment variables, which the gateway reads through the SDK rather than mirroring as TOML keys:

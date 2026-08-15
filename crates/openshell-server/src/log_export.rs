@@ -18,6 +18,7 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use openshell_core::proto::SandboxLogLine;
 use openshell_ocsf::OCSF_TARGET;
+use openshell_ocsf::format::attributes::SEVERITY_ID_KEY;
 use openshell_ocsf::format::shorthand::severity_id_from_shorthand;
 use opentelemetry::Key;
 use opentelemetry::logs::{AnyValue, LogRecord as _, Logger as _, Severity};
@@ -82,10 +83,10 @@ fn emit_line(logger: &SdkLogger, line: &SandboxLogLine, ocsf_full_payload: bool)
 
     record.add_attribute(Key::from_static_str("log.ocsf"), is_ocsf);
 
-    // Structured fields. For OCSF events these are only populated once
-    // `ocsf_full_payload` carries the schema attributes (Phase 3); until then
-    // the map is whatever the producer attached, and the flag simply gates
-    // whether we forward it verbatim.
+    // Structured fields. A sandbox pushes OCSF events with their schema
+    // flattened into `ocsf.*` keys, which is the bulk of a security event's
+    // size, so `ocsf_full_payload` gates whether that detail leaves the box.
+    // Non-OCSF lines carry whatever their producer attached and always travel.
     if !line.fields.is_empty() && (!is_ocsf || ocsf_full_payload) {
         for (key, value) in &line.fields {
             record.add_attribute(Key::new(key.clone()), value.clone());
@@ -98,14 +99,23 @@ fn emit_line(logger: &SdkLogger, line: &SandboxLogLine, ocsf_full_payload: bool)
 /// Resolve the OTLP severity for an exported log line.
 ///
 /// OCSF events all carry the level `OCSF`, so the level alone cannot rank a
-/// blocked nonce replay above a routine policy load. The severity the sandbox
-/// assigned survives in the rendered shorthand, so recover it from there and
-/// fall back to the level when a line carries no tag.
+/// blocked nonce replay above a routine policy load.
+///
+/// Prefer the structured `severity_id` the sandbox pushed: it is the value the
+/// emitter assigned rather than one recovered from rendered text. Fall back to
+/// the shorthand tag for lines pushed by a sandbox predating structured fields,
+/// then to the level when neither is present. Note this reads the field even
+/// when `ocsf_full_payload` is off — that flag governs what leaves the box, not
+/// what the gateway may use to rank a record.
 fn severity_for(line: &SandboxLogLine, is_ocsf: bool) -> Severity {
-    if is_ocsf && let Some(id) = severity_id_from_shorthand(&line.message) {
-        return ocsf_severity(id);
+    if !is_ocsf {
+        return severity_of(&line.level);
     }
-    severity_of(&line.level)
+    line.fields
+        .get(SEVERITY_ID_KEY)
+        .and_then(|id| id.parse::<u8>().ok())
+        .or_else(|| severity_id_from_shorthand(&line.message))
+        .map_or_else(|| severity_of(&line.level), ocsf_severity)
 }
 
 /// Map an OCSF `severity_id` onto an OTLP severity number.
@@ -179,6 +189,24 @@ mod tests {
         sorted.dedup();
         assert_eq!(severities, sorted, "OCSF levels collapsed: {severities:?}");
         assert!(severities.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn a_structured_severity_outranks_the_rendered_tag() {
+        // The pushed field is what the emitter assigned; the tag is a
+        // rendering of it. When they disagree the field wins.
+        let mut line = ocsf_line("NET:OPEN [INFO] DENIED curl(1) -> host:443");
+        line.fields
+            .insert(SEVERITY_ID_KEY.to_string(), "4".to_string());
+        assert_eq!(severity_for(&line, true), Severity::Error);
+    }
+
+    #[test]
+    fn a_malformed_structured_severity_falls_back_to_the_tag() {
+        let mut line = ocsf_line("NET:OPEN [MED] DENIED curl(1) -> host:443");
+        line.fields
+            .insert(SEVERITY_ID_KEY.to_string(), "not-a-number".to_string());
+        assert_eq!(severity_for(&line, true), Severity::Warn2);
     }
 
     #[test]

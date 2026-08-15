@@ -107,14 +107,16 @@ impl<S: Subscriber> Layer<S> for LogPushLayer {
             return;
         }
 
-        // OCSF events carry their payload in a thread-local; extract the
-        // shorthand representation for the push message. Non-OCSF events
-        // use the original visitor-based extraction.
+        // OCSF events carry their payload in a thread-local. Push the rendered
+        // shorthand as the message and the flattened event as fields, so a
+        // consumer can match `ocsf.dst_endpoint.port` rather than parse the
+        // line. The gateway decides whether to forward the fields off-box.
+        // Non-OCSF events use the original visitor-based extraction.
         let (msg, fields) = if meta.target() == openshell_ocsf::OCSF_TARGET {
             if let Some(ocsf_event) = openshell_ocsf::clone_current_event() {
                 (
                     ocsf_event.format_shorthand(),
-                    std::collections::HashMap::new(),
+                    openshell_ocsf::format::attributes::flatten_event(&ocsf_event),
                 )
             } else {
                 return;
