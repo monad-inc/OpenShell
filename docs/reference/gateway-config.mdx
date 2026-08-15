@@ -247,9 +247,15 @@ The gateway owns the log export pipeline end to end and never drops a record sil
 
 Loss is still possible — a collector outage eventually fills the queue, and an abandoned batch is gone — but it is always accounted: every dropped record is counted, and the next successful export carries a synthetic `telemetry_gap` record at WARN severity with `log.target = telemetry_gap`, the dropped count in `dropped`, and the window start in `dropped.since_ms`. Sandboxes apply the same accounting on their push path to the gateway. Alert on `telemetry_gap` records: one anywhere in the stream means telemetry was lost between production and the collector, and says exactly how much.
 
-The gateway's own fan-in sustains a few hundred thousand lines per second, and the buffer drains as fast as the collector acknowledges batches, so a `telemetry_gap` usually points at collector capacity or the network rather than the gateway.
+The export ceiling depends on the shape OCSF events arrive in, because per-record cost at every stage is dominated by attribute count rather than bytes. As reference points, on commodity dev hardware (`cargo bench --bench log_fanin --bench log_export`), a 46-field production denial costs about 4.5 µs to publish through the fan-in bus and the export worker drains roughly 70 thousand lines per second in the default flattened format; pushed as raw JSON (`OPENSHELL_OCSF_PUSH_FORMAT=raw`, below) the same event publishes in ~0.4 µs and drains at roughly 290 thousand lines per second. Plain log lines without OCSF fields drain at over a million lines per second.
 
-Sandboxes push OCSF events with the schema flattened into dotted `ocsf.*` attributes alongside the rendered summary, so a SIEM can match a field instead of pattern-matching the line:
+Size gateways against those ceilings: estimate the aggregate OCSF lines per second across every sandbox a gateway serves, and when it approaches the drain rate for your payload shape, switch to the raw shape or add gateways. In production the arriving `telemetry_gap` records are the direct signal — a sustained stream of them means the export stage, not any sandbox, is the limiting stage.
+
+### OCSF payload format
+
+Sandboxes push OCSF events in one of two shapes, selected per sandbox with the `OPENSHELL_OCSF_PUSH_FORMAT` environment variable on the sandbox supervisor. Both carry the same information; they trade where the parsing work happens.
+
+**`flat`** (the default) flattens the event schema into dotted `ocsf.*` attributes alongside the rendered summary, so a SIEM can match a field instead of pattern-matching the line:
 
 ```text
 ocsf.class_uid          4001
@@ -258,7 +264,25 @@ ocsf.dst_endpoint.port  443
 ocsf.actor.process.name curl
 ```
 
-Nested objects join with `.`, arrays of scalars join with `,` on one key, arrays of objects are indexed (`ocsf.affected.0.name`), absent fields are omitted rather than exported empty, and a single value is truncated at 256 characters. `severity_id` also sets the record's OTLP severity, so denials and findings outrank routine events regardless of this flag.
+Nested objects join with `.`, arrays of scalars join with `,` on one key, arrays of objects are indexed (`ocsf.affected.0.name`), absent fields are omitted rather than exported empty, and a single value is truncated at 256 characters.
+
+**`raw`** pushes the complete OCSF document as a single `ocsf.raw` attribute — the same JSON the OCSF JSONL file carries, with nothing flattened, joined, or truncated — plus `ocsf.severity_id` beside it. This is the high-throughput shape: per-record cost across the sandbox, the gateway, and the exporter is dominated by attribute count, not bytes, and one attribute instead of ~46 raises the gateway's export ceiling several-fold (see Export capacity). The trade is that field-level structure is recovered downstream instead of being present on the record; an OpenTelemetry Collector restores it with a transform such as:
+
+```yaml
+processors:
+  transform/ocsf:
+    log_statements:
+      - context: log
+        conditions:
+          - attributes["ocsf.raw"] != nil
+        statements:
+          - merge_maps(cache, ParseJSON(attributes["ocsf.raw"]), "upsert")
+          - set(attributes["ocsf"], cache)
+```
+
+Prefer `raw` when the collector or SIEM can parse JSON and the gateway aggregates many busy sandboxes; prefer `flat` when records must arrive query-ready.
+
+In both shapes `ocsf.severity_id` sets the record's OTLP severity, so denials and findings outrank routine events regardless of `ocsf_full_payload`, and unrecognized values of `OPENSHELL_OCSF_PUSH_FORMAT` fall back to `flat`.
 
 ### Tuning
 

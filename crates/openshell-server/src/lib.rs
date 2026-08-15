@@ -34,7 +34,8 @@ mod gateway_listener;
 mod grpc;
 mod http;
 mod inference;
-mod log_export;
+// Public for the `log_export` benchmark; not a stable API surface.
+pub mod log_export;
 mod middleware;
 mod multiplex;
 mod otel_tracing;

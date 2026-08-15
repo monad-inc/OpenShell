@@ -16,7 +16,7 @@ use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use openshell_ocsf::enums::{ActionId, ActivityId, DispositionId, SeverityId, StatusId};
-use openshell_ocsf::format::attributes::flatten_event;
+use openshell_ocsf::format::attributes::{flatten_event, raw_event_fields};
 use openshell_ocsf::objects::{Endpoint, Process};
 use openshell_ocsf::{NetworkActivityBuilder, OcsfEvent};
 
@@ -87,6 +87,20 @@ fn bench_rendering(c: &mut Criterion) {
         b.iter(|| {
             let event = black_box(&denial);
             black_box((event.format_shorthand(), flatten_event(event)))
+        });
+    });
+
+    // The raw alternative (`OPENSHELL_OCSF_PUSH_FORMAT=raw`), in isolation.
+    // One serialization and two map entries; compare against `flatten_only`.
+    group.bench_function("raw_fields_only", |b| {
+        b.iter(|| black_box(raw_event_fields(black_box(&denial))));
+    });
+
+    // What a sandbox pays per security event in raw mode.
+    group.bench_function("shorthand_and_raw_fields", |b| {
+        b.iter(|| {
+            let event = black_box(&denial);
+            black_box((event.format_shorthand(), raw_event_fields(event)))
         });
     });
 

@@ -25,6 +25,39 @@ const DEFAULT_BLOCK_TIMEOUT_MS: u64 = 25;
 /// Poll interval while blocking for queue space.
 const ENQUEUE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(2);
 
+/// How OCSF events are rendered into a pushed line's fields.
+///
+/// Selected once at startup via `OPENSHELL_OCSF_PUSH_FORMAT`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OcsfPushFormat {
+    /// Flatten the event into dotted `ocsf.*` fields (default). A consumer can
+    /// match individual fields without parsing, but rendering costs one entry
+    /// per leaf on this hot path — and the same again at every hop that clones
+    /// or converts the map.
+    Flat,
+    /// Push the complete event JSON as a single `ocsf.raw` field (plus
+    /// `ocsf.severity_id` for gateway ranking). Full fidelity, no truncation,
+    /// and a fraction of the per-event cost end to end; the collector parses
+    /// the document downstream instead.
+    Raw,
+}
+
+impl OcsfPushFormat {
+    fn from_env() -> Self {
+        Self::parse(std::env::var("OPENSHELL_OCSF_PUSH_FORMAT").ok().as_deref())
+    }
+
+    /// `raw` selects raw form; anything else — unset, `flat`, or a value we do
+    /// not recognize — keeps the default, because a typo must not silently
+    /// change what a SIEM receives beyond what it already handles.
+    fn parse(value: Option<&str>) -> Self {
+        match value {
+            Some(v) if v.trim().eq_ignore_ascii_case("raw") => Self::Raw,
+            _ => Self::Flat,
+        }
+    }
+}
+
 /// Tracing layer that pushes log events to the `OpenShell` server.
 ///
 /// Delivery is reliable-with-accounting rather than silently best-effort: an
@@ -40,6 +73,7 @@ pub struct LogPushLayer {
     tx: mpsc::Sender<SandboxLogLine>,
     max_level: tracing::Level,
     block_timeout: std::time::Duration,
+    ocsf_format: OcsfPushFormat,
     dropped: Arc<AtomicU64>,
 }
 
@@ -65,6 +99,7 @@ impl LogPushLayer {
             tx,
             max_level,
             block_timeout,
+            ocsf_format: OcsfPushFormat::from_env(),
             dropped,
         }
     }
@@ -108,16 +143,22 @@ impl<S: Subscriber> Layer<S> for LogPushLayer {
         }
 
         // OCSF events carry their payload in a thread-local. Push the rendered
-        // shorthand as the message and the flattened event as fields, so a
-        // consumer can match `ocsf.dst_endpoint.port` rather than parse the
-        // line. The gateway decides whether to forward the fields off-box.
-        // Non-OCSF events use the original visitor-based extraction.
+        // shorthand as the message and the event's structure as fields — either
+        // flattened so a consumer can match `ocsf.dst_endpoint.port` directly,
+        // or as one raw `ocsf.raw` JSON document for a consumer that parses
+        // downstream. The gateway decides whether to forward the fields
+        // off-box. Non-OCSF events use the original visitor-based extraction.
         let (msg, fields) = if meta.target() == openshell_ocsf::OCSF_TARGET {
             if let Some(ocsf_event) = openshell_ocsf::clone_current_event() {
-                (
-                    ocsf_event.format_shorthand(),
-                    openshell_ocsf::format::attributes::flatten_event(&ocsf_event),
-                )
+                let fields = match self.ocsf_format {
+                    OcsfPushFormat::Flat => {
+                        openshell_ocsf::format::attributes::flatten_event(&ocsf_event)
+                    }
+                    OcsfPushFormat::Raw => {
+                        openshell_ocsf::format::attributes::raw_event_fields(&ocsf_event)
+                    }
+                };
+                (ocsf_event.format_shorthand(), fields)
             } else {
                 return;
             }
@@ -435,8 +476,19 @@ mod tests {
             tx,
             max_level: tracing::Level::INFO,
             block_timeout: std::time::Duration::from_millis(5),
+            ocsf_format: OcsfPushFormat::Flat,
             dropped,
         }
+    }
+
+    #[test]
+    fn ocsf_push_format_parses_raw_and_defaults_everything_else() {
+        assert_eq!(OcsfPushFormat::parse(Some("raw")), OcsfPushFormat::Raw);
+        assert_eq!(OcsfPushFormat::parse(Some(" RAW ")), OcsfPushFormat::Raw);
+        assert_eq!(OcsfPushFormat::parse(Some("flat")), OcsfPushFormat::Flat);
+        // A typo must degrade to the default, never to silence.
+        assert_eq!(OcsfPushFormat::parse(Some("rawr")), OcsfPushFormat::Flat);
+        assert_eq!(OcsfPushFormat::parse(None), OcsfPushFormat::Flat);
     }
 
     #[test]

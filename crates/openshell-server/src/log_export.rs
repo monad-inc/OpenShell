@@ -199,10 +199,10 @@ async fn run_export_loop<E: LogExporter>(
             },
             _ = shutdown_rx.wait_for(|&stop| stop) => break,
         };
-        records.push(record_for(&logger, &first, ocsf_full_payload));
+        records.push(record_for(&logger, first, ocsf_full_payload));
         while records.len() < MAX_BATCH {
             match rx.try_recv() {
-                Ok(line) => records.push(record_for(&logger, &line, ocsf_full_payload)),
+                Ok(line) => records.push(record_for(&logger, line, ocsf_full_payload)),
                 Err(_) => break,
             }
         }
@@ -226,7 +226,7 @@ async fn run_export_loop<E: LogExporter>(
         records.clear();
         while records.len() < MAX_BATCH {
             match rx.try_recv() {
-                Ok(line) => records.push(record_for(&logger, &line, ocsf_full_payload)),
+                Ok(line) => records.push(record_for(&logger, line, ocsf_full_payload)),
                 Err(_) => break,
             }
         }
@@ -338,32 +338,46 @@ fn gap_record(
 }
 
 /// Convert a [`SandboxLogLine`] into an OTLP log record.
-fn record_for(logger: &SdkLogger, line: &SandboxLogLine, ocsf_full_payload: bool) -> SdkLogRecord {
+///
+/// Consumes the line: the worker owns it once it leaves the queue, so every
+/// string moves into the record instead of being cloned. On a ~46-field OCSF
+/// event those clones were most of the conversion cost.
+///
+/// Public only so the `log_export` benchmark can measure conversion cost per
+/// payload shape; not a stable API surface.
+#[doc(hidden)]
+#[must_use]
+pub fn record_for(
+    logger: &SdkLogger,
+    line: SandboxLogLine,
+    ocsf_full_payload: bool,
+) -> SdkLogRecord {
     let mut record = logger.create_log_record();
     let is_ocsf = line.target == OCSF_TARGET;
 
-    record.set_severity_number(severity_for(line, is_ocsf));
-    record.set_body(AnyValue::String(line.message.clone().into()));
+    record.set_severity_number(severity_for(&line, is_ocsf));
     record.set_observed_timestamp(SystemTime::now());
 
     if line.timestamp_ms > 0 {
         record.set_timestamp(UNIX_EPOCH + Duration::from_millis(line.timestamp_ms.cast_unsigned()));
     }
 
-    record.add_attribute(Key::from_static_str("sandbox.id"), line.sandbox_id.clone());
-    record.add_attribute(Key::from_static_str("log.source"), line.source.clone());
-    record.add_attribute(Key::from_static_str("log.target"), line.target.clone());
-    record.add_attribute(Key::from_static_str("log.level"), line.level.clone());
+    record.set_body(AnyValue::String(line.message.into()));
+    record.add_attribute(Key::from_static_str("sandbox.id"), line.sandbox_id);
+    record.add_attribute(Key::from_static_str("log.source"), line.source);
+    record.add_attribute(Key::from_static_str("log.target"), line.target);
+    record.add_attribute(Key::from_static_str("log.level"), line.level);
 
     record.add_attribute(Key::from_static_str("log.ocsf"), is_ocsf);
 
     // Structured fields. A sandbox pushes OCSF events with their schema
-    // flattened into `ocsf.*` keys, which is the bulk of a security event's
-    // size, so `ocsf_full_payload` gates whether that detail leaves the box.
-    // Non-OCSF lines carry whatever their producer attached and always travel.
+    // flattened into `ocsf.*` keys — or as one `ocsf.raw` JSON field — which is
+    // the bulk of a security event's size, so `ocsf_full_payload` gates whether
+    // that detail leaves the box. Non-OCSF lines carry whatever their producer
+    // attached and always travel.
     if !line.fields.is_empty() && (!is_ocsf || ocsf_full_payload) {
-        for (key, value) in &line.fields {
-            record.add_attribute(Key::new(key.clone()), value.clone());
+        for (key, value) in line.fields {
+            record.add_attribute(Key::new(key), value);
         }
     }
 
@@ -581,6 +595,41 @@ mod tests {
         assert_eq!(severity_of("ERROR"), Severity::Error);
         assert_eq!(severity_of("OCSF"), Severity::Info);
         assert_eq!(severity_of("something-else"), Severity::Info);
+    }
+
+    #[tokio::test]
+    async fn a_raw_mode_line_ranks_by_severity_and_carries_its_payload() {
+        // `OPENSHELL_OCSF_PUSH_FORMAT=raw` pushes the event as one JSON field
+        // plus its severity. The gateway must rank it exactly like the
+        // flattened form and pass the document through untouched.
+        let mut line = ocsf_line("NET:OPEN [MED] DENIED curl(1) -> blocked.invalid:443");
+        line.fields.insert(
+            "ocsf.raw".to_string(),
+            "{\"class_uid\":4001,\"severity_id\":4}".to_string(),
+        );
+        line.fields
+            .insert(SEVERITY_ID_KEY.to_string(), "4".to_string());
+
+        let exporter = InMemoryLogExporter::default();
+        let (handle, worker) = spawn(
+            KeptExporter(exporter.clone()),
+            Resource::builder_empty().build(),
+            true,
+        );
+        handle.enqueue(line);
+        worker.shutdown().await;
+
+        let emitted = exporter.get_emitted_logs().unwrap();
+        assert_eq!(emitted.len(), 1);
+        let record = &emitted[0].record;
+        // The pushed severity field wins over the rendered [MED] tag.
+        assert_eq!(record.severity_number(), Some(Severity::Error));
+        assert_eq!(
+            attribute(record, "ocsf.raw"),
+            Some(AnyValue::String(
+                "{\"class_uid\":4001,\"severity_id\":4}".into()
+            ))
+        );
     }
 
     #[tokio::test]

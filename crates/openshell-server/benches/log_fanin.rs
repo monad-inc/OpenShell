@@ -47,29 +47,49 @@ fn ocsf_line(sandbox_id: &str, field_count: usize) -> SandboxLogLine {
     }
 }
 
-/// Publish cost for a single line, by payload size.
+/// A raw-mode line: the whole event as one ~2 KB `ocsf.raw` JSON field plus
+/// its severity, as `OPENSHELL_OCSF_PUSH_FORMAT=raw` pushes it. Field-map
+/// clone cost collapses to two entries however large the event is.
+fn raw_ocsf_line(sandbox_id: &str) -> SandboxLogLine {
+    let mut line = ocsf_line(sandbox_id, 0);
+    line.fields.insert(
+        "ocsf.raw".to_string(),
+        format!(
+            "{{\"class_uid\":4001,\"severity_id\":3,\"padding\":\"{}\"}}",
+            "x".repeat(2000)
+        ),
+    );
+    line.fields
+        .insert("ocsf.severity_id".to_string(), "3".to_string());
+    line
+}
+
+/// Publish cost for a single line, by payload shape.
 ///
-/// Isolates what the flattened field map costs the gateway, separately from
-/// concurrency. 0 fields is a pre-Phase-3 line; 46 matches a production denial.
+/// Isolates what the field map costs the gateway, separately from concurrency.
+/// 0 fields is a pre-Phase-3 line; 46 matches a production denial pushed in
+/// the default flattened format; `raw` is the same event pushed as one JSON
+/// field.
 fn bench_publish_by_payload(c: &mut Criterion) {
     let mut group = c.benchmark_group("gateway_publish");
 
-    for field_count in [0_usize, 10, 46, 100] {
-        let line = ocsf_line("sb-0", field_count);
+    let mut cases: Vec<(String, SandboxLogLine)> = [0_usize, 10, 46, 100]
+        .into_iter()
+        .map(|count| (count.to_string(), ocsf_line("sb-0", count)))
+        .collect();
+    cases.push(("raw".to_string(), raw_ocsf_line("sb-0")));
+
+    for (label, line) in cases {
         group.throughput(Throughput::Elements(1));
-        group.bench_with_input(
-            BenchmarkId::from_parameter(field_count),
-            &line,
-            |b, line| {
-                // One long-lived bus, as the gateway has. Its tail fills to the
-                // 2000-line cap and then evicts per publish, which is the
-                // steady state a running gateway is in. Constructing a bus per
-                // iteration instead would charge allocator churn to the cheap
-                // payloads and invert the comparison.
-                let bus = TracingLogBus::new();
-                b.iter(|| bus.publish_external(black_box(line.clone())));
-            },
-        );
+        group.bench_with_input(BenchmarkId::from_parameter(label), &line, |b, line| {
+            // One long-lived bus, as the gateway has. Its tail fills to the
+            // 2000-line cap and then evicts per publish, which is the
+            // steady state a running gateway is in. Constructing a bus per
+            // iteration instead would charge allocator churn to the cheap
+            // payloads and invert the comparison.
+            let bus = TracingLogBus::new();
+            b.iter(|| bus.publish_external(black_box(line.clone())));
+        });
     }
     group.finish();
 }

@@ -108,27 +108,29 @@ impl TracingLogBus {
     /// used by the tracing layer, so it appears in `WatchSandbox` and
     /// `GetSandboxLogs` transparently.
     pub fn publish_external(&self, log: SandboxLogLine) {
-        let evt = SandboxStreamEvent {
-            payload: Some(openshell_core::proto::sandbox_stream_event::Payload::Log(
-                log.clone(),
-            )),
-        };
-        self.publish(&log.sandbox_id, evt, Self::DEFAULT_TAIL);
+        self.publish_log(log, Self::DEFAULT_TAIL);
     }
 
     /// Default tail buffer capacity (lines per sandbox).
     const DEFAULT_TAIL: usize = 2000;
 
-    fn publish(&self, sandbox_id: &str, event: SandboxStreamEvent, tail_cap: usize) {
-        // Tap for off-box export: forward log payloads (gateway-origin and
+    fn publish_log(&self, log: SandboxLogLine, tail_cap: usize) {
+        // Tap for off-box export: forward log lines (gateway-origin and
         // sandbox-pushed alike, since both reach the bus through here) into the
         // accounted export queue before they enter the bounded in-memory tail.
-        if let Some(export) = self.export.get()
-            && let Some(openshell_core::proto::sandbox_stream_event::Payload::Log(log)) =
-                &event.payload
-        {
+        // The queue takes the one clone this path pays; the stream event below
+        // takes the original. An OCSF line's field map is the expensive part of
+        // that clone, so this stays a single copy however many fields it has.
+        if let Some(export) = self.export.get() {
             export.enqueue(log.clone());
         }
+
+        let sandbox_id = log.sandbox_id.clone();
+        let event = SandboxStreamEvent {
+            payload: Some(openshell_core::proto::sandbox_stream_event::Payload::Log(
+                log,
+            )),
+        };
 
         // One lock acquisition covers both the broadcast lookup and the tail.
         // Every sandbox's lines converge here, so taking it twice per line
@@ -141,13 +143,13 @@ impl TracingLogBus {
         // the most expensive part of publishing an OCSF event. Skipping it when
         // there are no receivers changes nothing observable: the send was
         // already a discarded error in that case.
-        if let Some(tx) = inner.per_id.get(sandbox_id)
+        if let Some(tx) = inner.per_id.get(&sandbox_id)
             && tx.receiver_count() > 0
         {
             let _ = tx.send(event.clone());
         }
 
-        let deque = inner.tails.entry(sandbox_id.to_string()).or_default();
+        let deque = inner.tails.entry(sandbox_id).or_default();
         deque.push_back(event);
         while deque.len() > tail_cap {
             deque.pop_front();
@@ -179,7 +181,7 @@ where
 
         let ts = openshell_core::time::now_ms();
         let log = SandboxLogLine {
-            sandbox_id: sandbox_id.clone(),
+            sandbox_id,
             timestamp_ms: ts,
             level,
             target: meta.target().to_string(),
@@ -187,12 +189,7 @@ where
             source: "gateway".to_string(),
             fields: HashMap::new(),
         };
-        let evt = SandboxStreamEvent {
-            payload: Some(openshell_core::proto::sandbox_stream_event::Payload::Log(
-                log,
-            )),
-        };
-        self.bus.publish(&sandbox_id, evt, self.default_tail);
+        self.bus.publish_log(log, self.default_tail);
     }
 }
 

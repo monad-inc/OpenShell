@@ -131,6 +131,10 @@ test-support = []
 name = "log_fanin"
 harness = false
 
+[[bench]]
+name = "log_export"
+harness = false
+
 [dev-dependencies]
 criterion = { workspace = true }
 hyper-rustls = { version = "0.27", default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "ring"] }

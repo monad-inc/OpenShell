@@ -29,6 +29,13 @@ const KEY_PREFIX: &str = "ocsf";
 /// this to what [`flatten_event`] actually produces.
 pub const SEVERITY_ID_KEY: &str = "ocsf.severity_id";
 
+/// Key carrying the complete event JSON when the sandbox pushes raw form.
+///
+/// The value is the same document the JSONL formatter writes — nothing
+/// flattened, joined, or truncated — so a collector can parse it back into
+/// full structure downstream (e.g. with OTTL's `ParseJSON`).
+pub const RAW_KEY: &str = "ocsf.raw";
+
 /// Max length of a single flattened value before truncation.
 ///
 /// Event text is operator- and workload-influenced (a denial reason carries a
@@ -72,6 +79,31 @@ pub fn flatten_event(event: &OcsfEvent) -> HashMap<String, String> {
     let mut path = String::with_capacity(TYPICAL_KEY_LEN);
     path.push_str(KEY_PREFIX);
     flatten_value(&mut path, &value, &mut out);
+    out
+}
+
+/// Render an OCSF event as raw push fields: the complete event JSON under
+/// [`RAW_KEY`] plus [`SEVERITY_ID_KEY`], so the gateway can rank the record
+/// without parsing the document.
+///
+/// This is the cheap, full-fidelity alternative to [`flatten_event`]: one
+/// serialization and two map entries instead of ~46, with no per-value
+/// truncation. The cost moves downstream — a consumer that wants individual
+/// fields parses the JSON after the collector receives it.
+///
+/// Returns an empty map when the event cannot be serialized, matching
+/// [`flatten_event`]: losing structure must not cost the caller the event.
+#[must_use]
+pub fn raw_event_fields(event: &OcsfEvent) -> HashMap<String, String> {
+    let Ok(json) = serde_json::to_string(event) else {
+        return HashMap::new();
+    };
+    let mut out = HashMap::with_capacity(2);
+    out.insert(RAW_KEY.to_string(), json);
+    out.insert(
+        SEVERITY_ID_KEY.to_string(),
+        event.base().severity.as_u8().to_string(),
+    );
     out
 }
 
@@ -258,6 +290,41 @@ mod tests {
 
         assert_eq!(out.len(), 1);
         assert_eq!(out.get("ocsf.kept").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn raw_fields_carry_the_complete_event_and_its_severity() {
+        let event = test_event();
+        let fields = raw_event_fields(&event);
+
+        assert_eq!(fields.len(), 2);
+        // The raw value round-trips to exactly the document the JSONL
+        // formatter writes — full fidelity is the contract.
+        let raw = fields.get(RAW_KEY).expect("raw payload present");
+        let parsed: serde_json::Value = serde_json::from_str(raw).expect("raw is valid JSON");
+        assert_eq!(parsed, event.to_json().unwrap());
+        // The severity travels beside it under the same key the flattened
+        // form uses, so the gateway ranks both forms identically.
+        assert_eq!(fields.get(SEVERITY_ID_KEY).map(String::as_str), Some("3"));
+    }
+
+    #[test]
+    fn raw_fields_do_not_truncate_long_values() {
+        let mut base = match test_event() {
+            OcsfEvent::Base(event) => event.base,
+            other => panic!("unexpected variant: {other:?}"),
+        };
+        let long_message = "x".repeat(MAX_VALUE_LEN * 4);
+        base.set_message(&long_message);
+        let event = OcsfEvent::Base(BaseEvent { base });
+
+        let fields = raw_event_fields(&event);
+        let parsed: serde_json::Value = serde_json::from_str(fields.get(RAW_KEY).unwrap()).unwrap();
+        assert_eq!(
+            parsed.get("message").and_then(|m| m.as_str()),
+            Some(long_message.as_str()),
+            "raw form must never truncate"
+        );
     }
 
     #[test]
