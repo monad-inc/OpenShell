@@ -523,7 +523,7 @@ async fn run_from_args(mut args: RunArgs, matches: ArgMatches) -> Result<()> {
 
     let result = Box::pin(run_server(prepared, tracing_log_bus)).await;
 
-    tracing_handle.shutdown();
+    tracing_handle.shutdown().await;
 
     result.into_diagnostic()
 }

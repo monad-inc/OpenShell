@@ -122,7 +122,7 @@ impl TracingLogBus {
     fn publish(&self, sandbox_id: &str, event: SandboxStreamEvent, tail_cap: usize) {
         // Tap for off-box export: forward log payloads (gateway-origin and
         // sandbox-pushed alike, since both reach the bus through here) into the
-        // non-dropping export queue before they enter the bounded in-memory tail.
+        // accounted export queue before they enter the bounded in-memory tail.
         if let Some(export) = self.export.get()
             && let Some(openshell_core::proto::sandbox_stream_event::Payload::Log(log)) =
                 &event.payload

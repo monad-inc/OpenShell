@@ -8,14 +8,15 @@ mod logs;
 mod propagation;
 
 pub use grpc::RecordGrpcFailure;
-pub use logs::{OtlpLogConfig, build_log_provider, log_provider_for, logger};
+pub use logs::{OtlpLogConfig, build_log_exporter, log_exporter_for, logger};
+pub use opentelemetry_otlp::LogExporter as OtlpLogExporter;
 pub use opentelemetry_sdk::logs::SdkLoggerProvider;
 pub use propagation::{HeaderMapExtractor, MetadataMapInjector, TraceContextInterceptor};
 
 use opentelemetry::KeyValue;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::{SpanExporter, WithExportConfig, WithTonicConfig as _};
-use opentelemetry_sdk::Resource;
+pub use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::trace::SdkTracer;
 pub use opentelemetry_sdk::trace::SdkTracerProvider;
 use tonic::transport::ClientTlsConfig;

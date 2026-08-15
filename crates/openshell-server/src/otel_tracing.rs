@@ -18,12 +18,13 @@
 //! and mirrored nowhere here. `docs/reference/gateway-config.mdx` documents
 //! the variables operators are likely to want.
 //!
-//! Only traces are exported. Logs and metrics have their own surfaces (OCSF
-//! JSONL and the Prometheus `/metrics` endpoint).
+//! Traces are exported through the SDK's batch pipeline. Logs are batched and
+//! exported by [`crate::log_export`] when `export_logs` is set (the `OTEL_BLRP_*`
+//! variables therefore have no effect); metrics stay on the Prometheus
+//! `/metrics` endpoint.
 
 use openshell_otel::{OtlpTraceConfig, ServiceName};
 pub use openshell_otel::{SetupError, TraceContextInterceptor, mark_error};
-#[cfg(test)]
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing::Subscriber;
@@ -86,20 +87,20 @@ pub fn provider_for(cfg: Option<&OtlpConfig>) -> (Option<SdkTracerProvider>, Opt
     openshell_otel::provider_for(cfg.map(trace_config))
 }
 
-/// Resolve the OTLP **log** provider for a gateway config.
+/// Resolve the OTLP **log** exporter (and its resource) for a gateway config.
 ///
 /// Returns `None` unless the `[openshell.gateway.otlp]` table is present *and*
 /// `export_logs` is set — log export is opt-in on top of the same endpoint the
 /// tracer uses. Like [`provider_for`], a broken exporter never stops the
 /// gateway; the error is returned for the caller to report.
-pub fn log_provider_for(
+pub fn log_exporter_for(
     cfg: Option<&OtlpConfig>,
 ) -> (
-    Option<openshell_otel::SdkLoggerProvider>,
+    Option<(openshell_otel::OtlpLogExporter, Resource)>,
     Option<SetupError>,
 ) {
     let cfg = cfg.filter(|c| c.export_logs);
-    openshell_otel::log_provider_for(cfg.map(trace_config))
+    openshell_otel::log_exporter_for(cfg.map(trace_config))
 }
 
 /// Build the `tracing` layer that forwards spans to `provider`.

@@ -17,22 +17,20 @@ use crate::tracing_bus::TracingLogBus;
 
 pub struct TracingHandle {
     tracer_provider: Option<SdkTracerProvider>,
-    logger_provider: Option<openshell_otel::SdkLoggerProvider>,
+    log_export: Option<crate::log_export::LogExportWorker>,
 }
 
 impl TracingHandle {
-    pub fn shutdown(&self) {
+    pub async fn shutdown(self) {
         if let Some(provider) = &self.tracer_provider
             && let Err(err) = provider.shutdown()
         {
             tracing::warn!(error = %err, "OTLP tracer provider shutdown failed");
         }
-        // Flush and stop the log exporter last so records enqueued during
+        // Flush and stop the log export worker last so records enqueued during
         // shutdown of other subsystems still leave the box.
-        if let Some(provider) = &self.logger_provider
-            && let Err(err) = provider.shutdown()
-        {
-            tracing::warn!(error = %err, "OTLP logger provider shutdown failed");
+        if let Some(worker) = self.log_export {
+            worker.shutdown().await;
         }
     }
 }
@@ -43,16 +41,17 @@ pub fn install(
     otlp_config: Option<&OtlpConfig>,
 ) -> (TracingHandle, Option<SetupError>) {
     let (tracer_provider, trace_error) = crate::otel_tracing::provider_for(otlp_config);
-    let (logger_provider, log_error) = crate::otel_tracing::log_provider_for(otlp_config);
+    let (log_exporter, log_error) = crate::otel_tracing::log_exporter_for(otlp_config);
 
-    // When a logger provider was built (export_logs enabled + usable endpoint),
-    // spawn the drain task and point the log bus at its queue so every log line
-    // the gateway observes is exported off-box.
-    if let Some(provider) = &logger_provider {
+    // When a log exporter was built (export_logs enabled + usable endpoint),
+    // spawn the export worker and point the log bus at its queue so every log
+    // line the gateway observes is exported off-box.
+    let log_export = log_exporter.map(|(exporter, resource)| {
         let ocsf_full_payload = otlp_config.is_some_and(|c| c.ocsf_full_payload);
-        let handle = crate::log_export::spawn(provider, ocsf_full_payload);
+        let (handle, worker) = crate::log_export::spawn(exporter, resource, ocsf_full_payload);
         tracing_log_bus.set_export(handle);
-    }
+        worker
+    });
 
     tracing_subscriber::registry()
         .with(env_filter)
@@ -64,7 +63,7 @@ pub fn install(
     (
         TracingHandle {
             tracer_provider,
-            logger_provider,
+            log_export,
         },
         // Surface whichever setup failed; the trace error takes precedence
         // since both signals share one endpoint.

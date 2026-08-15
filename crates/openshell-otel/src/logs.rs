@@ -3,36 +3,46 @@
 
 //! OTLP/gRPC log export support.
 //!
-//! Mirrors the span pipeline in [`crate`]: an [`OtlpLogConfig`] describes the
-//! destination and resource identity, and [`build_log_provider`] constructs a
-//! batching [`SdkLoggerProvider`] that ships [`opentelemetry`] log records over
-//! OTLP/gRPC.
+//! Mirrors the span pipeline in [`crate`] up to the exporter: an
+//! [`OtlpLogConfig`] describes the destination and resource identity, and
+//! [`build_log_exporter`] constructs the OTLP/gRPC [`LogExporter`] plus the
+//! [`Resource`] to stamp on it.
 //!
-//! Unlike the span layer, callers here do **not** bridge `tracing` events
-//! automatically. The gateway already aggregates sandbox log lines as
-//! structured records; it converts each one into a log record and emits it
-//! through a [`Logger`] obtained from the provider. Keeping emission explicit
-//! lets the gateway carry fields the `tracing` bridge would drop (sandbox id,
-//! OCSF attributes) and control delivery accounting.
+//! Unlike the span pipeline, no SDK batch processor sits in front of the
+//! exporter. The SDK's `BatchLogProcessor` drops records silently once its
+//! bounded queue fills, and its drop counter is private, so a caller cannot
+//! account for the loss. Security telemetry must never vanish silently, so the
+//! caller owns batching and drives [`LogExporter::export`] directly — each
+//! batch's outcome is observable, failed batches can be retried, and any drop
+//! the caller takes is one it counted itself.
+//!
+//! [`LogExporter::export`]: opentelemetry_sdk::logs::LogExporter::export
 
 use opentelemetry::logs::LoggerProvider as _;
 use opentelemetry_otlp::{LogExporter, WithExportConfig as _, WithTonicConfig as _};
+use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::logs::SdkLoggerProvider;
 
 use crate::{OtlpTraceConfig, SetupError, resource_for, tls_config_for, validated_endpoint};
 
-/// Inputs for an OTLP/gRPC log provider.
+/// Inputs for an OTLP/gRPC log exporter.
 ///
 /// Shares [`OtlpTraceConfig`]'s shape so a caller with one OTLP endpoint can
 /// build both signals from the same configuration.
 pub type OtlpLogConfig<'a> = OtlpTraceConfig<'a>;
 
-/// Build an OTLP/gRPC log provider.
+/// Build an OTLP/gRPC log exporter and the resource identity to export under.
+///
+/// The caller must call `set_resource` with the returned resource before the
+/// first export; the exporter is returned unstamped so the caller can defer
+/// that to the task that owns it.
 ///
 /// Must be called from within a Tokio runtime; the tonic exporter binds to the
 /// current reactor as it is constructed. It does not connect — an unreachable
 /// collector produces export failures, never a construction failure.
-pub fn build_log_provider(config: &OtlpLogConfig<'_>) -> Result<SdkLoggerProvider, SetupError> {
+pub fn build_log_exporter(
+    config: &OtlpLogConfig<'_>,
+) -> Result<(LogExporter, Resource), SetupError> {
     let (endpoint, uri) = validated_endpoint(config.endpoint)?;
 
     let mut builder = LogExporter::builder().with_tonic().with_endpoint(endpoint);
@@ -41,31 +51,30 @@ pub fn build_log_provider(config: &OtlpLogConfig<'_>) -> Result<SdkLoggerProvide
     }
     let exporter = builder.build()?;
 
-    Ok(SdkLoggerProvider::builder()
-        .with_batch_exporter(exporter)
-        .with_resource(resource_for(config))
-        .build())
+    Ok((exporter, resource_for(config)))
 }
 
-/// Build the provider for an optional OTLP log configuration.
+/// Build the exporter for an optional OTLP log configuration.
 ///
 /// Like [`crate::provider_for`], setup failures disable export and are returned
 /// for the caller to report once its subscriber is installed.
 #[must_use]
-pub fn log_provider_for(
+pub fn log_exporter_for(
     config: Option<OtlpLogConfig<'_>>,
-) -> (Option<SdkLoggerProvider>, Option<SetupError>) {
-    match config.as_ref().map(build_log_provider) {
+) -> (Option<(LogExporter, Resource)>, Option<SetupError>) {
+    match config.as_ref().map(build_log_exporter) {
         None => (None, None),
-        Some(Ok(provider)) => (Some(provider), None),
+        Some(Ok(parts)) => (Some(parts), None),
         Some(Err(error)) => (None, Some(error)),
     }
 }
 
-/// Obtain a named [`Logger`] for emitting records through `provider`.
+/// Obtain a named [`Logger`] for minting and emitting records.
 ///
 /// `instrumentation_scope` is recorded as the scope on every record the logger
 /// emits, matching the convention used for the span layer's tracer scope.
+///
+/// [`Logger`]: opentelemetry::logs::Logger
 #[must_use]
 pub fn logger(
     provider: &SdkLoggerProvider,
@@ -107,8 +116,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn https_endpoint_builds_a_log_provider_with_public_roots() {
-        let (provider, error) = log_provider_for(Some(OtlpLogConfig {
+    async fn https_endpoint_builds_a_log_exporter_with_public_roots() {
+        let (parts, error) = log_exporter_for(Some(OtlpLogConfig {
             endpoint: "https://collector.example.com:4317",
             service_name: ServiceName::Fixed("openshell-gateway"),
             service_version: None,
@@ -116,19 +125,25 @@ mod tests {
         }));
 
         assert!(error.is_none(), "unexpected setup error: {error:?}");
-        assert!(provider.is_some());
+        let (_exporter, resource) = parts.expect("exporter builds");
+        assert_eq!(
+            resource
+                .get(&opentelemetry::Key::from_static_str("service.name"))
+                .map(|v| v.to_string()),
+            Some("openshell-gateway".to_string())
+        );
     }
 
     #[tokio::test]
     async fn malformed_endpoint_disables_log_export_with_a_reportable_error() {
-        let (provider, error) = log_provider_for(Some(OtlpLogConfig {
+        let (parts, error) = log_exporter_for(Some(OtlpLogConfig {
             endpoint: "definitely not a url",
             service_name: ServiceName::Fixed("test-service"),
             service_version: None,
             resource_attributes: Vec::new(),
         }));
 
-        assert!(provider.is_none());
+        assert!(parts.is_none());
         assert!(matches!(error, Some(SetupError::InvalidEndpoint { .. })));
     }
 }
