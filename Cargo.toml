@@ -86,6 +86,14 @@ apollo-parser = "0.8.5"
 tower-mcp-types = "0.12.0"
 regex = "1"
 
+# Allocation-free integer and float formatting, for rendering event fields on
+# the sandbox's logging hot path. Both are already in the tree via serde_json.
+itoa = "1"
+ryu = "1"
+
+# Benchmarking
+criterion = { version = "0.7", features = ["html_reports"] }
+
 # HTTP client
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 
@@ -170,4 +178,11 @@ strip = true
 
 [profile.dev]
 # Faster compile times for dev builds
+debug = 1
+
+# Benchmarks measure the telemetry hot path, where the cost being measured is
+# allocation and serialization in inlined generic code. An unoptimized build
+# reports numbers dominated by debug overhead and ranks alternatives wrongly, so
+# benches always build optimized, with symbols kept for profiling.
+[profile.bench]
 debug = 1

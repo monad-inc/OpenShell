@@ -37,6 +37,15 @@ pub const SEVERITY_ID_KEY: &str = "ocsf.severity_id";
 /// the shorthand reason budget.
 const MAX_VALUE_LEN: usize = 256;
 
+/// Leaf count of a representative production event, used to size the output map
+/// so filling it does not rehash. Overshooting costs a little memory per event;
+/// undershooting costs repeated reallocation on the sandbox's hot path.
+const TYPICAL_FIELD_COUNT: usize = 48;
+
+/// Longest key path seen in practice (`ocsf.actor.process.parent_process…`),
+/// used to size the scratch buffer so the walk never reallocates it.
+const TYPICAL_KEY_LEN: usize = 64;
+
 /// Marker appended to a value cut at [`MAX_VALUE_LEN`], so a consumer can tell
 /// truncation from a value that happened to end there.
 const TRUNCATION_SUFFIX: &str = "…";
@@ -54,32 +63,50 @@ const TRUNCATION_SUFFIX: &str = "…";
 /// it, and this is a diagnostic path.
 #[must_use]
 pub fn flatten_event(event: &OcsfEvent) -> HashMap<String, String> {
-    let mut out = HashMap::new();
-    match event.to_json() {
-        Ok(value) => flatten_value(KEY_PREFIX, &value, &mut out),
-        Err(_) => return out,
-    }
+    let Ok(value) = event.to_json() else {
+        return HashMap::new();
+    };
+    // A production event flattens to roughly this many leaves; sizing up front
+    // avoids rehashing the map several times while filling it.
+    let mut out = HashMap::with_capacity(TYPICAL_FIELD_COUNT);
+    let mut path = String::with_capacity(TYPICAL_KEY_LEN);
+    path.push_str(KEY_PREFIX);
+    flatten_value(&mut path, &value, &mut out);
     out
 }
 
-/// Recursively flatten `value` into `out` under `key`.
-fn flatten_value(key: &str, value: &serde_json::Value, out: &mut HashMap<String, String>) {
+/// Recursively flatten `value` into `out` under the key currently in `path`.
+///
+/// `path` is a scratch buffer that grows and rewinds as the walk descends and
+/// returns, so each nested level costs a push and a truncate rather than a fresh
+/// allocation. Only leaves allocate, and only for the key they keep.
+fn flatten_value(path: &mut String, value: &serde_json::Value, out: &mut HashMap<String, String>) {
     match value {
         serde_json::Value::Null => {}
         serde_json::Value::Object(map) => {
+            let base = path.len();
             for (name, child) in map {
-                flatten_value(&format!("{key}.{name}"), child, out);
+                path.push('.');
+                path.push_str(name);
+                flatten_value(path, child, out);
+                path.truncate(base);
             }
         }
-        serde_json::Value::Array(items) => flatten_array(key, items, out),
+        serde_json::Value::Array(items) => flatten_array(path, items, out),
         scalar => {
-            out.insert(key.to_string(), truncate(&scalar_to_string(scalar)));
+            let mut rendered = String::new();
+            push_scalar(&mut rendered, scalar);
+            out.insert(path.clone(), truncate(rendered));
         }
     }
 }
 
 /// Flatten an array, joining scalars and indexing everything else.
-fn flatten_array(key: &str, items: &[serde_json::Value], out: &mut HashMap<String, String>) {
+fn flatten_array(
+    path: &mut String,
+    items: &[serde_json::Value],
+    out: &mut HashMap<String, String>,
+) {
     if items.is_empty() {
         return;
     }
@@ -87,34 +114,60 @@ fn flatten_array(key: &str, items: &[serde_json::Value], out: &mut HashMap<Strin
         .iter()
         .all(|item| !item.is_object() && !item.is_array())
     {
-        let joined = items
-            .iter()
-            .filter(|item| !item.is_null())
-            .map(scalar_to_string)
-            .collect::<Vec<_>>()
-            .join(",");
+        let mut joined = String::new();
+        for item in items.iter().filter(|item| !item.is_null()) {
+            if !joined.is_empty() {
+                joined.push(',');
+            }
+            push_scalar(&mut joined, item);
+        }
         if !joined.is_empty() {
-            out.insert(key.to_string(), truncate(&joined));
+            out.insert(path.clone(), truncate(joined));
         }
         return;
     }
+    let base = path.len();
+    let mut index_buf = itoa::Buffer::new();
     for (index, item) in items.iter().enumerate() {
-        flatten_value(&format!("{key}.{index}"), item, out);
+        path.push('.');
+        path.push_str(index_buf.format(index));
+        flatten_value(path, item, out);
+        path.truncate(base);
     }
 }
 
-/// Render a JSON scalar without the quoting `to_string` would add to strings.
-fn scalar_to_string(value: &serde_json::Value) -> String {
+/// Append a JSON scalar to `out` without the quoting `to_string` adds to
+/// strings, and without allocating a temporary for numbers.
+fn push_scalar(out: &mut String, value: &serde_json::Value) {
     match value {
-        serde_json::Value::String(text) => text.clone(),
-        other => other.to_string(),
+        serde_json::Value::String(text) => out.push_str(text),
+        serde_json::Value::Bool(flag) => out.push_str(if *flag { "true" } else { "false" }),
+        serde_json::Value::Number(number) => {
+            if let Some(int) = number.as_i64() {
+                out.push_str(itoa::Buffer::new().format(int));
+            } else if let Some(float) = number.as_f64() {
+                out.push_str(ryu::Buffer::new().format(float));
+            } else {
+                out.push_str(&number.to_string());
+            }
+        }
+        // Null is filtered before this point; objects and arrays never reach it.
+        other => out.push_str(&other.to_string()),
     }
 }
 
-/// Cut `value` to [`MAX_VALUE_LEN`] on a character boundary, marking the cut.
-fn truncate(value: &str) -> String {
+/// Cut `value` to [`MAX_VALUE_LEN`] characters, marking the cut.
+///
+/// Takes ownership so the overwhelmingly common short value is returned
+/// untouched rather than copied. The byte-length check is a fast path: a string
+/// short enough in bytes is always short enough in characters, which avoids
+/// walking the string at all for the usual case.
+fn truncate(value: String) -> String {
+    if value.len() <= MAX_VALUE_LEN {
+        return value;
+    }
     if value.chars().count() <= MAX_VALUE_LEN {
-        return value.to_string();
+        return value;
     }
     let mut cut: String = value.chars().take(MAX_VALUE_LEN).collect();
     cut.push_str(TRUNCATION_SUFFIX);
@@ -185,7 +238,7 @@ mod tests {
     fn object_arrays_are_indexed() {
         let mut out = HashMap::new();
         let value = serde_json::json!([{"name": "a"}, {"name": "b"}]);
-        flatten_value("ocsf.affected", &value, &mut out);
+        flatten_value(&mut "ocsf.affected".to_string(), &value, &mut out);
 
         assert_eq!(
             out.get("ocsf.affected.0.name").map(String::as_str),
@@ -201,7 +254,7 @@ mod tests {
     fn nulls_and_empty_arrays_produce_no_keys() {
         let mut out = HashMap::new();
         let value = serde_json::json!({"absent": null, "none": [], "kept": 1});
-        flatten_value("ocsf", &value, &mut out);
+        flatten_value(&mut "ocsf".to_string(), &value, &mut out);
 
         assert_eq!(out.len(), 1);
         assert_eq!(out.get("ocsf.kept").map(String::as_str), Some("1"));
@@ -211,7 +264,11 @@ mod tests {
     fn long_values_are_truncated_and_marked() {
         let mut out = HashMap::new();
         let long = "x".repeat(MAX_VALUE_LEN + 50);
-        flatten_value("ocsf", &serde_json::json!({ "reason": long }), &mut out);
+        flatten_value(
+            &mut "ocsf".to_string(),
+            &serde_json::json!({ "reason": long }),
+            &mut out,
+        );
 
         let stored = out.get("ocsf.reason").expect("reason kept");
         assert_eq!(stored.chars().count(), MAX_VALUE_LEN + 1);
@@ -223,7 +280,11 @@ mod tests {
         let mut out = HashMap::new();
         // Truncating by bytes here would panic or produce invalid UTF-8.
         let long = "é".repeat(MAX_VALUE_LEN + 10);
-        flatten_value("ocsf", &serde_json::json!({ "reason": long }), &mut out);
+        flatten_value(
+            &mut "ocsf".to_string(),
+            &serde_json::json!({ "reason": long }),
+            &mut out,
+        );
 
         let stored = out.get("ocsf.reason").expect("reason kept");
         assert_eq!(stored.chars().count(), MAX_VALUE_LEN + 1);

@@ -14,11 +14,18 @@ repository.workspace = true
 chrono = { version = "0.4", features = ["serde"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+itoa = { workspace = true }
+ryu = { workspace = true }
 serde_repr = "0.1"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
+[[bench]]
+name = "event_rendering"
+harness = false
+
 [dev-dependencies]
+criterion = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
 
 [lints]

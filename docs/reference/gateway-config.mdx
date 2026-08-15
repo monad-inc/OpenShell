@@ -241,6 +241,16 @@ The gateway forwards the OTLP configuration to managed external drivers. Each dr
 
 `ocsf_full_payload` carries the structured OCSF fields on exported records rather than only the human-readable summary. It has no effect unless `export_logs` is set, and it increases per-record size, so leave it off unless the collector or SIEM consumes the OCSF schema directly.
 
+### Export capacity
+
+Log export is bounded by the SDK's log record queue, not by the gateway. The queue holds `OTEL_BLRP_MAX_QUEUE_SIZE` records — **2048** by default — and once it fills, the SDK drops records and reports `BatchLogProcessor.LogDroppingStarted` at WARN. A gateway aggregating several busy sandboxes can produce lines faster than a distant collector accepts them, so raise the queue and the batch size before running one in production:
+
+```shell
+OTEL_BLRP_MAX_QUEUE_SIZE=65536 OTEL_BLRP_MAX_EXPORT_BATCH_SIZE=2048
+```
+
+The gateway's own fan-in sustains a few hundred thousand lines per second, and the queue drains as fast as the collector acknowledges batches. Watch for that WARN: it is the signal that export, rather than the sandbox, is the limiting stage.
+
 Sandboxes push OCSF events with the schema flattened into dotted `ocsf.*` attributes alongside the rendered summary, so a SIEM can match a field instead of pattern-matching the line:
 
 ```text
@@ -260,6 +270,7 @@ This table decides whether and where to export. How the SDK exports is controlle
 |---|---|
 | `OTEL_TRACES_SAMPLER`, `OTEL_TRACES_SAMPLER_ARG` | Sampling strategy and ratio. Defaults to `parentbased_always_on`. |
 | `OTEL_BSP_SCHEDULE_DELAY`, `OTEL_BSP_MAX_QUEUE_SIZE`, `OTEL_BSP_MAX_EXPORT_BATCH_SIZE`, `OTEL_BSP_EXPORT_TIMEOUT` | Batch span processor tuning. |
+| `OTEL_BLRP_SCHEDULE_DELAY`, `OTEL_BLRP_MAX_QUEUE_SIZE`, `OTEL_BLRP_MAX_EXPORT_BATCH_SIZE`, `OTEL_BLRP_EXPORT_TIMEOUT` | Batch **log** record processor tuning. Separate from the span knobs above; `OTEL_BSP_*` has no effect on log export. |
 | `OTEL_RESOURCE_ATTRIBUTES` | Additional resource attributes, such as `deployment.environment=prod`. |
 | `OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT`, `OTEL_SPAN_EVENT_COUNT_LIMIT`, `OTEL_SPAN_LINK_COUNT_LIMIT` | Per-span limits. |
 | `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_EXPORTER_OTLP_COMPRESSION`, `OTEL_EXPORTER_OTLP_TIMEOUT` | Exporter transport tuning. |

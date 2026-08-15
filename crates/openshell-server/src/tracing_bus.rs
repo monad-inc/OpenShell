@@ -130,10 +130,23 @@ impl TracingLogBus {
             export.enqueue(log.clone());
         }
 
-        let tx = self.sender_for(sandbox_id);
-        let _ = tx.send(event.clone());
-
+        // One lock acquisition covers both the broadcast lookup and the tail.
+        // Every sandbox's lines converge here, so taking it twice per line
+        // doubled the contention this point creates.
         let mut inner = self.inner.lock().expect("tracing bus lock poisoned");
+
+        // Broadcast only when something is actually watching. A live watcher —
+        // `openshell logs -f`, the TUI — is the exception rather than the rule,
+        // and this clone copies the line's whole flattened field map, which is
+        // the most expensive part of publishing an OCSF event. Skipping it when
+        // there are no receivers changes nothing observable: the send was
+        // already a discarded error in that case.
+        if let Some(tx) = inner.per_id.get(sandbox_id)
+            && tx.receiver_count() > 0
+        {
+            let _ = tx.send(event.clone());
+        }
+
         let deque = inner.tails.entry(sandbox_id.to_string()).or_default();
         deque.push_back(event);
         while deque.len() > tail_cap {
