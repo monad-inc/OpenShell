@@ -18,6 +18,7 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use openshell_core::proto::SandboxLogLine;
 use openshell_ocsf::OCSF_TARGET;
+use openshell_ocsf::format::shorthand::severity_id_from_shorthand;
 use opentelemetry::Key;
 use opentelemetry::logs::{AnyValue, LogRecord as _, Logger as _, Severity};
 use opentelemetry_sdk::logs::{SdkLogger, SdkLoggerProvider};
@@ -65,8 +66,9 @@ pub fn spawn(provider: &SdkLoggerProvider, ocsf_full_payload: bool) -> LogExport
 /// Convert a [`SandboxLogLine`] into an OTLP log record and emit it.
 fn emit_line(logger: &SdkLogger, line: &SandboxLogLine, ocsf_full_payload: bool) {
     let mut record = logger.create_log_record();
+    let is_ocsf = line.target == OCSF_TARGET;
 
-    record.set_severity_number(severity_of(&line.level));
+    record.set_severity_number(severity_for(line, is_ocsf));
     record.set_body(AnyValue::String(line.message.clone().into()));
 
     if line.timestamp_ms > 0 {
@@ -78,7 +80,6 @@ fn emit_line(logger: &SdkLogger, line: &SandboxLogLine, ocsf_full_payload: bool)
     record.add_attribute(Key::from_static_str("log.target"), line.target.clone());
     record.add_attribute(Key::from_static_str("log.level"), line.level.clone());
 
-    let is_ocsf = line.target == OCSF_TARGET;
     record.add_attribute(Key::from_static_str("log.ocsf"), is_ocsf);
 
     // Structured fields. For OCSF events these are only populated once
@@ -94,6 +95,36 @@ fn emit_line(logger: &SdkLogger, line: &SandboxLogLine, ocsf_full_payload: bool)
     logger.emit(record);
 }
 
+/// Resolve the OTLP severity for an exported log line.
+///
+/// OCSF events all carry the level `OCSF`, so the level alone cannot rank a
+/// blocked nonce replay above a routine policy load. The severity the sandbox
+/// assigned survives in the rendered shorthand, so recover it from there and
+/// fall back to the level when a line carries no tag.
+fn severity_for(line: &SandboxLogLine, is_ocsf: bool) -> Severity {
+    if is_ocsf && let Some(id) = severity_id_from_shorthand(&line.message) {
+        return ocsf_severity(id);
+    }
+    severity_of(&line.level)
+}
+
+/// Map an OCSF `severity_id` onto an OTLP severity number.
+///
+/// OCSF ranks six levels where OTLP offers four bands of four. Low and Medium
+/// share the WARN band and High and Critical the ERROR band, using the second
+/// slot of each so the OCSF ordering survives instead of collapsing.
+fn ocsf_severity(severity_id: u8) -> Severity {
+    match severity_id {
+        2 => Severity::Warn,   // Low
+        3 => Severity::Warn2,  // Medium
+        4 => Severity::Error,  // High
+        5 => Severity::Error2, // Critical
+        6 => Severity::Fatal,  // Fatal
+        // Unknown and Informational.
+        _ => Severity::Info,
+    }
+}
+
 /// Map an `OpenShell` log level string onto an OTLP severity number.
 fn severity_of(level: &str) -> Severity {
     match level {
@@ -101,8 +132,8 @@ fn severity_of(level: &str) -> Severity {
         "DEBUG" => Severity::Debug,
         "WARN" | "WARNING" => Severity::Warn,
         "ERROR" => Severity::Error,
-        // OCSF security events and INFO both map to informational severity;
-        // the `log.ocsf` attribute distinguishes them downstream.
+        // An OCSF line reaching here carried no severity tag; the `log.ocsf`
+        // attribute still distinguishes it downstream.
         _ => Severity::Info,
     }
 }
@@ -111,6 +142,61 @@ fn severity_of(level: &str) -> Severity {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    fn ocsf_line(message: &str) -> SandboxLogLine {
+        SandboxLogLine {
+            sandbox_id: "sb-1".into(),
+            timestamp_ms: 1,
+            level: "OCSF".into(),
+            target: OCSF_TARGET.into(),
+            message: message.into(),
+            source: "sandbox".into(),
+            fields: HashMap::default(),
+        }
+    }
+
+    #[test]
+    fn ocsf_events_export_at_their_own_severity() {
+        // Every OCSF line carries the level "OCSF", so without reading the
+        // shorthand tag a blocked denial exports as INFO and cannot be alerted
+        // on downstream.
+        let denial = ocsf_line("NET:OPEN [MED] DENIED curl(1) -> blocked.invalid:443");
+        assert_eq!(severity_for(&denial, true), Severity::Warn2);
+
+        let finding = ocsf_line("FINDING:BLOCKED [HIGH] \"NSSH1 Nonce Replay Attack\"");
+        assert_eq!(severity_for(&finding, true), Severity::Error);
+
+        let routine = ocsf_line("CONFIG:LOADED [INFO] Loaded sandbox policy");
+        assert_eq!(severity_for(&routine, true), Severity::Info);
+    }
+
+    #[test]
+    fn ocsf_severity_ordering_survives_the_mapping() {
+        // Distinct OCSF levels must not collapse onto one OTLP number, or
+        // "medium and above" stops being expressible.
+        let severities: Vec<_> = (1..=6u8).map(|id| ocsf_severity(id) as u8).collect();
+        let mut sorted = severities.clone();
+        sorted.dedup();
+        assert_eq!(severities, sorted, "OCSF levels collapsed: {severities:?}");
+        assert!(severities.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn an_untagged_ocsf_line_falls_back_to_its_level() {
+        let untagged = ocsf_line("NET:OPEN no severity tag here");
+        assert_eq!(severity_for(&untagged, true), Severity::Info);
+    }
+
+    #[test]
+    fn non_ocsf_lines_still_use_their_level() {
+        // A gateway line whose text happens to contain a tag must not be
+        // reranked by it.
+        let mut line = ocsf_line("connection refused [HIGH] load");
+        line.level = "WARN".into();
+        line.target = "openshell_server::compute".into();
+        line.source = "gateway".into();
+        assert_eq!(severity_for(&line, false), Severity::Warn);
+    }
 
     #[test]
     fn severity_mapping_covers_known_levels() {

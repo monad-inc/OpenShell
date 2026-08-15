@@ -59,6 +59,30 @@ pub fn severity_tag(severity_id: u8) -> &'static str {
     }
 }
 
+/// Recover the severity id from a formatted shorthand line.
+///
+/// The inverse of [`severity_tag`], for consumers that receive a shorthand
+/// line rather than the event it was built from. The gateway forwards sandbox
+/// OCSF events as their rendered text, so the severity the sandbox assigned
+/// survives only inside that text; exporters read it back through here rather
+/// than matching the tag spellings themselves, which would silently disagree
+/// with [`severity_tag`] the moment a tag changes.
+///
+/// Returns `None` when no known tag is present. `[INFO]` reports `1`
+/// (Informational) rather than `0` (Unknown): [`severity_tag`] renders both as
+/// `[INFO]`, so a rendered line cannot tell them apart.
+///
+/// Ids 1 through 6 cover every distinct tag. The leftmost match wins, because
+/// the tag sits immediately after `CLASS:ACTIVITY` while a later `[...]` of the
+/// same spelling could appear inside a message or reason.
+#[must_use]
+pub fn severity_id_from_shorthand(line: &str) -> Option<u8> {
+    (1..=6u8)
+        .filter_map(|id| line.find(severity_tag(id)).map(|at| (at, id)))
+        .min()
+        .map(|(_, id)| id)
+}
+
 /// Max length for the reason text in `[reason:...]` before truncation. A
 /// denial reason carries the full destination endpoint plus the rejecting
 /// policy name (e.g. `endpoint host.example:443 not in policy <name>`), so the
@@ -478,6 +502,37 @@ mod tests {
         HttpActivityEvent, NetworkActivityEvent, ProcessActivityEvent, SshActivityEvent,
     };
     use crate::objects::*;
+
+    #[test]
+    fn severity_survives_a_round_trip_through_the_shorthand_tag() {
+        // Pins the parser to the formatter: renaming a tag in `severity_tag`
+        // without teaching `severity_id_from_shorthand` about it fails here
+        // rather than silently flattening severity at the export boundary.
+        for id in 1..=6u8 {
+            let line = format!("NET:OPEN {} DENIED curl(1) -> host:443", severity_tag(id));
+            assert_eq!(
+                severity_id_from_shorthand(&line),
+                Some(id),
+                "id {id} did not survive the round trip"
+            );
+        }
+        // Unknown renders as `[INFO]`, so it comes back as Informational.
+        let unknown = format!("NET:OPEN {} ALLOWED", severity_tag(0));
+        assert_eq!(severity_id_from_shorthand(&unknown), Some(1));
+    }
+
+    #[test]
+    fn severity_parsing_prefers_the_tag_over_a_later_lookalike() {
+        // The reason text carries an operator-supplied string; a bracketed
+        // lookalike in it must not outrank the real tag.
+        let line = "NET:OPEN [MED] DENIED curl(1) -> host:443 [reason:downgraded from [HIGH]]";
+        assert_eq!(severity_id_from_shorthand(line), Some(3));
+    }
+
+    #[test]
+    fn severity_parsing_reports_no_tag() {
+        assert_eq!(severity_id_from_shorthand("plain log line, no tag"), None);
+    }
 
     fn test_metadata() -> Metadata {
         Metadata {
