@@ -370,11 +370,11 @@ pub fn record_for(
 
     record.add_attribute(Key::from_static_str("log.ocsf"), is_ocsf);
 
-    // Structured fields. A sandbox pushes OCSF events with their schema
-    // flattened into `ocsf.*` keys — or as one `ocsf.raw` JSON field — which is
-    // the bulk of a security event's size, so `ocsf_full_payload` gates whether
-    // that detail leaves the box. Non-OCSF lines carry whatever their producer
-    // attached and always travel.
+    // Structured fields. A sandbox pushes OCSF events as one `ocsf.raw` JSON
+    // field (the default) or with their schema flattened into `ocsf.*` keys —
+    // either way the bulk of a security event's size, so `ocsf_full_payload`
+    // gates whether that detail leaves the box. Non-OCSF lines carry whatever
+    // their producer attached and always travel.
     if !line.fields.is_empty() && (!is_ocsf || ocsf_full_payload) {
         for (key, value) in line.fields {
             record.add_attribute(Key::new(key), value);

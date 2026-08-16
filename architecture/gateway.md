@@ -695,12 +695,13 @@ Buffered spans and queued log records flush after the server loop exits so
 
 Per-record export cost is dominated by attribute count, not payload bytes, so
 the shape OCSF events arrive in sets the gateway's export ceiling: events
-flattened into dotted `ocsf.*` attributes (the default) cost roughly an order
-of magnitude more per record at every stage than events pushed as one raw JSON
-field (`OPENSHELL_OCSF_PUSH_FORMAT=raw`). The `log_fanin` and `log_export`
-benches measure both stages; a sustained stream of `telemetry_gap` records in
-production is the signal that aggregate sandbox line rate has passed one
-gateway's ceiling and it is time to switch shapes or add gateways.
+pushed as one raw JSON field (the default) cost roughly an order of magnitude
+less per record at every stage than events flattened into dotted `ocsf.*`
+attributes (opt-in via `OPENSHELL_OCSF_PUSH_FORMAT=flat`). The `log_fanin` and
+`log_export` benches measure both stages; a sustained stream of
+`telemetry_gap` records in production is the signal that aggregate sandbox
+line rate has passed one gateway's ceiling and it is time to switch shapes or
+add gateways.
 
 ### Package-managed gateway registry
 

@@ -33,7 +33,8 @@ use opentelemetry_sdk::logs::{LogBatch, LogExporter, SdkLoggerProvider};
 const LINES_PER_ITER: usize = 32_768;
 
 /// A sandbox-pushed OCSF line with its schema flattened into dotted fields, as
-/// the default push format sends it. 46 fields matches a production denial.
+/// `OPENSHELL_OCSF_PUSH_FORMAT=flat` sends it. 46 fields matches a production
+/// denial.
 fn flattened_line(field_count: usize) -> SandboxLogLine {
     let mut fields = HashMap::with_capacity(field_count);
     for i in 0..field_count {
@@ -46,8 +47,8 @@ fn flattened_line(field_count: usize) -> SandboxLogLine {
     ocsf_line(fields)
 }
 
-/// The same event pushed as one raw JSON field plus the severity, as
-/// `OPENSHELL_OCSF_PUSH_FORMAT=raw` sends it. The JSON body is sized like a
+/// The same event pushed as one raw JSON field plus the severity, as the
+/// default push format sends it. The JSON body is sized like a
 /// production denial (~2 KB), so the comparison holds bytes roughly constant
 /// while collapsing the attribute count.
 fn raw_line() -> SandboxLogLine {

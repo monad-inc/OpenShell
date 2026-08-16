@@ -129,19 +129,31 @@ performance lever. Each event is pushed with a human-readable shorthand message
 plus structured fields in one of two shapes, selected per sandbox with
 `OPENSHELL_OCSF_PUSH_FORMAT`:
 
-- **`flat`** (default): the event schema flattened into ~46 dotted `ocsf.*`
-  attributes (`ocsf.dst_endpoint.port`, `ocsf.actor.process.name`, …).
-  Records arrive query-ready — a SIEM matches fields directly — but every
-  stage pays per attribute, and individual values are truncated at 256
-  characters.
-
-- **`raw`**: the complete OCSF document as a single `ocsf.raw` JSON attribute,
-  with `ocsf.severity_id` beside it so gateway severity ranking is identical.
-  Nothing is flattened, joined, or truncated — this is *higher* fidelity than
-  `flat` — and it is 4–10× cheaper at every stage. The collector restores
+- **`raw`** (the default): the complete OCSF document as a single `ocsf.raw`
+  JSON attribute, with `ocsf.severity_id` beside it so gateway severity
+  ranking is identical. Nothing is flattened, joined, or truncated — this is
+  the *highest*-fidelity shape, byte-identical to the sandbox's local JSONL
+  record — and it is 4–10× cheaper at every stage. The collector restores
   field-level structure downstream with a transform (OTTL `ParseJSON`); the
   exact processor config is in the
   [gateway config reference](../docs/reference/gateway-config.mdx).
+
+- **`flat`** (opt-in): the event schema flattened into ~46 dotted `ocsf.*`
+  attributes (`ocsf.dst_endpoint.port`, `ocsf.actor.process.name`, …).
+  Records arrive query-ready with no parse step anywhere in the pipeline, but
+  every stage pays per attribute, values are stringified, and individual
+  values are truncated at 256 characters. Use it only when there is nowhere
+  downstream to parse JSON — no collector transform and no SIEM-side parsing.
+
+Why the raw document is a JSON *string* rather than a nested OTLP object:
+OTLP log attributes do allow arbitrarily nested maps, but a structured value
+would be re-materialized (allocated, cloned, re-encoded) at every hop through
+the sandbox, gateway, and exporter, while a string moves as one memcpy — the
+entire reason `raw` is cheap. A JSON string is also the most portable
+representation across collectors and SIEMs, and it keeps the exported payload
+byte-identical to the local JSONL record, which matters for forensics.
+Structure is a one-line transform away in the collector, where compute is
+elastic.
 
 In both shapes, `ocsf.severity_id` sets the OTLP record's severity, so a
 blocked nonce replay outranks a routine policy load and "medium and above"
@@ -178,8 +190,8 @@ locally is the text you search in the SIEM.
 ### 2. OCSF JSONL file — `/var/log/openshell-ocsf.*.log` in the sandbox
 
 The complete OCSF v1.7.0 document, one compact JSON object per line (shown
-pretty-printed here). This is the full-fidelity local record, and in `raw`
-push format it is byte-for-byte what travels in `ocsf.raw`:
+pretty-printed here). This is the full-fidelity local record, and in the
+default `raw` push format it is byte-for-byte what travels in `ocsf.raw`:
 
 ```json
 {
@@ -216,13 +228,33 @@ push format it is byte-for-byte what travels in `ocsf.raw`:
 }
 ```
 
-### 3. Exported OTLP record — `flat` push format (the default)
+### 3. Exported OTLP record — `raw` push format (the default)
 
 What your collector receives per event (shown as the collector `debug`
 exporter prints it). The body is the shorthand line; the gateway adds the
-`sandbox.id` and `log.*` envelope; the event schema arrives as one string
-attribute per leaf. **All `ocsf.*` values are strings in `flat`**, including
-numbers, and single values are truncated at 256 characters:
+`sandbox.id` and `log.*` envelope; the event arrives as two attributes —
+`ocsf.raw` holding the complete JSONL document (section 2) verbatim and
+untruncated, and `ocsf.severity_id` for parse-free routing:
+
+```text
+Body: Str(NET:OPEN [MED] DENIED /usr/bin/curl(64) -> blocked.invalid:443 [policy:- engine:opa] [reason:endpoint blocked.invalid:443 is not allowed by any policy])
+SeverityNumber: Warn2(14)
+Attributes:
+  -> sandbox.id: Str(sb-7f3a)
+  -> log.source: Str(sandbox)
+  -> log.target: Str(ocsf)
+  -> log.level: Str(OCSF)
+  -> log.ocsf: Bool(true)
+  -> ocsf.severity_id: Str(3)
+  -> ocsf.raw: Str({"action":"Denied","action_id":2,"activity_id":1,"activity_name":"Open","actor":{"process":{"cmd_line":"curl -sS https://blocked.invalid","name":"/usr/bin/curl",…,"severity_id":3,…,"type_uid":400101})
+```
+
+### 4. Exported OTLP record — `flat` push format (opt-in)
+
+Same envelope and body; with `OPENSHELL_OCSF_PUSH_FORMAT=flat` the event
+schema instead arrives pre-exploded, one string attribute per leaf. **All
+`ocsf.*` values are strings in `flat`**, including numbers, and single values
+are truncated at 256 characters:
 
 ```text
 Body: Str(NET:OPEN [MED] DENIED /usr/bin/curl(64) -> blocked.invalid:443 [policy:- engine:opa] [reason:endpoint blocked.invalid:443 is not allowed by any policy])
@@ -282,25 +314,6 @@ Flattening rules visible above: nested objects join with `.`
 (`ocsf.metadata.profiles`), arrays of objects would be indexed
 (`ocsf.affected.0.name`), and absent fields are omitted entirely rather than
 sent empty.
-
-### 4. Exported OTLP record — `raw` push format
-
-Same envelope and body; the event arrives as two attributes instead of ~46.
-`ocsf.raw` holds the complete JSONL document (section 2) verbatim and
-untruncated:
-
-```text
-Body: Str(NET:OPEN [MED] DENIED /usr/bin/curl(64) -> blocked.invalid:443 [policy:- engine:opa] [reason:endpoint blocked.invalid:443 is not allowed by any policy])
-SeverityNumber: Warn2(14)
-Attributes:
-  -> sandbox.id: Str(sb-7f3a)
-  -> log.source: Str(sandbox)
-  -> log.target: Str(ocsf)
-  -> log.level: Str(OCSF)
-  -> log.ocsf: Bool(true)
-  -> ocsf.severity_id: Str(3)
-  -> ocsf.raw: Str({"action":"Denied","action_id":2,"activity_id":1,"activity_name":"Open","actor":{"process":{"cmd_line":"curl -sS https://blocked.invalid","name":"/usr/bin/curl",…,"severity_id":3,…,"type_uid":400101})
-```
 
 ### 5. Exported OTLP record — `ocsf_full_payload = false`
 
@@ -414,12 +427,13 @@ How to read this for capacity planning:
   and export worker are shared: their ceilings bound the whole deployment.
 - **The export worker is the bottleneck stage.** Fan-in sustains hundreds of
   thousands of lines per second across concurrent sandboxes; export drains
-  ~68 K/s in `flat` and ~289 K/s in `raw`. Estimate your aggregate OCSF
-  lines/second across every sandbox one gateway serves and compare to the
-  ceiling for your shape.
-- **The scaling levers, in order:** switch busy fleets to `raw`; then add
-  gateways. Also check collector capacity — the bench numbers stop at the
-  exporter boundary, so wire encoding and a slow collector reduce them.
+  ~289 K/s in the default `raw` shape and ~68 K/s in `flat`. Estimate your
+  aggregate OCSF lines/second across every sandbox one gateway serves and
+  compare to the ceiling for your shape.
+- **The scaling levers, in order:** move any `flat` fleets back to the `raw`
+  default; then add gateways. Also check collector capacity — the bench
+  numbers stop at the exporter boundary, so wire encoding and a slow
+  collector reduce them.
 - **The signal is built in.** When the aggregate rate passes the ceiling,
   `telemetry_gap` records appear in your collector. That is the "scale up
   or change shape" alarm, not a hint buried in gateway logs.
@@ -432,8 +446,8 @@ How to read this for capacity planning:
 |---|---|---|
 | Local development | Nothing (no `[openshell.gateway.otlp]` table) | stderr + rolling files in each sandbox, `openshell logs` / TUI via the gateway. No off-box export. |
 | Traces only | `[openshell.gateway.otlp] endpoint = "…"` | Distributed traces to your collector; logs stay on the visibility plane. |
-| SIEM, query-ready records | Add `export_logs = true`, `ocsf_full_payload = true` (default `flat` shape) | Every line off-box as OTLP records; OCSF events carry matchable `ocsf.*` fields. Ceiling ~68 K lines/s per gateway. |
-| High-scale fleet / busy sandboxes | Same, plus `OPENSHELL_OCSF_PUSH_FORMAT=raw` on sandboxes and a `ParseJSON` transform in the collector | Full-fidelity OCSF at ~4× the export ceiling and ~2× cheaper sandboxes. |
+| SIEM / security telemetry (recommended) | Add `export_logs = true`, `ocsf_full_payload = true`, and a `ParseJSON` transform in the collector (default `raw` shape) | Every line off-box as OTLP records; full-fidelity OCSF documents, byte-identical to the sandbox's local JSONL. Ceiling ~289 K lines/s per gateway. |
+| No collector transform available | Same, plus `OPENSHELL_OCSF_PUSH_FORMAT=flat` on sandboxes | Query-ready `ocsf.*` attributes with no parse step anywhere — at ~¼ the export ceiling, stringified values, and 256-char truncation. |
 | Minimal export volume | `export_logs = true`, `ocsf_full_payload = false` | Shorthand summaries with correct severity ranking; structured OCSF payload stays on the box (JSONL file remains available). |
 
 Full knob-by-knob reference, including TLS behavior, `OTEL_*` environment

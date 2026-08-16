@@ -30,15 +30,16 @@ const ENQUEUE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_mi
 /// Selected once at startup via `OPENSHELL_OCSF_PUSH_FORMAT`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OcsfPushFormat {
-    /// Flatten the event into dotted `ocsf.*` fields (default). A consumer can
-    /// match individual fields without parsing, but rendering costs one entry
-    /// per leaf on this hot path — and the same again at every hop that clones
-    /// or converts the map.
+    /// Flatten the event into dotted `ocsf.*` fields (opt-in via `flat`).
+    /// A consumer can match individual fields with no parse step anywhere,
+    /// but rendering costs one entry per leaf on this hot path — and the same
+    /// again at every hop that clones or converts the map — and values are
+    /// truncated and stringified.
     Flat,
     /// Push the complete event JSON as a single `ocsf.raw` field (plus
-    /// `ocsf.severity_id` for gateway ranking). Full fidelity, no truncation,
-    /// and a fraction of the per-event cost end to end; the collector parses
-    /// the document downstream instead.
+    /// `ocsf.severity_id` for gateway ranking). The default: full fidelity,
+    /// no truncation, and a fraction of the per-event cost end to end; a
+    /// consumer that wants individual fields parses the document downstream.
     Raw,
 }
 
@@ -47,13 +48,13 @@ impl OcsfPushFormat {
         Self::parse(std::env::var("OPENSHELL_OCSF_PUSH_FORMAT").ok().as_deref())
     }
 
-    /// `raw` selects raw form; anything else — unset, `flat`, or a value we do
-    /// not recognize — keeps the default, because a typo must not silently
-    /// change what a SIEM receives beyond what it already handles.
+    /// `flat` opts into flattened fields; anything else — unset, `raw`, or a
+    /// value we do not recognize — keeps the default, because a typo must not
+    /// silently change what a SIEM receives beyond what it already handles.
     fn parse(value: Option<&str>) -> Self {
         match value {
-            Some(v) if v.trim().eq_ignore_ascii_case("raw") => Self::Raw,
-            _ => Self::Flat,
+            Some(v) if v.trim().eq_ignore_ascii_case("flat") => Self::Flat,
+            _ => Self::Raw,
         }
     }
 }
@@ -482,13 +483,13 @@ mod tests {
     }
 
     #[test]
-    fn ocsf_push_format_parses_raw_and_defaults_everything_else() {
-        assert_eq!(OcsfPushFormat::parse(Some("raw")), OcsfPushFormat::Raw);
-        assert_eq!(OcsfPushFormat::parse(Some(" RAW ")), OcsfPushFormat::Raw);
+    fn ocsf_push_format_parses_flat_and_defaults_everything_else_to_raw() {
         assert_eq!(OcsfPushFormat::parse(Some("flat")), OcsfPushFormat::Flat);
+        assert_eq!(OcsfPushFormat::parse(Some(" FLAT ")), OcsfPushFormat::Flat);
+        assert_eq!(OcsfPushFormat::parse(Some("raw")), OcsfPushFormat::Raw);
         // A typo must degrade to the default, never to silence.
-        assert_eq!(OcsfPushFormat::parse(Some("rawr")), OcsfPushFormat::Flat);
-        assert_eq!(OcsfPushFormat::parse(None), OcsfPushFormat::Flat);
+        assert_eq!(OcsfPushFormat::parse(Some("flatt")), OcsfPushFormat::Raw);
+        assert_eq!(OcsfPushFormat::parse(None), OcsfPushFormat::Raw);
     }
 
     #[test]

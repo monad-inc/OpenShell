@@ -90,8 +90,8 @@ fn bench_rendering(c: &mut Criterion) {
         });
     });
 
-    // The raw alternative (`OPENSHELL_OCSF_PUSH_FORMAT=raw`), in isolation.
-    // One serialization and two map entries; compare against `flatten_only`.
+    // The raw default push format, in isolation. One serialization and two
+    // map entries; compare against `flatten_only`.
     group.bench_function("raw_fields_only", |b| {
         b.iter(|| black_box(raw_event_fields(black_box(&denial))));
     });

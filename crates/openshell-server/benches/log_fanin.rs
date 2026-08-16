@@ -48,8 +48,8 @@ fn ocsf_line(sandbox_id: &str, field_count: usize) -> SandboxLogLine {
 }
 
 /// A raw-mode line: the whole event as one ~2 KB `ocsf.raw` JSON field plus
-/// its severity, as `OPENSHELL_OCSF_PUSH_FORMAT=raw` pushes it. Field-map
-/// clone cost collapses to two entries however large the event is.
+/// its severity, as the default push format sends it. Field-map clone cost
+/// collapses to two entries however large the event is.
 fn raw_ocsf_line(sandbox_id: &str) -> SandboxLogLine {
     let mut line = ocsf_line(sandbox_id, 0);
     line.fields.insert(
@@ -68,8 +68,8 @@ fn raw_ocsf_line(sandbox_id: &str) -> SandboxLogLine {
 ///
 /// Isolates what the field map costs the gateway, separately from concurrency.
 /// 0 fields is a pre-Phase-3 line; 46 matches a production denial pushed in
-/// the default flattened format; `raw` is the same event pushed as one JSON
-/// field.
+/// the opt-in flat format; `raw` is the same event pushed as one JSON field,
+/// the default.
 fn bench_publish_by_payload(c: &mut Criterion) {
     let mut group = c.benchmark_group("gateway_publish");
 

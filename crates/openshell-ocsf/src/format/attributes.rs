@@ -86,10 +86,11 @@ pub fn flatten_event(event: &OcsfEvent) -> HashMap<String, String> {
 /// [`RAW_KEY`] plus [`SEVERITY_ID_KEY`], so the gateway can rank the record
 /// without parsing the document.
 ///
-/// This is the cheap, full-fidelity alternative to [`flatten_event`]: one
-/// serialization and two map entries instead of ~46, with no per-value
-/// truncation. The cost moves downstream — a consumer that wants individual
-/// fields parses the JSON after the collector receives it.
+/// This is the default push shape — cheap and full-fidelity: one
+/// serialization and two map entries instead of the ~46 that
+/// [`flatten_event`] produces, with no per-value truncation. The cost moves
+/// downstream — a consumer that wants individual fields parses the JSON after
+/// the collector receives it.
 ///
 /// Returns an empty map when the event cannot be serialized, matching
 /// [`flatten_event`]: losing structure must not cost the caller the event.
