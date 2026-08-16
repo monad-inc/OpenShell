@@ -150,6 +150,245 @@ stays expressible in collector routing. Separately,
 (either shape) leaves the gateway at all — with it off, only the shorthand
 summary and severity export.
 
+## Format reference: one event, every surface
+
+The examples below follow a single policy denial — `curl` inside a sandbox
+trying to reach `blocked.invalid:443` — through every surface it appears on.
+Structure and key names are generated from the real formatters; timestamps and
+context values (`sandbox.id`, hostname, container, versions) are illustrative
+and come from your deployment at runtime.
+
+### 1. Shorthand — sandbox stderr, sandbox log files, `openshell logs`
+
+One line per event, built for a human tail and for grep. OCSF events are
+prefixed `OCSF` and rendered as `CLASS:ACTIVITY [SEVERITY] DISPOSITION`
+followed by the actors and context; ordinary tracing events keep their level
+and target:
+
+```text
+2026-08-16T01:25:31.805Z OCSF NET:OPEN [MED] DENIED /usr/bin/curl(64) -> blocked.invalid:443 [policy:- engine:opa] [reason:endpoint blocked.invalid:443 is not allowed by any policy]
+2026-08-16T01:25:31.810Z INFO openshell_supervisor_network::proxy: flushed 3 denial summaries to gateway
+```
+
+The severity tag ranks the line at a glance: `[INFO]`, `[LOW]`, `[MED]`,
+`[HIGH]`, `[CRIT]`, `[FATAL]`. This same shorthand string becomes the `message` of the
+pushed line and the **body** of the exported OTLP record, so the text you grep
+locally is the text you search in the SIEM.
+
+### 2. OCSF JSONL file — `/var/log/openshell-ocsf.*.log` in the sandbox
+
+The complete OCSF v1.7.0 document, one compact JSON object per line (shown
+pretty-printed here). This is the full-fidelity local record, and in `raw`
+push format it is byte-for-byte what travels in `ocsf.raw`:
+
+```json
+{
+  "activity_id": 1, "activity_name": "Open",
+  "category_uid": 4, "category_name": "Network Activity",
+  "class_uid": 4001, "class_name": "Network Activity",
+  "type_uid": 400101, "type_name": "Network Activity: Open",
+  "action": "Denied", "action_id": 2,
+  "disposition": "Blocked", "disposition_id": 2,
+  "severity": "Medium", "severity_id": 3,
+  "status": "Failure", "status_id": 2,
+  "status_detail": "endpoint blocked.invalid:443 is not allowed by any policy",
+  "message": "CONNECT denied blocked.invalid:443",
+  "time": 1786843531805,
+  "actor": {
+    "process": {
+      "name": "/usr/bin/curl", "pid": 64,
+      "cmd_line": "curl -sS https://blocked.invalid",
+      "parent_process": { "name": "/usr/bin/bash,/usr/bin/containerd-shim", "pid": 0 }
+    }
+  },
+  "dst_endpoint": { "domain": "blocked.invalid", "port": 443 },
+  "src_endpoint": { "ip": "10.200.0.2", "port": 48744 },
+  "proxy_endpoint": { "ip": "127.0.0.1", "port": 3128 },
+  "firewall_rule": { "name": "-", "type": "opa" },
+  "is_src_dst_assignment_known": true,
+  "container": { "name": "sbx-agent-7f3a", "uid": "c1d2e3f4", "image": { "name": "ghcr.io/nvidia/openshell/sandbox:latest" } },
+  "device": { "hostname": "sb-7f3a", "os": { "name": "Linux" } },
+  "metadata": {
+    "version": "1.7.0", "uid": "sb-7f3a",
+    "product": { "name": "OpenShell Sandbox Supervisor", "vendor_name": "OpenShell", "version": "0.9.0" },
+    "profiles": ["security_control", "network_proxy", "container", "host"]
+  }
+}
+```
+
+### 3. Exported OTLP record — `flat` push format (the default)
+
+What your collector receives per event (shown as the collector `debug`
+exporter prints it). The body is the shorthand line; the gateway adds the
+`sandbox.id` and `log.*` envelope; the event schema arrives as one string
+attribute per leaf. **All `ocsf.*` values are strings in `flat`**, including
+numbers, and single values are truncated at 256 characters:
+
+```text
+Body: Str(NET:OPEN [MED] DENIED /usr/bin/curl(64) -> blocked.invalid:443 [policy:- engine:opa] [reason:endpoint blocked.invalid:443 is not allowed by any policy])
+SeverityNumber: Warn2(14)
+Attributes:
+  -> sandbox.id: Str(sb-7f3a)
+  -> log.source: Str(sandbox)
+  -> log.target: Str(ocsf)
+  -> log.level: Str(OCSF)
+  -> log.ocsf: Bool(true)
+  -> ocsf.class_uid: Str(4001)
+  -> ocsf.class_name: Str(Network Activity)
+  -> ocsf.category_uid: Str(4)
+  -> ocsf.activity_id: Str(1)
+  -> ocsf.activity_name: Str(Open)
+  -> ocsf.type_uid: Str(400101)
+  -> ocsf.action: Str(Denied)
+  -> ocsf.action_id: Str(2)
+  -> ocsf.disposition: Str(Blocked)
+  -> ocsf.disposition_id: Str(2)
+  -> ocsf.severity: Str(Medium)
+  -> ocsf.severity_id: Str(3)
+  -> ocsf.status: Str(Failure)
+  -> ocsf.status_id: Str(2)
+  -> ocsf.status_detail: Str(endpoint blocked.invalid:443 is not allowed by any policy)
+  -> ocsf.message: Str(CONNECT denied blocked.invalid:443)
+  -> ocsf.time: Str(1786843531805)
+  -> ocsf.actor.process.name: Str(/usr/bin/curl)
+  -> ocsf.actor.process.pid: Str(64)
+  -> ocsf.actor.process.cmd_line: Str(curl -sS https://blocked.invalid)
+  -> ocsf.actor.process.parent_process.name: Str(/usr/bin/bash,/usr/bin/containerd-shim)
+  -> ocsf.actor.process.parent_process.pid: Str(0)
+  -> ocsf.dst_endpoint.domain: Str(blocked.invalid)
+  -> ocsf.dst_endpoint.port: Str(443)
+  -> ocsf.src_endpoint.ip: Str(10.200.0.2)
+  -> ocsf.src_endpoint.port: Str(48744)
+  -> ocsf.proxy_endpoint.ip: Str(127.0.0.1)
+  -> ocsf.proxy_endpoint.port: Str(3128)
+  -> ocsf.firewall_rule.name: Str(-)
+  -> ocsf.firewall_rule.type: Str(opa)
+  -> ocsf.is_src_dst_assignment_known: Str(true)
+  -> ocsf.container.name: Str(sbx-agent-7f3a)
+  -> ocsf.container.uid: Str(c1d2e3f4)
+  -> ocsf.container.image.name: Str(ghcr.io/nvidia/openshell/sandbox:latest)
+  -> ocsf.device.hostname: Str(sb-7f3a)
+  -> ocsf.device.os.name: Str(Linux)
+  -> ocsf.metadata.version: Str(1.7.0)
+  -> ocsf.metadata.uid: Str(sb-7f3a)
+  -> ocsf.metadata.product.name: Str(OpenShell Sandbox Supervisor)
+  -> ocsf.metadata.product.vendor_name: Str(OpenShell)
+  -> ocsf.metadata.product.version: Str(0.9.0)
+  -> ocsf.metadata.profiles: Str(security_control,network_proxy,container,host)
+```
+
+Flattening rules visible above: nested objects join with `.`
+(`ocsf.dst_endpoint.port`), arrays of scalars join with `,` on one key
+(`ocsf.metadata.profiles`), arrays of objects would be indexed
+(`ocsf.affected.0.name`), and absent fields are omitted entirely rather than
+sent empty.
+
+### 4. Exported OTLP record — `raw` push format
+
+Same envelope and body; the event arrives as two attributes instead of ~46.
+`ocsf.raw` holds the complete JSONL document (section 2) verbatim and
+untruncated:
+
+```text
+Body: Str(NET:OPEN [MED] DENIED /usr/bin/curl(64) -> blocked.invalid:443 [policy:- engine:opa] [reason:endpoint blocked.invalid:443 is not allowed by any policy])
+SeverityNumber: Warn2(14)
+Attributes:
+  -> sandbox.id: Str(sb-7f3a)
+  -> log.source: Str(sandbox)
+  -> log.target: Str(ocsf)
+  -> log.level: Str(OCSF)
+  -> log.ocsf: Bool(true)
+  -> ocsf.severity_id: Str(3)
+  -> ocsf.raw: Str({"action":"Denied","action_id":2,"activity_id":1,"activity_name":"Open","actor":{"process":{"cmd_line":"curl -sS https://blocked.invalid","name":"/usr/bin/curl",…,"severity_id":3,…,"type_uid":400101})
+```
+
+### 5. Exported OTLP record — `ocsf_full_payload = false`
+
+With the payload gate off, only the envelope and shorthand summary leave the
+gateway. Severity ranking is unchanged (the gateway still reads the pushed
+`severity_id` before stripping the fields):
+
+```text
+Body: Str(NET:OPEN [MED] DENIED /usr/bin/curl(64) -> blocked.invalid:443 [policy:- engine:opa] [reason:endpoint blocked.invalid:443 is not allowed by any policy])
+SeverityNumber: Warn2(14)
+Attributes:
+  -> sandbox.id: Str(sb-7f3a)
+  -> log.source: Str(sandbox)
+  -> log.target: Str(ocsf)
+  -> log.level: Str(OCSF)
+  -> log.ocsf: Bool(true)
+```
+
+### 6. Exported OTLP record — plain (non-OCSF) log line
+
+Ordinary `tracing` events from the gateway or a sandbox export with the same
+envelope, `log.ocsf: false`, and severity mapped from their level:
+
+```text
+Body: Str(sandbox started)
+SeverityNumber: Info(9)
+Attributes:
+  -> sandbox.id: Str(sb-7f3a)
+  -> log.source: Str(gateway)
+  -> log.target: Str(openshell_server::compute)
+  -> log.level: Str(INFO)
+  -> log.ocsf: Bool(false)
+```
+
+### 7. `telemetry_gap` — the loss-accounting records
+
+The sandbox emits its gap as a normal log line (so it flows through the same
+pipeline), the gateway as a synthetic OTLP record. Alert on either:
+
+```text
+# Sandbox push gap, as an exported record:
+Body: Str(telemetry gap: 12 sandbox log line(s) dropped under backpressure)
+SeverityNumber: Warn(13)
+Attributes:
+  -> sandbox.id: Str(sb-7f3a)
+  -> log.source: Str(sandbox)
+  -> log.target: Str(telemetry_gap)
+  -> log.level: Str(WARN)
+  -> log.ocsf: Bool(false)
+  -> dropped: Str(12)
+
+# Gateway export gap:
+Body: Str(telemetry gap: 4096 gateway log record(s) dropped under backpressure)
+SeverityNumber: Warn(13)
+Attributes:
+  -> log.source: Str(gateway)
+  -> log.target: Str(telemetry_gap)
+  -> log.level: Str(WARN)
+  -> log.ocsf: Bool(false)
+  -> dropped: Int(4096)
+  -> dropped.since_ms: Int(1786843531805)
+```
+
+The gateway gap has no `sandbox.id` — it accounts for the shared export queue,
+not any one sandbox.
+
+### Envelope, resource, and severity
+
+Every exported record carries the same envelope — `sandbox.id`, `log.source`
+(`sandbox` or `gateway`), `log.target`, `log.level`, `log.ocsf` — and the
+gateway's OTLP resource identity: `service.name` (default
+`openshell-gateway`, configurable) and `service.version`. Route and filter on
+the envelope; it is shape-independent.
+
+OCSF severity maps onto OTLP severity numbers so the ordering survives into
+collector routing rules ("WARN and above" works):
+
+| OCSF `severity_id` | OTLP `SeverityNumber` |
+|---|---|
+| 1 Informational (and 0 Unknown) | Info (9) |
+| 2 Low | Warn (13) |
+| 3 Medium | Warn2 (14) |
+| 4 High | Error (17) |
+| 5 Critical | Error2 (18) |
+| 6 Fatal | Fatal (21) |
+
+Plain lines map by level: TRACE(1), DEBUG(5), INFO(9), WARN(13), ERROR(17).
+
 ## Performance model and bottlenecks
 
 The rule that explains almost every number below: **per-record cost is
