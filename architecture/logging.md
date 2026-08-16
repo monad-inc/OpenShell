@@ -388,6 +388,16 @@ gateway's OTLP resource identity: `service.name` (default
 `openshell-gateway`, configurable) and `service.version`. Route and filter on
 the envelope; it is shape-independent.
 
+The envelope is also a **trust boundary**. The sandbox authors log *content*
+(it is the observer), but the gateway authors *identity*: on the push path it
+validates the authenticated principal's scope against the claimed sandbox and
+then stamps `sandbox.id` and `log.source` itself, discarding whatever the
+sandbox claimed. A compromised sandbox can lie about what happened inside it,
+but it cannot impersonate another sandbox or the gateway. Identity-shaped
+fields *inside* the OCSF document (`metadata.uid`, `device.hostname`,
+`container.*`) are sandbox-authored content — correlate and authorize on the
+gateway-stamped `sandbox.id` attribute, never on the self-reported fields.
+
 OCSF severity maps onto OTLP severity numbers so the ordering survives into
 collector routing rules ("WARN and above" works):
 
@@ -454,6 +464,26 @@ Full knob-by-knob reference, including TLS behavior, `OTEL_*` environment
 variables, and Helm rendering: [gateway config
 reference](../docs/reference/gateway-config.mdx) and the [OTLP export section
 of the gateway architecture doc](gateway.md#otlp-export).
+
+## Growth path: relay export
+
+When one gateway's export ceiling does become the binding constraint, the
+designed next step is **relay export**: the sandbox pre-encodes each OCSF
+event as OTLP-native structured bytes (a protobuf `AnyValue` map — a real
+nested object, not a JSON string), and the gateway splices those bytes into
+outgoing batches without decoding them. Protobuf's length-delimited encoding
+makes the splice legal, so the gateway's per-record cost falls to roughly the
+plain-line floor while the collector receives a genuinely structured object —
+no `ParseJSON` transform anywhere.
+
+The design preserves the trust split above: the sandbox pre-encodes only the
+payload it already authors; the gateway continues to stamp the identity
+envelope from the authenticated session. The costs are a push-proto change, a
+gateway-owned OTLP assembly path (bypassing the SDK's record building), and
+giving up byte-identity between the exported payload and the local JSONL file
+(same content, different encoding). Build trigger: a sustained stream of
+`telemetry_gap` records at rates the collector is not causing, or a
+deployment that needs more than ~300 K OCSF lines/s per gateway.
 
 ## Known gaps
 
