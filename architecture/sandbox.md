@@ -280,7 +280,9 @@ sandbox workload directly. The relay supports:
 
 Sandbox logs are emitted locally and can also be pushed back to the gateway.
 Security-relevant sandbox behavior uses OCSF structured events; internal
-diagnostics use ordinary tracing.
+diagnostics use ordinary tracing. The full pipeline — local surfaces, the push
+path's accounting, gateway fan-in, and off-box export — is documented in
+[Logging & Observability](logging.md).
 
 ## Policy Proposals
 

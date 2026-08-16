@@ -644,6 +644,11 @@ table.
 
 ### OTLP export
 
+For the end-to-end telemetry pipeline — sandbox emission through fan-in to the
+collector, delivery guarantees, and performance ceilings — see
+[Logging & Observability](logging.md). This section covers the gateway's side
+of it.
+
 The gateway already uses Rust's `tracing` framework for structured log events
 and request-span context consumed by stdout and the sandbox log bus. OTLP export
 adds an OpenTelemetry layer to the same subscriber. That layer turns selected

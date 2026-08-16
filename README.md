@@ -244,6 +244,7 @@ All agent implementation work is human-gated: maintainers explicitly request a p
 - [Quickstart](https://docs.nvidia.com/openshell/latest/get-started/quickstart) — detailed install and first sandbox walkthrough
 - [GitHub Sandbox Tutorial](https://docs.nvidia.com/openshell/latest/get-started/tutorials/github-sandbox) — end-to-end scoped GitHub repo access
 - [Architecture](https://github.com/NVIDIA/OpenShell/tree/main/architecture) — detailed architecture docs and design decisions
+- [Logging & Observability](architecture/logging.md) — how logs, OCSF security events, traces, and metrics flow off-box, the delivery guarantees, and how to pick the right export configuration
 - [Roadmap](https://github.com/orgs/NVIDIA/projects/233) — planned work and project priorities
 - [RFC Board](https://github.com/orgs/NVIDIA/projects/233/views/6) — RFC proposals tracked on the OpenShell Roadmap with the `rfc` label
 - [Support Matrix](https://docs.nvidia.com/openshell/latest/reference/support-matrix) — platforms, versions, and kernel requirements

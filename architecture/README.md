@@ -164,6 +164,7 @@ that crate's `README.md`.
 | [Gateway](gateway.md) | Gateway control plane, auth, APIs, persistence, settings, and relay coordination. |
 | [Sandbox](sandbox.md) | Sandbox supervisor, child process isolation, proxy, credentials, inference, connect, and logs. |
 | [Security Policy](security-policy.md) | Policy model, enforcement layers, policy updates, policy advisor, and security logging. |
+| [Logging & Observability](logging.md) | Log/OCSF/trace/metric data flow, visibility vs export planes, delivery guarantees, performance ceilings, and export configuration choices. |
 | [Compute Runtimes](compute-runtimes.md) | Docker, Podman, Kubernetes, VM, sandbox images, and runtime-specific responsibilities. |
 | [Build](build.md) | Build artifacts, CI/E2E, docs site validation, and release packaging. |
 | [Google Vertex AI Provider](google-vertex-ai-provider.md) | Implementation reference for the `google-vertex-ai` provider, from CLI through gateway to sandbox. |
