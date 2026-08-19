@@ -220,7 +220,8 @@ impl OcsfEvent {
                 let actor_str = e
                     .actor
                     .as_ref()
-                    .map(|a| format!("{}({})", a.process.name, a.process.pid))
+                    .and_then(|a| a.process.as_ref())
+                    .map(|p| format!("{}({})", p.name, p.pid))
                     .unwrap_or_default();
                 let dst = e
                     .dst_endpoint
@@ -282,7 +283,8 @@ impl OcsfEvent {
                 let actor_str = e
                     .actor
                     .as_ref()
-                    .map(|a| format!("{}({})", a.process.name, a.process.pid))
+                    .and_then(|a| a.process.as_ref())
+                    .map(|p| format!("{}({})", p.name, p.pid))
                     .unwrap_or_default();
                 let url_str = e
                     .http_request
@@ -413,6 +415,53 @@ impl OcsfEvent {
                     .unwrap_or_default();
 
                 format!("LIFECYCLE:{activity} {sev} {app} {status}")
+            }
+
+            Self::EntityManagement(e) => {
+                let activity = e.base.activity_name.to_uppercase();
+                let outcome = match e.base.status.map(crate::enums::StatusId::label) {
+                    Some("Failure") => " FAILED",
+                    _ => "",
+                };
+                let actor_str = e
+                    .actor
+                    .as_ref()
+                    .and_then(|a| a.user.as_ref())
+                    .map(|u| format!(" by {}", u.name))
+                    .unwrap_or_default();
+                format!(
+                    "ENTITY:{activity} {sev}{outcome} {} \"{}\"{actor_str}",
+                    e.entity.entity_type,
+                    e.entity.display(),
+                )
+            }
+
+            Self::Authentication(e) => {
+                let activity = e.base.activity_name.to_uppercase();
+                let outcome = match e.base.status.map(crate::enums::StatusId::label) {
+                    Some("Success") => "OK",
+                    _ => "FAILED",
+                };
+                let protocol = e
+                    .auth_protocol
+                    .map(|p| format!(" {}", p.label().to_lowercase()))
+                    .unwrap_or_default();
+                let who = e
+                    .user
+                    .as_ref()
+                    .map(|u| format!(" user:{}", u.name))
+                    .unwrap_or_default();
+                let from = e
+                    .src_endpoint
+                    .as_ref()
+                    .map(|ep| {
+                        let host = ep.domain_or_ip();
+                        let port = ep.port.map_or(String::new(), |p| format!(":{p}"));
+                        format!(" from {host}{port}")
+                    })
+                    .unwrap_or_default();
+                let reason = reason_tag(&e.base);
+                format!("AUTHN:{activity} {sev} {outcome}{protocol}{who}{from}{reason}")
             }
 
             Self::DeviceConfigStateChange(e) => {
@@ -600,9 +649,7 @@ mod tests {
             src_endpoint: None,
             dst_endpoint: Some(Endpoint::from_domain("api.example.com", 443)),
             proxy_endpoint: None,
-            actor: Some(Actor {
-                process: Process::new("python3", 42),
-            }),
+            actor: Some(Actor::from_process(Process::new("python3", 42))),
             firewall_rule: Some(FirewallRule::new("default-egress", "mechanistic")),
             connection_info: None,
             action: Some(ActionId::Allowed),
@@ -629,9 +676,7 @@ mod tests {
             src_endpoint: None,
             dst_endpoint: Some(Endpoint::from_ip_str("93.184.216.34", 443)),
             proxy_endpoint: None,
-            actor: Some(Actor {
-                process: Process::new("node", 1234),
-            }),
+            actor: Some(Actor::from_process(Process::new("node", 1234))),
             firewall_rule: Some(FirewallRule::new("bypass-detect", "nftables")),
             connection_info: Some(ConnectionInfo::new("tcp")),
             action: Some(ActionId::Denied),
@@ -659,9 +704,7 @@ mod tests {
             src_endpoint: None,
             dst_endpoint: None,
             proxy_endpoint: None,
-            actor: Some(Actor {
-                process: Process::new("curl", 88),
-            }),
+            actor: Some(Actor::from_process(Process::new("curl", 88))),
             firewall_rule: Some(FirewallRule::new("default-egress", "mechanistic")),
             action: Some(ActionId::Allowed),
             disposition: None,
@@ -776,9 +819,7 @@ mod tests {
             src_endpoint: None,
             dst_endpoint: Some(Endpoint::from_domain("169.254.169.254", 80)),
             proxy_endpoint: None,
-            actor: Some(Actor {
-                process: Process::new("curl", 1618),
-            }),
+            actor: Some(Actor::from_process(Process::new("curl", 1618))),
             firewall_rule: Some(FirewallRule::new("-", "ssrf")),
             connection_info: None,
             action: Some(ActionId::Denied),
@@ -805,9 +846,7 @@ mod tests {
             src_endpoint: None,
             dst_endpoint: Some(Endpoint::from_domain("api.example.com", 443)),
             proxy_endpoint: None,
-            actor: Some(Actor {
-                process: Process::new("python3", 42),
-            }),
+            actor: Some(Actor::from_process(Process::new("python3", 42))),
             firewall_rule: Some(FirewallRule::new("default-egress", "mechanistic")),
             connection_info: None,
             action: Some(ActionId::Allowed),
@@ -866,9 +905,7 @@ mod tests {
             src_endpoint: None,
             dst_endpoint: None,
             proxy_endpoint: None,
-            actor: Some(Actor {
-                process: Process::new("curl", 1618),
-            }),
+            actor: Some(Actor::from_process(Process::new("curl", 1618))),
             firewall_rule: Some(FirewallRule::new("aws_iam", "ssrf")),
             action: Some(ActionId::Denied),
             disposition: Some(DispositionId::Blocked),
@@ -989,9 +1026,7 @@ mod tests {
             src_endpoint: None,
             dst_endpoint: None,
             proxy_endpoint: None,
-            actor: Some(Actor {
-                process: Process::new("curl", 68),
-            }),
+            actor: Some(Actor::from_process(Process::new("curl", 68))),
             firewall_rule: Some(FirewallRule::new("allow_host_9876", "mechanistic")),
             action: Some(ActionId::Allowed),
             disposition: None,

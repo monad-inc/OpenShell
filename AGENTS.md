@@ -126,6 +126,8 @@ Use `info!()`, `debug!()`, `warn!()` for **internal operational plumbing** that 
 | Security alerts | `DetectionFindingBuilder` | Nonce replay, bypass detection, unsafe policy. Dual-emit with the domain event. |
 | Policy/config changes | `ConfigStateChangeBuilder` | Policy load, Landlock apply, TLS setup, inference routes, settings |
 | Supervisor lifecycle | `AppLifecycleBuilder` | Sandbox start, SSH server ready/failed |
+| Gateway resource CRUD | `EntityManagementBuilder` | Gateway audit events: workspace/member/provider/sandbox/credential create, update, delete. Always carry the authenticated principal via `.actor_user()`. |
+| Authentication outcomes | `AuthenticationBuilder` | Gateway auth failures (and successes when the audit toggle enables them). Never carry token or credential material. |
 
 ### Severity guidelines
 
@@ -166,6 +168,7 @@ ocsf_emit!(event);
 - The shorthand layer and JSONL layer extract the event from the thread-local. The shorthand format is derived automatically from the builder fields.
 - For security findings, **dual-emit**: one domain event (e.g., `SshActivityBuilder`) AND one `DetectionFindingBuilder` for the same incident.
 - Never log secrets, credentials, or query parameters in OCSF messages. The OCSF JSONL file may be shipped to external systems.
+- **A new state-changing gateway RPC must emit an audit event** (`EntityManagementBuilder` or `ConfigStateChangeBuilder`) carrying the authenticated principal as the OCSF actor. The audit event taxonomy in the logging architecture doc maps existing handlers.
 - The `message` field should be a concise, grep-friendly summary. Details go in builder fields (dst_endpoint, firewall_rule, etc.).
 
 ## Sandbox Infra Changes

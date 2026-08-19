@@ -57,9 +57,9 @@ pub use objects::{
 
 // --- Builders ---
 pub use builders::{
-    AppLifecycleBuilder, BaseEventBuilder, ConfigStateChangeBuilder, DetectionFindingBuilder,
-    HttpActivityBuilder, NetworkActivityBuilder, ProcessActivityBuilder, SandboxContext,
-    SshActivityBuilder,
+    AppLifecycleBuilder, AuthenticationBuilder, BaseEventBuilder, ConfigStateChangeBuilder,
+    DetectionFindingBuilder, EntityManagementBuilder, HttpActivityBuilder, NetworkActivityBuilder,
+    ProcessActivityBuilder, SandboxContext, SshActivityBuilder,
 };
 
 // --- Tracing layers ---
