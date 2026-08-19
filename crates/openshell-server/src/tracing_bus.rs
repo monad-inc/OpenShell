@@ -57,6 +57,18 @@ impl TracingLogBus {
         let _ = self.export.set(handle);
     }
 
+    /// Forward a gateway-scoped line to off-box export only.
+    ///
+    /// Gateway events without a sandbox — governance, auth, credential
+    /// refresh, TLS — have no per-sandbox tail or watcher to serve, so they
+    /// skip the visibility plane (the gateway's own stdout already shows
+    /// them) and go straight to the export queue.
+    fn export_only(&self, log: SandboxLogLine) {
+        if let Some(export) = self.export.get() {
+            export.enqueue(log);
+        }
+    }
+
     pub(crate) fn layer<S: Subscriber>(&self) -> impl Layer<S> {
         SandboxLogLayer {
             bus: self.clone(),
@@ -169,34 +181,66 @@ where
 {
     fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
         let meta = event.metadata();
+
+        // A sandbox-less event only matters here when export is installed, and
+        // events from the export path itself must never re-enter the queue
+        // they are trying to drain.
+        let gateway_scoped_exportable =
+            self.bus.export.get().is_some() && !is_export_feedback_target(meta.target());
+
         let mut visitor = LogVisitor::default();
         event.record(&mut visitor);
 
-        let Some(sandbox_id) = visitor.sandbox_id else {
+        let sandbox_id = visitor.sandbox_id.filter(|id| !id.is_empty());
+        if sandbox_id.is_none() && !gateway_scoped_exportable {
             return;
-        };
+        }
 
         let msg = visitor.message.unwrap_or_else(|| meta.name().to_string());
         let level = display_level(meta.target(), &meta.level().to_string());
 
         let ts = openshell_core::time::now_ms();
         let log = SandboxLogLine {
-            sandbox_id,
+            sandbox_id: sandbox_id.clone().unwrap_or_default(),
             timestamp_ms: ts,
             level,
             target: meta.target().to_string(),
             message: msg,
             source: "gateway".to_string(),
-            fields: HashMap::new(),
+            fields: visitor.fields,
         };
-        self.bus.publish_log(log, self.default_tail);
+        match sandbox_id {
+            // Sandbox-scoped: visibility plane (tail/broadcast) + export tap.
+            Some(_) => self.bus.publish_log(log, self.default_tail),
+            // Gateway-scoped: export only.
+            None => self.bus.export_only(log),
+        }
     }
+}
+
+/// Whether events from `target` could be produced by the export path itself.
+///
+/// The export worker logs its own failures, and the OTLP/tonic stack beneath
+/// it logs transport errors. Forwarding those into the export queue would turn
+/// every export failure into fresh queue traffic — a feedback loop that is
+/// loudest exactly when the collector is down. They stay on gateway stdout.
+fn is_export_feedback_target(target: &str) -> bool {
+    target.starts_with("openshell_server::log_export")
+        || target.starts_with("opentelemetry")
+        || target.starts_with("tonic")
+        || target.starts_with("h2")
+        || target.starts_with("hyper")
+        || target.starts_with("rustls")
 }
 
 #[derive(Debug, Default)]
 struct LogVisitor {
     sandbox_id: Option<String>,
     message: Option<String>,
+    /// Every other structured field on the event, preserved so exported
+    /// records keep the data operators can only otherwise find on stdout
+    /// (e.g. an auth denial's principal and requested sandbox).
+    fields: HashMap<String, String>,
 }
 
 impl tracing::field::Visit for LogVisitor {
@@ -204,7 +248,9 @@ impl tracing::field::Visit for LogVisitor {
         match field.name() {
             "sandbox_id" => self.sandbox_id = Some(value.to_string()),
             "message" => self.message = Some(value.to_string()),
-            _ => {}
+            name => {
+                self.fields.insert(name.to_string(), value.to_string());
+            }
         }
     }
 
@@ -212,7 +258,9 @@ impl tracing::field::Visit for LogVisitor {
         match field.name() {
             "sandbox_id" => self.sandbox_id = Some(format!("{value:?}")),
             "message" => self.message = Some(format!("{value:?}")),
-            _ => {}
+            name => {
+                self.fields.insert(name.to_string(), format!("{value:?}"));
+            }
         }
     }
 }
@@ -301,6 +349,99 @@ mod tests {
         let bus = TracingLogBus::new();
         // Should not panic
         bus.remove("nonexistent");
+    }
+
+    #[test]
+    fn export_feedback_targets_are_excluded() {
+        assert!(is_export_feedback_target("openshell_server::log_export"));
+        assert!(is_export_feedback_target("opentelemetry_otlp::exporter"));
+        assert!(is_export_feedback_target("tonic::transport"));
+        assert!(is_export_feedback_target("h2::codec"));
+        // The rest of the gateway must not be swept up by the guard.
+        assert!(!is_export_feedback_target("openshell_server::auth::guard"));
+        assert!(!is_export_feedback_target("openshell_server::grpc::policy"));
+    }
+
+    /// The full lane: a gateway event with no `sandbox_id` must reach the OTLP
+    /// exporter (with its structured fields and without a sandbox.id
+    /// attribute), export-path events must not, and sandbox-scoped events must
+    /// keep serving the visibility plane.
+    #[tokio::test]
+    async fn gateway_scoped_events_export_without_a_sandbox_id() {
+        use opentelemetry::logs::AnyValue;
+
+        let exporter = opentelemetry_sdk::logs::InMemoryLogExporter::default();
+        let (handle, worker) = crate::log_export::spawn(
+            exporter.clone(),
+            opentelemetry_sdk::Resource::builder_empty().build(),
+            false,
+        );
+        let bus = TracingLogBus::new();
+        bus.set_export(handle);
+
+        {
+            use tracing_subscriber::layer::SubscriberExt as _;
+            let subscriber = tracing_subscriber::registry().with(bus.layer());
+            let _guard = crate::otel_tracing::test_exporter::install_scoped(subscriber);
+            tracing::info!(principal = "user:alice", "workspace created");
+            tracing::warn!(target: "openshell_server::log_export", "OTLP log export failed");
+            tracing::info!(sandbox_id = "sb-1", "sandbox event");
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while exporter.get_emitted_logs().unwrap().len() < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "expected 2 exported records, got {:?}",
+                exporter.get_emitted_logs().unwrap().len()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let emitted = exporter.get_emitted_logs().unwrap();
+        assert_eq!(emitted.len(), 2, "the export-path warning must not export");
+
+        let attr = |record: &opentelemetry_sdk::logs::SdkLogRecord, key: &str| {
+            record
+                .attributes_iter()
+                .find(|(k, _)| k.as_str() == key)
+                .map(|(_, v)| v.clone())
+        };
+        let gateway = &emitted[0].record;
+        assert!(
+            attr(gateway, "sandbox.id").is_none(),
+            "gateway-scoped records carry no sandbox.id"
+        );
+        assert_eq!(
+            attr(gateway, "principal"),
+            Some(AnyValue::String("user:alice".into())),
+            "structured fields survive export"
+        );
+        assert_eq!(
+            attr(gateway, "log.source"),
+            Some(AnyValue::String("gateway".into()))
+        );
+        assert_eq!(
+            attr(&emitted[1].record, "sandbox.id"),
+            Some(AnyValue::String("sb-1".into()))
+        );
+
+        // Visibility plane unchanged: only the sandbox-scoped line has a tail.
+        assert_eq!(bus.tail("sb-1", 10).len(), 1);
+        assert!(bus.tail("", 10).is_empty());
+
+        worker.shutdown().await;
+    }
+
+    /// Without an export sink, sandbox-less events cost nothing and go
+    /// nowhere — local development keeps its Phase-0 behavior.
+    #[test]
+    fn gateway_scoped_events_are_ignored_when_export_is_off() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let bus = TracingLogBus::new();
+        let subscriber = tracing_subscriber::registry().with(bus.layer());
+        let _guard = crate::otel_tracing::test_exporter::install_scoped(subscriber);
+        tracing::info!(principal = "user:alice", "workspace created");
+        assert!(bus.tail("", 10).is_empty());
     }
 
     #[test]

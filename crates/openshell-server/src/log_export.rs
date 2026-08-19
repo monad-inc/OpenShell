@@ -261,8 +261,9 @@ async fn export_with_retry<E: LogExporter>(
         match export_once(exporter, records, scope).await {
             Ok(()) => return ExportOutcome::Delivered,
             Err(err) => {
-                // No `sandbox_id` field, so the bus tap ignores this event and
-                // it cannot feed back into the very queue that is failing.
+                // The bus tap excludes this module's target (and the OTLP
+                // transport stack) from export, so this warning cannot feed
+                // back into the very queue that is failing.
                 tracing::warn!(
                     error = %err,
                     attempt,
@@ -363,7 +364,11 @@ pub fn record_for(
     }
 
     record.set_body(AnyValue::String(line.message.into()));
-    record.add_attribute(Key::from_static_str("sandbox.id"), line.sandbox_id);
+    // Gateway-scoped lines (governance, auth, TLS) have no sandbox; an empty
+    // sandbox.id attribute would read as a sandbox with an empty name.
+    if !line.sandbox_id.is_empty() {
+        record.add_attribute(Key::from_static_str("sandbox.id"), line.sandbox_id);
+    }
     record.add_attribute(Key::from_static_str("log.source"), line.source);
     record.add_attribute(Key::from_static_str("log.target"), line.target);
     record.add_attribute(Key::from_static_str("log.level"), line.level);

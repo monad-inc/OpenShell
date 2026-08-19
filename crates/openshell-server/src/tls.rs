@@ -98,7 +98,6 @@ impl TlsAcceptor {
             .build();
         info!(
             target: OCSF_TARGET,
-            sandbox_id = "",
             message = %event.format_shorthand()
         );
 
@@ -216,7 +215,6 @@ impl TlsAcceptor {
                                     .build();
                                 info!(
                                     target: OCSF_TARGET,
-                                    sandbox_id = "",
                                     message = %event.format_shorthand()
                                 );
                                 warn!(error = %e, "TLS certificate reload failed, keeping existing config");

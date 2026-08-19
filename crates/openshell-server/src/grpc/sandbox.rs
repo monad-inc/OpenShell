@@ -758,7 +758,11 @@ async fn handle_delete_sandbox_inner(
     if result.deleted {
         state.telemetry.end_sandbox_session(&result.sandbox_id);
     }
-    info!(sandbox_name = %name, "DeleteSandbox request completed successfully");
+    info!(
+        sandbox_id = %result.sandbox_id,
+        sandbox_name = %name,
+        "DeleteSandbox request completed successfully"
+    );
     Ok(Response::new(DeleteSandboxResponse {
         deleted: result.deleted,
     }))

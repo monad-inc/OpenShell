@@ -58,7 +58,7 @@ flowchart LR
 
     subgraph GATEWAY["Gateway (fan-in point)"]
         direction TB
-        GWEV["gateway tracing events<br/>(sandbox-scoped)"] --> BUS["TracingLogBus"]
+        GWEV["gateway tracing events<br/>(sandbox- and gateway-scoped)"] --> BUS["TracingLogBus"]
         BUS --> TAIL[["per-sandbox tail<br/>2,000 lines, ring"]]
         BUS --> BCAST[["live broadcast<br/>1,024 events,<br/>only when watched"]]
         BUS --> EQ[["export queue<br/>65,536 lines<br/>overflow counted"]]
@@ -386,7 +386,13 @@ Every exported record carries the same envelope — `sandbox.id`, `log.source`
 (`sandbox` or `gateway`), `log.target`, `log.level`, `log.ocsf` — and the
 gateway's OTLP resource identity: `service.name` (default
 `openshell-gateway`, configurable) and `service.version`. Route and filter on
-the envelope; it is shape-independent.
+the envelope; it is shape-independent. Gateway-scoped records — governance,
+auth, credential, and TLS events with no sandbox in play — omit `sandbox.id`
+rather than carrying an empty one, and any structured fields on the event
+(`principal_sandbox_id`, `provider`, …) export as attributes. Events produced
+by the export path itself (the export worker and the OTLP/tonic transport
+stack) are excluded from export, so a failing collector cannot feed the very
+queue it is failing to drain; those stay on gateway stdout.
 
 The envelope is also a **trust boundary**. The sandbox authors log *content*
 (it is the observer), but the gateway authors *identity*: on the push path it
@@ -487,6 +493,16 @@ deployment that needs more than ~300 K OCSF lines/s per gateway.
 
 ## Known gaps
 
+- **Governance events are sparse.** Gateway-scoped events now export, but
+  most control-plane mutations (workspace membership, settings updates,
+  provider CRUD, policy draft decisions) do not yet *emit* structured audit
+  events carrying the acting principal — the export lane is ready for them,
+  the emissions are future work.
+- **Platform events stay on the visibility plane.** Driver-synthesized
+  provisioning progress (image pulls, pod scheduling) feeds `WatchSandbox`
+  only. Deliberate: for Kubernetes they duplicate what cluster tooling
+  already captures, and the security-relevant lifecycle facts export through
+  supervisor OCSF events and gateway lifecycle logs.
 - **Crash durability.** A clean shutdown flushes the export queue (bounded at
   5 s), but records in memory when the gateway *crashes* are lost and not
   accounted. The designed fix is a disk-backed spool with acknowledged
