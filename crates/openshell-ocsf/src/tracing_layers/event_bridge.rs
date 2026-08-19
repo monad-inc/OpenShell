@@ -50,6 +50,25 @@ pub fn emit_ocsf_event(event: OcsfEvent) {
     });
 }
 
+/// Emit an `OcsfEvent` scoped to a specific sandbox.
+///
+/// Identical to [`emit_ocsf_event`], but the tracing event carries a
+/// `sandbox_id` field so consumers that route by sandbox — the gateway's log
+/// bus in particular — can file the event under that sandbox's stream. Used
+/// by gateway-side emitters; sandbox-side emitters are already scoped by the
+/// push layer.
+pub fn emit_ocsf_event_for_sandbox(sandbox_id: &str, event: OcsfEvent) {
+    CURRENT_EVENT.with(|cell| {
+        *cell.borrow_mut() = Some(event);
+    });
+
+    tracing::info!(target: "ocsf", sandbox_id = %sandbox_id, "ocsf_event");
+
+    CURRENT_EVENT.with(|cell| {
+        cell.borrow_mut().take();
+    });
+}
+
 /// Convenience macro for emitting an `OcsfEvent`.
 ///
 /// ```ignore

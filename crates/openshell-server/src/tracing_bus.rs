@@ -196,7 +196,25 @@ where
             return;
         }
 
-        let msg = visitor.message.unwrap_or_else(|| meta.name().to_string());
+        // Gateway-emitted OCSF events (`ocsf_emit!` on the gateway) carry
+        // their payload in the thread-local, exactly like the sandbox push
+        // layer reads it: shorthand as the message, the full document as raw
+        // fields. Gateway emission is raw-only. Pre-rendered OCSF lines
+        // (legacy emitters that pass `message` directly) fall through to the
+        // visitor path unchanged.
+        let (msg, fields) = if meta.target() == OCSF_TARGET
+            && let Some(ocsf_event) = openshell_ocsf::clone_current_event()
+        {
+            (
+                ocsf_event.format_shorthand(),
+                openshell_ocsf::format::attributes::raw_event_fields(&ocsf_event),
+            )
+        } else {
+            (
+                visitor.message.unwrap_or_else(|| meta.name().to_string()),
+                visitor.fields,
+            )
+        };
         let level = display_level(meta.target(), &meta.level().to_string());
 
         let ts = openshell_core::time::now_ms();
@@ -207,7 +225,7 @@ where
             target: meta.target().to_string(),
             message: msg,
             source: "gateway".to_string(),
-            fields: visitor.fields,
+            fields,
         };
         match sandbox_id {
             // Sandbox-scoped: visibility plane (tail/broadcast) + export tap.
@@ -428,6 +446,107 @@ mod tests {
         // Visibility plane unchanged: only the sandbox-scoped line has a tail.
         assert_eq!(bus.tail("sb-1", 10).len(), 1);
         assert!(bus.tail("", 10).is_empty());
+
+        worker.shutdown().await;
+    }
+
+    /// A gateway `ocsf_emit!` audit event must export with the full raw
+    /// payload and correct severity, and a sandbox-scoped emission must land
+    /// in that sandbox's stream as well.
+    #[tokio::test]
+    async fn gateway_ocsf_events_export_with_raw_payloads() {
+        use opentelemetry::logs::{AnyValue, Severity};
+
+        let exporter = opentelemetry_sdk::logs::InMemoryLogExporter::default();
+        let (handle, worker) = crate::log_export::spawn(
+            exporter.clone(),
+            opentelemetry_sdk::Resource::builder_empty().build(),
+            true,
+        );
+        let bus = TracingLogBus::new();
+        bus.set_export(handle);
+
+        {
+            use tracing_subscriber::layer::SubscriberExt as _;
+            let subscriber = tracing_subscriber::registry().with(bus.layer());
+            let _guard = crate::otel_tracing::test_exporter::install_scoped(subscriber);
+
+            // Gateway-scoped governance event.
+            crate::audit::emit(
+                openshell_ocsf::EntityManagementBuilder::new(crate::audit::ctx())
+                    .activity(openshell_ocsf::enums::EntityActivityId::Create)
+                    .entity(
+                        openshell_ocsf::objects::ManagedEntity::new("workspace", "ws-1")
+                            .with_name("team-a"),
+                    )
+                    .actor_user(openshell_ocsf::objects::User::new(
+                        "alice",
+                        "oidc|alice-123",
+                        openshell_ocsf::objects::UserTypeId::User,
+                    ))
+                    .status(openshell_ocsf::enums::StatusId::Success)
+                    .build(),
+            );
+
+            // Sandbox-scoped audit event.
+            crate::audit::emit_for_sandbox(
+                "sb-7f3a",
+                openshell_ocsf::AuthenticationBuilder::new(crate::audit::ctx())
+                    .status(openshell_ocsf::enums::StatusId::Failure)
+                    .status_detail("token expired")
+                    .build(),
+            );
+
+            // Legacy pre-rendered OCSF line (tls.rs style): no thread-local.
+            tracing::info!(target: "ocsf", message = "CONFIG:LOADED [INFO] TLS reloaded");
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while exporter.get_emitted_logs().unwrap().len() < 3 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "records never arrived"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let emitted = exporter.get_emitted_logs().unwrap();
+        let attr = |record: &opentelemetry_sdk::logs::SdkLogRecord, key: &str| {
+            record
+                .attributes_iter()
+                .find(|(k, _)| k.as_str() == key)
+                .map(|(_, v)| v.clone())
+        };
+
+        let entity = &emitted[0].record;
+        let body = format!("{:?}", entity.body());
+        assert!(body.contains("ENTITY:CREATE"), "unexpected body: {body}");
+        assert!(attr(entity, "sandbox.id").is_none());
+        assert_eq!(
+            attr(entity, "log.level"),
+            Some(AnyValue::String("OCSF".into()))
+        );
+        let Some(AnyValue::String(raw)) = attr(entity, "ocsf.raw") else {
+            panic!("ocsf.raw missing");
+        };
+        let parsed: serde_json::Value = serde_json::from_str(raw.as_str()).unwrap();
+        assert_eq!(parsed["class_uid"], 3004);
+        assert_eq!(parsed["actor"]["user"]["name"], "alice");
+
+        let auth = &emitted[1].record;
+        assert_eq!(
+            attr(auth, "sandbox.id"),
+            Some(AnyValue::String("sb-7f3a".into()))
+        );
+        // Medium severity ranks as Warn2, from the pushed ocsf.severity_id.
+        assert_eq!(auth.severity_number(), Some(Severity::Warn2));
+        assert_eq!(bus.tail("sb-7f3a", 10).len(), 1, "sandbox stream has it");
+
+        let legacy = &emitted[2].record;
+        assert!(
+            attr(legacy, "ocsf.raw").is_none(),
+            "pre-rendered lines carry no raw payload"
+        );
+        assert!(format!("{:?}", legacy.body()).contains("CONFIG:LOADED"));
 
         worker.shutdown().await;
     }

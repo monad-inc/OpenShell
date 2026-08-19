@@ -23,6 +23,7 @@
 //! The VM launch plumbing now lives in [`compute::vm`]; keep this file limited
 //! to selecting and acquiring drivers.
 
+pub(crate) mod audit;
 mod auth;
 pub mod certgen;
 pub mod cli;
