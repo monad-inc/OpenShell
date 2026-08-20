@@ -169,6 +169,7 @@ pub(super) async fn handle_create_workspace(
                 uid,
                 name: Some(name.clone()),
             },
+            sandbox: None,
             principal: &principal,
             request_id: request_id.as_deref(),
             success_message: format!("workspace {name} created"),
@@ -347,6 +348,7 @@ pub(super) async fn handle_delete_workspace(
                 uid: None,
                 name: Some(name.clone()),
             },
+            sandbox: None,
             principal: &principal,
             request_id: request_id.as_deref(),
             success_message: format!("workspace {name} deleted"),
@@ -550,6 +552,7 @@ pub(super) async fn handle_add_workspace_member(
         audit::EntityOutcome {
             activity: EntityActivityId::Create,
             entity: ManagedEntity::new(WorkspaceMember::object_type(), subject.clone()),
+            sandbox: None,
             principal: &principal,
             request_id: request_id.as_deref(),
             success_message: format!("member {subject} added to workspace {workspace}"),
@@ -687,6 +690,7 @@ pub(super) async fn handle_remove_workspace_member(
         audit::EntityOutcome {
             activity: EntityActivityId::Delete,
             entity: ManagedEntity::new(WorkspaceMember::object_type(), subject.clone()),
+            sandbox: None,
             principal: &principal,
             request_id: request_id.as_deref(),
             success_message: format!("member {subject} removed from workspace {workspace}"),

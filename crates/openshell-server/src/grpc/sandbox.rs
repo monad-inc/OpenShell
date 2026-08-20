@@ -10,6 +10,8 @@
 #![allow(clippy::cast_possible_wrap)] // Intentional u32->i32 conversions for proto compat
 
 use crate::ServerState;
+use crate::audit;
+use crate::auth::principal::Principal;
 use crate::auth::workspace_authz::{
     MinWorkspaceRole, authorize_sandbox_workspace, authorize_workspace, require_platform_admin,
 };
@@ -33,6 +35,8 @@ use openshell_core::telemetry::{
     TelemetryOutcome,
 };
 use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
+use openshell_ocsf::enums::EntityActivityId;
+use openshell_ocsf::objects::ManagedEntity;
 use prost::Message;
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -115,7 +119,7 @@ impl Drop for WatchSandboxStream {
 /// cannot distinguish the two cases (CWE-203).
 pub(super) async fn fetch_and_authorize_sandbox(
     state: &Arc<ServerState>,
-    principal: &crate::auth::principal::Principal,
+    principal: &Principal,
     sandbox_id: &str,
 ) -> Result<Sandbox, Status> {
     let sandbox = state
@@ -153,16 +157,70 @@ fn generate_routable_name() -> String {
 // Sandbox lifecycle handlers
 // ---------------------------------------------------------------------------
 
+/// The command-line value for exec audit events. Full argv by default;
+/// `[openshell.gateway.audit] exec_args = false` (`OPENSHELL_AUDIT_EXEC_ARGS`)
+/// reduces it to the binary name for deployments whose command lines may
+/// carry secrets. Environment variables and stdin never enter audit events.
+fn exec_audit_command(state: &ServerState, command: &[String]) -> serde_json::Value {
+    if state.config.audit.exec_args {
+        serde_json::Value::from(command.to_vec())
+    } else {
+        serde_json::Value::from(command.first().cloned().unwrap_or_default())
+    }
+}
+
+/// The resolved (id, name) of the sandbox a successful response carries,
+/// for audit identity and routing. `None` on failures.
+fn response_sandbox_identity(sandbox: Option<&Sandbox>) -> Option<(String, String)> {
+    sandbox
+        .and_then(|s| s.metadata.as_ref())
+        .map(|m| (m.id.clone(), m.name.clone()))
+}
+
 pub(super) async fn handle_create_sandbox(
     state: &Arc<ServerState>,
     request: Request<CreateSandboxRequest>,
 ) -> Result<Response<SandboxResponse>, Status> {
     let create_request = request.get_ref().clone();
+    let principal = audit::principal(&request);
+    let request_id = audit::request_id(&request);
     let result = handle_create_sandbox_inner(state, request).await;
     emit_sandbox_create_telemetry(
         state,
         &create_request,
         TelemetryOutcome::from_success(result.is_ok()),
+    );
+
+    let identity = result
+        .as_ref()
+        .ok()
+        .and_then(|response| response_sandbox_identity(response.get_ref().sandbox.as_ref()));
+    // The requested name may be empty (server-generated); the response
+    // carries the authoritative one.
+    let name = identity
+        .as_ref()
+        .map_or(create_request.name.as_str(), |(_, name)| name.as_str())
+        .to_string();
+    let workspace = super::workspace::audit_workspace_name(&create_request.workspace).to_string();
+    audit::emit_entity_outcome(
+        &state.config.audit,
+        &result,
+        audit::EntityOutcome {
+            activity: EntityActivityId::Create,
+            entity: ManagedEntity {
+                entity_type: "sandbox".to_string(),
+                uid: identity.as_ref().map(|(id, _)| id.clone()),
+                name: Some(name.clone()),
+            },
+            sandbox: identity
+                .as_ref()
+                .map(|(id, name)| (id.as_str(), name.as_str())),
+            principal: &principal,
+            request_id: request_id.as_deref(),
+            success_message: format!("sandbox {name} created in workspace {workspace}"),
+            failure_message: format!("sandbox {name} create in workspace {workspace} failed"),
+            unmapped: vec![("workspace", serde_json::Value::from(workspace))],
+        },
     );
     result
 }
@@ -483,6 +541,57 @@ pub(super) async fn handle_attach_sandbox_provider(
     state: &Arc<ServerState>,
     request: Request<AttachSandboxProviderRequest>,
 ) -> Result<Response<AttachSandboxProviderResponse>, Status> {
+    let principal = audit::principal(&request);
+    let request_id = audit::request_id(&request);
+    let (sandbox_name, provider_name, workspace) = {
+        let req = request.get_ref();
+        (
+            req.sandbox_name.clone(),
+            req.provider_name.clone(),
+            super::workspace::audit_workspace_name(&req.workspace).to_string(),
+        )
+    };
+    let result = handle_attach_sandbox_provider_inner(state, request).await;
+
+    let identity = result
+        .as_ref()
+        .ok()
+        .and_then(|response| response_sandbox_identity(response.get_ref().sandbox.as_ref()));
+    // Attaching an already-attached provider is a no-op, not a state change.
+    audit::emit_entity_outcome_judged(
+        &state.config.audit,
+        &result,
+        |response| response.attached,
+        audit::EntityOutcome {
+            activity: EntityActivityId::Update,
+            entity: ManagedEntity {
+                entity_type: "sandbox".to_string(),
+                uid: identity.as_ref().map(|(id, _)| id.clone()),
+                name: Some(sandbox_name.clone()),
+            },
+            sandbox: identity
+                .as_ref()
+                .map(|(id, name)| (id.as_str(), name.as_str())),
+            principal: &principal,
+            request_id: request_id.as_deref(),
+            success_message: format!("provider {provider_name} attached to sandbox {sandbox_name}"),
+            failure_message: format!(
+                "provider {provider_name} attach to sandbox {sandbox_name} failed"
+            ),
+            unmapped: vec![
+                ("operation", serde_json::Value::from("attach_provider")),
+                ("provider", serde_json::Value::from(provider_name.clone())),
+                ("workspace", serde_json::Value::from(workspace)),
+            ],
+        },
+    );
+    result
+}
+
+async fn handle_attach_sandbox_provider_inner(
+    state: &Arc<ServerState>,
+    request: Request<AttachSandboxProviderRequest>,
+) -> Result<Response<AttachSandboxProviderResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let request = request.into_inner();
     let authz = authorize_workspace(
@@ -620,6 +729,60 @@ pub(super) async fn handle_detach_sandbox_provider(
     state: &Arc<ServerState>,
     request: Request<DetachSandboxProviderRequest>,
 ) -> Result<Response<DetachSandboxProviderResponse>, Status> {
+    let principal = audit::principal(&request);
+    let request_id = audit::request_id(&request);
+    let (sandbox_name, provider_name, workspace) = {
+        let req = request.get_ref();
+        (
+            req.sandbox_name.clone(),
+            req.provider_name.clone(),
+            super::workspace::audit_workspace_name(&req.workspace).to_string(),
+        )
+    };
+    let result = handle_detach_sandbox_provider_inner(state, request).await;
+
+    let identity = result
+        .as_ref()
+        .ok()
+        .and_then(|response| response_sandbox_identity(response.get_ref().sandbox.as_ref()));
+    // Detaching a provider that was not attached is a no-op, not a state
+    // change.
+    audit::emit_entity_outcome_judged(
+        &state.config.audit,
+        &result,
+        |response| response.detached,
+        audit::EntityOutcome {
+            activity: EntityActivityId::Update,
+            entity: ManagedEntity {
+                entity_type: "sandbox".to_string(),
+                uid: identity.as_ref().map(|(id, _)| id.clone()),
+                name: Some(sandbox_name.clone()),
+            },
+            sandbox: identity
+                .as_ref()
+                .map(|(id, name)| (id.as_str(), name.as_str())),
+            principal: &principal,
+            request_id: request_id.as_deref(),
+            success_message: format!(
+                "provider {provider_name} detached from sandbox {sandbox_name}"
+            ),
+            failure_message: format!(
+                "provider {provider_name} detach from sandbox {sandbox_name} failed"
+            ),
+            unmapped: vec![
+                ("operation", serde_json::Value::from("detach_provider")),
+                ("provider", serde_json::Value::from(provider_name.clone())),
+                ("workspace", serde_json::Value::from(workspace)),
+            ],
+        },
+    );
+    result
+}
+
+async fn handle_detach_sandbox_provider_inner(
+    state: &Arc<ServerState>,
+    request: Request<DetachSandboxProviderRequest>,
+) -> Result<Response<DetachSandboxProviderResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let request = request.into_inner();
     let authz = authorize_workspace(
@@ -719,6 +882,15 @@ pub(super) async fn handle_delete_sandbox(
     state: &Arc<ServerState>,
     request: Request<DeleteSandboxRequest>,
 ) -> Result<Response<DeleteSandboxResponse>, Status> {
+    let principal = audit::principal(&request);
+    let request_id = audit::request_id(&request);
+    let (name, workspace) = {
+        let req = request.get_ref();
+        (
+            req.name.clone(),
+            super::workspace::audit_workspace_name(&req.workspace).to_string(),
+        )
+    };
     let result = handle_delete_sandbox_inner(state, request).await;
     let outcome = match &result {
         Ok(response) if response.get_ref().deleted => TelemetryOutcome::Success,
@@ -729,6 +901,31 @@ pub(super) async fn handle_delete_sandbox(
         LifecycleOperation::Delete,
         outcome,
     );
+    // The success event is emitted inside the inner handler at the compute
+    // commit, where the sandbox id is in scope; the wrapper records only
+    // failed attempts.
+    if let Err(status) = &result
+        && audit::audited_failure(status)
+    {
+        audit::emit_entity(
+            &state.config.audit,
+            false,
+            audit::EntityOutcome {
+                activity: EntityActivityId::Delete,
+                entity: ManagedEntity {
+                    entity_type: "sandbox".to_string(),
+                    uid: None,
+                    name: Some(name.clone()),
+                },
+                sandbox: None,
+                principal: &principal,
+                request_id: request_id.as_deref(),
+                success_message: String::new(),
+                failure_message: format!("sandbox {name} delete from workspace {workspace} failed"),
+                unmapped: vec![("workspace", serde_json::Value::from(workspace))],
+            },
+        );
+    }
     result
 }
 
@@ -737,6 +934,7 @@ async fn handle_delete_sandbox_inner(
     request: Request<DeleteSandboxRequest>,
 ) -> Result<Response<DeleteSandboxResponse>, Status> {
     let principal = super::extract_principal(&request)?;
+    let request_id = audit::request_id(&request);
     let req = request.into_inner();
     let name = req.name;
     if name.is_empty() {
@@ -758,6 +956,28 @@ async fn handle_delete_sandbox_inner(
     if result.deleted {
         state.telemetry.end_sandbox_session(&result.sandbox_id);
     }
+    // Audit at the compute commit; a no-op delete (already gone) is not a
+    // state change and records as Failure.
+    audit::emit_entity(
+        &state.config.audit,
+        result.deleted,
+        audit::EntityOutcome {
+            activity: EntityActivityId::Delete,
+            entity: ManagedEntity {
+                entity_type: "sandbox".to_string(),
+                uid: (!result.sandbox_id.is_empty()).then(|| result.sandbox_id.clone()),
+                name: Some(name.clone()),
+            },
+            sandbox: result
+                .deleted
+                .then_some((result.sandbox_id.as_str(), name.as_str())),
+            principal: &principal,
+            request_id: request_id.as_deref(),
+            success_message: format!("sandbox {name} deleted from workspace {workspace}"),
+            failure_message: format!("sandbox {name} delete from workspace {workspace} failed"),
+            unmapped: vec![("workspace", serde_json::Value::from(workspace.clone()))],
+        },
+    );
     info!(
         sandbox_id = %result.sandbox_id,
         sandbox_name = %name,
@@ -768,10 +988,64 @@ async fn handle_delete_sandbox_inner(
     }))
 }
 
+/// Emit the audit event for a start/stop lifecycle transition: Update on
+/// the sandbox entity with `unmapped.operation`, routed into the sandbox's
+/// stream when it resolved.
+fn emit_sandbox_transition_audit(
+    state: &ServerState,
+    principal: &Principal,
+    request_id: Option<&str>,
+    operation: &'static str,
+    name: &str,
+    workspace: &str,
+    result: &Result<Response<SandboxResponse>, Status>,
+) {
+    let past = match operation {
+        "start" => "started",
+        _ => "stopped",
+    };
+    let identity = result
+        .as_ref()
+        .ok()
+        .and_then(|response| response_sandbox_identity(response.get_ref().sandbox.as_ref()));
+    audit::emit_entity_outcome(
+        &state.config.audit,
+        result,
+        audit::EntityOutcome {
+            activity: EntityActivityId::Update,
+            entity: ManagedEntity {
+                entity_type: "sandbox".to_string(),
+                uid: identity.as_ref().map(|(id, _)| id.clone()),
+                name: Some(name.to_string()),
+            },
+            sandbox: identity
+                .as_ref()
+                .map(|(id, name)| (id.as_str(), name.as_str())),
+            principal,
+            request_id,
+            success_message: format!("sandbox {name} {past}"),
+            failure_message: format!("sandbox {name} {operation} failed"),
+            unmapped: vec![
+                ("operation", serde_json::Value::from(operation)),
+                ("workspace", serde_json::Value::from(workspace)),
+            ],
+        },
+    );
+}
+
 pub(super) async fn handle_stop_sandbox(
     state: &Arc<ServerState>,
     request: Request<StopSandboxRequest>,
 ) -> Result<Response<SandboxResponse>, Status> {
+    let principal = audit::principal(&request);
+    let request_id = audit::request_id(&request);
+    let (name, workspace) = {
+        let req = request.get_ref();
+        (
+            req.name.clone(),
+            super::workspace::audit_workspace_name(&req.workspace).to_string(),
+        )
+    };
     let result = handle_stop_sandbox_inner(state, request).await;
     openshell_core::telemetry::emit_lifecycle(
         LifecycleResource::Sandbox,
@@ -781,6 +1055,15 @@ pub(super) async fn handle_stop_sandbox(
         } else {
             TelemetryOutcome::Failure
         },
+    );
+    emit_sandbox_transition_audit(
+        state,
+        &principal,
+        request_id.as_deref(),
+        "stop",
+        &name,
+        &workspace,
+        &result,
     );
     result
 }
@@ -816,6 +1099,15 @@ pub(super) async fn handle_start_sandbox(
     state: &Arc<ServerState>,
     request: Request<StartSandboxRequest>,
 ) -> Result<Response<SandboxResponse>, Status> {
+    let principal = audit::principal(&request);
+    let request_id = audit::request_id(&request);
+    let (name, workspace) = {
+        let req = request.get_ref();
+        (
+            req.name.clone(),
+            super::workspace::audit_workspace_name(&req.workspace).to_string(),
+        )
+    };
     let result = handle_start_sandbox_inner(state, request).await;
     openshell_core::telemetry::emit_lifecycle(
         LifecycleResource::Sandbox,
@@ -825,6 +1117,15 @@ pub(super) async fn handle_start_sandbox(
         } else {
             TelemetryOutcome::Failure
         },
+    );
+    emit_sandbox_transition_audit(
+        state,
+        &principal,
+        request_id.as_deref(),
+        "start",
+        &name,
+        &workspace,
+        &result,
     );
     result
 }
@@ -1162,6 +1463,7 @@ pub(super) async fn handle_exec_sandbox(
     use openshell_core::ObjectId;
 
     let principal = super::extract_principal(&request)?;
+    let request_id = audit::request_id(&request);
     let req = request.into_inner();
     if req.sandbox_id.is_empty() {
         return Err(Status::invalid_argument("sandbox_id is required"));
@@ -1176,23 +1478,73 @@ pub(super) async fn handle_exec_sandbox(
     }
     validate_exec_request_fields(&req)?;
 
-    let sandbox = fetch_and_authorize_sandbox(state, &principal, &req.sandbox_id).await?;
+    let setup = async {
+        let sandbox = fetch_and_authorize_sandbox(state, &principal, &req.sandbox_id).await?;
 
-    if SandboxPhase::try_from(sandbox.phase()).ok() != Some(SandboxPhase::Ready) {
-        return Err(Status::failed_precondition("sandbox is not ready"));
+        if SandboxPhase::try_from(sandbox.phase()).ok() != Some(SandboxPhase::Ready) {
+            return Err(Status::failed_precondition("sandbox is not ready"));
+        }
+
+        // Open a relay channel through the supervisor session. Use a 15s
+        // session-wait timeout, enough to cover a transient supervisor
+        // reconnect while still failing quickly during normal operation.
+        let (channel_id, relay_rx) = state
+            .supervisor_sessions
+            .open_relay(sandbox.object_id(), std::time::Duration::from_secs(15))
+            .await
+            .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
+
+        let command_str = build_remote_exec_command(&req)
+            .map_err(|e| Status::invalid_argument(format!("command construction failed: {e}")))?;
+        Ok::<_, Status>((sandbox, channel_id, relay_rx, command_str))
     }
+    .await;
 
-    // Open a relay channel through the supervisor session. Use a 15s
-    // session-wait timeout, enough to cover a transient supervisor reconnect
-    // while still failing quickly during normal operation.
-    let (channel_id, relay_rx) = state
-        .supervisor_sessions
-        .open_relay(sandbox.object_id(), std::time::Duration::from_secs(15))
-        .await
-        .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
-
-    let command_str = build_remote_exec_command(&req)
-        .map_err(|e| Status::invalid_argument(format!("command construction failed: {e}")))?;
+    // Audit the exec acceptance/rejection — session initiation and the
+    // command line are in scope, exec I/O never is.
+    let binary = req.command.first().cloned().unwrap_or_default();
+    match &setup {
+        Ok((sandbox, ..)) => audit::emit_entity(
+            &state.config.audit,
+            true,
+            audit::EntityOutcome {
+                activity: EntityActivityId::Update,
+                entity: ManagedEntity::new("sandbox", req.sandbox_id.clone())
+                    .with_name(sandbox.object_name()),
+                sandbox: Some((&req.sandbox_id, sandbox.object_name())),
+                principal: &principal,
+                request_id: request_id.as_deref(),
+                success_message: format!(
+                    "exec {binary} accepted in sandbox {}",
+                    sandbox.object_name()
+                ),
+                failure_message: String::new(),
+                unmapped: vec![
+                    ("operation", serde_json::Value::from("exec")),
+                    ("command", exec_audit_command(state, &req.command)),
+                ],
+            },
+        ),
+        Err(status) if audit::audited_failure(status) => audit::emit_entity(
+            &state.config.audit,
+            false,
+            audit::EntityOutcome {
+                activity: EntityActivityId::Update,
+                entity: ManagedEntity::new("sandbox", req.sandbox_id.clone()),
+                sandbox: None,
+                principal: &principal,
+                request_id: request_id.as_deref(),
+                success_message: String::new(),
+                failure_message: format!("exec {binary} in sandbox {} rejected", req.sandbox_id),
+                unmapped: vec![
+                    ("operation", serde_json::Value::from("exec")),
+                    ("command", exec_audit_command(state, &req.command)),
+                ],
+            },
+        ),
+        Err(_) => {}
+    }
+    let (sandbox, channel_id, relay_rx, command_str) = setup?;
     let stdin_payload = req.stdin;
     let timeout_seconds = req.timeout_seconds;
     let request_tty = req.tty;
@@ -1273,6 +1625,7 @@ pub(super) async fn handle_forward_tcp(
     Status,
 > {
     let principal = super::extract_principal(&request)?;
+    let request_id = audit::request_id(&request);
     let mut inbound = request.into_inner();
     let first = inbound
         .message()
@@ -1285,24 +1638,85 @@ pub(super) async fn handle_forward_tcp(
     };
 
     let target = validate_tcp_forward_init(&init)?;
+    // Non-secret target description for the audit record.
+    let target_label = match &target {
+        relay_open::Target::Ssh(_) => "ssh".to_string(),
+        relay_open::Target::Tcp(tcp) => format!("tcp:{}", tcp.port),
+    };
 
-    let sandbox = fetch_and_authorize_sandbox(state, &principal, &init.sandbox_id).await?;
+    let setup = async {
+        let sandbox = fetch_and_authorize_sandbox(state, &principal, &init.sandbox_id).await?;
 
-    if SandboxPhase::try_from(sandbox.phase()).ok() != Some(SandboxPhase::Ready) {
-        return Err(Status::failed_precondition("sandbox is not ready"));
+        if SandboxPhase::try_from(sandbox.phase()).ok() != Some(SandboxPhase::Ready) {
+            return Err(Status::failed_precondition("sandbox is not ready"));
+        }
+
+        let connection_guard = acquire_forward_connection_guard(state, &init, &sandbox).await?;
+        let (channel_id, relay_rx) = state
+            .supervisor_sessions
+            .open_relay_with_target(
+                sandbox.object_id(),
+                target,
+                init.service_id.clone(),
+                std::time::Duration::from_secs(15),
+            )
+            .await
+            .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
+        Ok::<_, Status>((sandbox, connection_guard, channel_id, relay_rx))
     }
+    .await;
 
-    let connection_guard = acquire_forward_connection_guard(state, &init, &sandbox).await?;
-    let (channel_id, relay_rx) = state
-        .supervisor_sessions
-        .open_relay_with_target(
-            sandbox.object_id(),
-            target,
-            init.service_id.clone(),
-            std::time::Duration::from_secs(15),
-        )
-        .await
-        .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
+    // Audit the tunnel acceptance/rejection — forwarded bytes never enter
+    // the audit record.
+    let mut forward_unmapped = vec![
+        ("operation", serde_json::Value::from("forward")),
+        ("target", serde_json::Value::from(target_label.clone())),
+    ];
+    if !init.service_id.is_empty() {
+        forward_unmapped.push((
+            "service_id",
+            serde_json::Value::from(init.service_id.clone()),
+        ));
+    }
+    match &setup {
+        Ok((sandbox, ..)) => audit::emit_entity(
+            &state.config.audit,
+            true,
+            audit::EntityOutcome {
+                activity: EntityActivityId::Update,
+                entity: ManagedEntity::new("sandbox", init.sandbox_id.clone())
+                    .with_name(sandbox.object_name()),
+                sandbox: Some((&init.sandbox_id, sandbox.object_name())),
+                principal: &principal,
+                request_id: request_id.as_deref(),
+                success_message: format!(
+                    "tcp forward {target_label} opened to sandbox {}",
+                    sandbox.object_name()
+                ),
+                failure_message: String::new(),
+                unmapped: forward_unmapped.clone(),
+            },
+        ),
+        Err(status) if audit::audited_failure(status) => audit::emit_entity(
+            &state.config.audit,
+            false,
+            audit::EntityOutcome {
+                activity: EntityActivityId::Update,
+                entity: ManagedEntity::new("sandbox", init.sandbox_id.clone()),
+                sandbox: None,
+                principal: &principal,
+                request_id: request_id.as_deref(),
+                success_message: String::new(),
+                failure_message: format!(
+                    "tcp forward {target_label} to sandbox {} rejected",
+                    init.sandbox_id
+                ),
+                unmapped: forward_unmapped.clone(),
+            },
+        ),
+        Err(_) => {}
+    }
+    let (sandbox, connection_guard, channel_id, relay_rx) = setup?;
 
     let sandbox_id = sandbox.object_id().to_string();
     let (tx, rx) = mpsc::channel::<Result<TcpForwardFrame, Status>>(256);
@@ -1599,6 +2013,7 @@ pub(super) async fn handle_exec_sandbox_interactive(
     use openshell_core::ObjectId;
 
     let principal = super::extract_principal(&request)?;
+    let request_id = audit::request_id(&request);
     let mut input_stream = request.into_inner();
 
     let first_msg = input_stream
@@ -1608,20 +2023,75 @@ pub(super) async fn handle_exec_sandbox_interactive(
 
     let req = validate_interactive_exec_start(first_msg)?;
 
-    let sandbox = fetch_and_authorize_sandbox(state, &principal, &req.sandbox_id).await?;
+    let setup = async {
+        let sandbox = fetch_and_authorize_sandbox(state, &principal, &req.sandbox_id).await?;
 
-    if SandboxPhase::try_from(sandbox.phase()).ok() != Some(SandboxPhase::Ready) {
-        return Err(Status::failed_precondition("sandbox is not ready"));
+        if SandboxPhase::try_from(sandbox.phase()).ok() != Some(SandboxPhase::Ready) {
+            return Err(Status::failed_precondition("sandbox is not ready"));
+        }
+
+        let (channel_id, relay_rx) = state
+            .supervisor_sessions
+            .open_relay(sandbox.object_id(), std::time::Duration::from_secs(15))
+            .await
+            .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
+
+        let command_str = build_remote_exec_command(&req)
+            .map_err(|e| Status::invalid_argument(format!("command construction failed: {e}")))?;
+        Ok::<_, Status>((sandbox, channel_id, relay_rx, command_str))
     }
+    .await;
 
-    let (channel_id, relay_rx) = state
-        .supervisor_sessions
-        .open_relay(sandbox.object_id(), std::time::Duration::from_secs(15))
-        .await
-        .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
-
-    let command_str = build_remote_exec_command(&req)
-        .map_err(|e| Status::invalid_argument(format!("command construction failed: {e}")))?;
+    // Audit the exec acceptance/rejection — session initiation and the
+    // command line are in scope, terminal I/O never is.
+    let binary = req.command.first().cloned().unwrap_or_default();
+    match &setup {
+        Ok((sandbox, ..)) => audit::emit_entity(
+            &state.config.audit,
+            true,
+            audit::EntityOutcome {
+                activity: EntityActivityId::Update,
+                entity: ManagedEntity::new("sandbox", req.sandbox_id.clone())
+                    .with_name(sandbox.object_name()),
+                sandbox: Some((&req.sandbox_id, sandbox.object_name())),
+                principal: &principal,
+                request_id: request_id.as_deref(),
+                success_message: format!(
+                    "interactive exec {binary} accepted in sandbox {}",
+                    sandbox.object_name()
+                ),
+                failure_message: String::new(),
+                unmapped: vec![
+                    ("operation", serde_json::Value::from("exec")),
+                    ("interactive", serde_json::Value::from(true)),
+                    ("command", exec_audit_command(state, &req.command)),
+                ],
+            },
+        ),
+        Err(status) if audit::audited_failure(status) => audit::emit_entity(
+            &state.config.audit,
+            false,
+            audit::EntityOutcome {
+                activity: EntityActivityId::Update,
+                entity: ManagedEntity::new("sandbox", req.sandbox_id.clone()),
+                sandbox: None,
+                principal: &principal,
+                request_id: request_id.as_deref(),
+                success_message: String::new(),
+                failure_message: format!(
+                    "interactive exec {binary} in sandbox {} rejected",
+                    req.sandbox_id
+                ),
+                unmapped: vec![
+                    ("operation", serde_json::Value::from("exec")),
+                    ("interactive", serde_json::Value::from(true)),
+                    ("command", exec_audit_command(state, &req.command)),
+                ],
+            },
+        ),
+        Err(_) => {}
+    }
+    let (sandbox, channel_id, relay_rx, command_str) = setup?;
     let request_tty = req.tty;
     let timeout_seconds = req.timeout_seconds;
     let cols = if req.cols == 0 { 80 } else { req.cols };
@@ -1673,7 +2143,43 @@ pub(super) async fn handle_create_ssh_session(
     state: &Arc<ServerState>,
     request: Request<CreateSshSessionRequest>,
 ) -> Result<Response<CreateSshSessionResponse>, Status> {
+    let principal = audit::principal(&request);
+    let request_id = audit::request_id(&request);
+    let sandbox_id = request.get_ref().sandbox_id.clone();
+    let result = handle_create_ssh_session_inner(state, request).await;
+    // The success event is emitted inside the inner handler at the store
+    // commit, where the session's non-secret name is in scope.
+    if let Err(status) = &result
+        && audit::audited_failure(status)
+    {
+        audit::emit_entity(
+            &state.config.audit,
+            false,
+            audit::EntityOutcome {
+                activity: EntityActivityId::Create,
+                entity: ManagedEntity {
+                    entity_type: "ssh_session".to_string(),
+                    uid: None,
+                    name: None,
+                },
+                sandbox: None,
+                principal: &principal,
+                request_id: request_id.as_deref(),
+                success_message: String::new(),
+                failure_message: format!("ssh session create for sandbox {sandbox_id} failed"),
+                unmapped: vec![("sandbox_id", serde_json::Value::from(sandbox_id.clone()))],
+            },
+        );
+    }
+    result
+}
+
+async fn handle_create_ssh_session_inner(
+    state: &Arc<ServerState>,
+    request: Request<CreateSshSessionRequest>,
+) -> Result<Response<CreateSshSessionResponse>, Status> {
     let principal = super::extract_principal(&request)?;
+    let request_id = audit::request_id(&request);
     let req = request.into_inner();
     if req.sandbox_id.is_empty() {
         return Err(Status::invalid_argument("sandbox_id is required"));
@@ -1736,6 +2242,33 @@ pub(super) async fn handle_create_ssh_session(
         .await
         .map_err(|e| Status::internal(format!("persist ssh session failed: {e}")))?;
 
+    // Audit at the store commit. The session is identified by its generated
+    // name — the bearer token never enters the audit record.
+    audit::emit_entity(
+        &state.config.audit,
+        true,
+        audit::EntityOutcome {
+            activity: EntityActivityId::Create,
+            entity: ManagedEntity::new("ssh_session", session.object_name()),
+            sandbox: Some((&req.sandbox_id, sandbox.object_name())),
+            principal: &principal,
+            request_id: request_id.as_deref(),
+            success_message: format!(
+                "ssh session {} created for sandbox {}",
+                session.object_name(),
+                sandbox.object_name()
+            ),
+            failure_message: String::new(),
+            unmapped: vec![
+                (
+                    "sandbox_id",
+                    serde_json::Value::from(req.sandbox_id.clone()),
+                ),
+                ("expires_at_ms", serde_json::Value::from(expires_at_ms)),
+            ],
+        },
+    );
+
     let (gateway_host, gateway_port) = resolve_gateway(&state.config);
     let scheme = if state.config.tls.is_some() {
         "https"
@@ -1758,7 +2291,46 @@ pub(super) async fn handle_revoke_ssh_session(
     state: &Arc<ServerState>,
     request: Request<RevokeSshSessionRequest>,
 ) -> Result<Response<RevokeSshSessionResponse>, Status> {
+    let principal = audit::principal(&request);
+    let request_id = audit::request_id(&request);
+    let result = handle_revoke_ssh_session_inner(state, request).await;
+    // The success event is emitted inside the inner handler at the store
+    // commit, where the session's non-secret name is in scope. The request
+    // identifies the session only by its bearer token, which must never
+    // enter the audit record — failed attempts carry no identifier.
+    let failed = match &result {
+        Ok(response) => !response.get_ref().revoked,
+        Err(status) => audit::audited_failure(status),
+    };
+    if failed {
+        audit::emit_entity(
+            &state.config.audit,
+            false,
+            audit::EntityOutcome {
+                activity: EntityActivityId::Delete,
+                entity: ManagedEntity {
+                    entity_type: "ssh_session".to_string(),
+                    uid: None,
+                    name: None,
+                },
+                sandbox: None,
+                principal: &principal,
+                request_id: request_id.as_deref(),
+                success_message: String::new(),
+                failure_message: "ssh session revoke failed (unknown or already gone)".to_string(),
+                unmapped: vec![("operation", serde_json::Value::from("revoke"))],
+            },
+        );
+    }
+    result
+}
+
+async fn handle_revoke_ssh_session_inner(
+    state: &Arc<ServerState>,
+    request: Request<RevokeSshSessionRequest>,
+) -> Result<Response<RevokeSshSessionResponse>, Status> {
     let principal = super::extract_principal(&request)?;
+    let request_id = audit::request_id(&request);
     let token = request.into_inner().token;
     if token.is_empty() {
         return Err(Status::invalid_argument("token is required"));
@@ -1819,6 +2391,29 @@ pub(super) async fn handle_revoke_ssh_session(
         )
         .await
         .map_err(|e| super::persistence_error_to_status(e, "revoke ssh session"))?;
+
+    // Audit at the store commit; identified by the session's generated
+    // name — never the bearer token the request carried.
+    audit::emit_entity(
+        &state.config.audit,
+        true,
+        audit::EntityOutcome {
+            activity: EntityActivityId::Delete,
+            entity: ManagedEntity::new("ssh_session", session.object_name()),
+            sandbox: Some((&session.sandbox_id, "")),
+            principal: &principal,
+            request_id: request_id.as_deref(),
+            success_message: format!("ssh session {} revoked", session.object_name()),
+            failure_message: String::new(),
+            unmapped: vec![
+                ("operation", serde_json::Value::from("revoke")),
+                (
+                    "sandbox_id",
+                    serde_json::Value::from(session.sandbox_id.clone()),
+                ),
+            ],
+        },
+    );
 
     Ok(Response::new(RevokeSshSessionResponse { revoked: true }))
 }
@@ -2749,6 +3344,232 @@ mod tests {
         sandbox.set_phase(SandboxPhase::Ready as i32);
         sandbox.set_current_policy_version(7);
         sandbox
+    }
+
+    /// Sandbox-family mutations must leave a 3004 audit trail with correct
+    /// routing and no secret material: ssh session events carry the
+    /// generated session name but never the bearer token, exec rejections
+    /// record the attempted command line, revokes record the session, and
+    /// a no-op provider detach audits as a failed mutation.
+    #[tokio::test]
+    async fn sandbox_sessions_and_exec_emit_audit_events_without_secrets() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let exporter = opentelemetry_sdk::logs::InMemoryLogExporter::default();
+        let (handle, worker) = crate::log_export::spawn(
+            exporter.clone(),
+            opentelemetry_sdk::Resource::builder_empty().build(),
+            true,
+        );
+        let bus = crate::tracing_bus::TracingLogBus::new();
+        bus.set_export(handle);
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_sandbox("audit-sb", Vec::new()))
+            .await
+            .unwrap();
+
+        let token;
+        {
+            let subscriber = tracing_subscriber::registry().with(bus.layer());
+            let _guard = crate::otel_tracing::test_exporter::install_scoped(subscriber);
+
+            let response = handle_create_ssh_session(
+                &state,
+                authed_request(CreateSshSessionRequest {
+                    sandbox_id: "sandbox-audit-sb".to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+            token = response.into_inner().token;
+
+            let error = handle_exec_sandbox(
+                &state,
+                authed_request(ExecSandboxRequest {
+                    sandbox_id: "no-such-sandbox".to_string(),
+                    command: vec![
+                        "curl".to_string(),
+                        "-H".to_string(),
+                        "Authorization: Bearer sk-exec-arg".to_string(),
+                    ],
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code(), tonic::Code::NotFound);
+
+            handle_revoke_ssh_session(
+                &state,
+                authed_request(RevokeSshSessionRequest {
+                    token: token.clone(),
+                }),
+            )
+            .await
+            .unwrap();
+
+            // Detaching a provider that was never attached: Ok(detached=false).
+            let response = handle_detach_sandbox_provider(
+                &state,
+                authed_request(DetachSandboxProviderRequest {
+                    sandbox_name: "audit-sb".to_string(),
+                    provider_name: "ghost-provider".to_string(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+            assert!(!response.get_ref().detached);
+        }
+
+        let audit_records = || -> Vec<(serde_json::Value, Option<String>)> {
+            exporter
+                .get_emitted_logs()
+                .unwrap()
+                .iter()
+                .filter_map(|log| {
+                    let raw = log
+                        .record
+                        .attributes_iter()
+                        .find(|(k, _)| k.as_str() == "ocsf.raw")
+                        .map(|(_, v)| v.clone())?;
+                    let opentelemetry::logs::AnyValue::String(raw) = raw else {
+                        panic!("ocsf.raw should be a string");
+                    };
+                    let sandbox_attr = log
+                        .record
+                        .attributes_iter()
+                        .find(|(k, _)| k.as_str() == "sandbox.id")
+                        .and_then(|(_, v)| match v {
+                            opentelemetry::logs::AnyValue::String(s) => {
+                                Some(s.as_str().to_string())
+                            }
+                            _ => None,
+                        });
+                    Some((
+                        serde_json::from_str::<serde_json::Value>(raw.as_str()).unwrap(),
+                        sandbox_attr,
+                    ))
+                })
+                .collect()
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while audit_records().len() < 4 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "audit records never arrived"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let records = audit_records();
+
+        let (ssh_create, ssh_route) = &records[0];
+        assert_eq!(ssh_create["entity"]["type"], "ssh_session");
+        assert!(
+            ssh_create["entity"]["uid"]
+                .as_str()
+                .is_some_and(|uid| !uid.is_empty() && uid != token),
+            "session is identified by its generated name, never the token"
+        );
+        assert_eq!(ssh_route.as_deref(), Some("sandbox-audit-sb"));
+
+        let (exec_reject, exec_route) = &records[1];
+        assert_eq!(exec_reject["status"], "Failure");
+        assert_eq!(exec_reject["unmapped"]["operation"], "exec");
+        assert_eq!(
+            exec_reject["unmapped"]["command"],
+            serde_json::json!(["curl", "-H", "Authorization: Bearer sk-exec-arg"]),
+            "full argv recorded by default (exec_args=true)"
+        );
+        assert!(exec_route.is_none(), "rejections ride the gateway lane");
+
+        let (revoke, _) = &records[2];
+        assert_eq!(revoke["entity"]["type"], "ssh_session");
+        assert_eq!(revoke["unmapped"]["operation"], "revoke");
+        assert_eq!(revoke["status"], "Success");
+
+        let (detach, _) = &records[3];
+        assert_eq!(detach["unmapped"]["operation"], "detach_provider");
+        assert_eq!(
+            detach["status"], "Failure",
+            "a no-op detach is not a state change"
+        );
+
+        for (record, _) in &records {
+            assert!(
+                !record.to_string().contains(&token),
+                "ssh bearer token must never appear in any audit record"
+            );
+        }
+
+        worker.shutdown().await;
+    }
+
+    /// `exec_args = false` reduces the audited command line to the binary
+    /// name — arguments that may carry secrets stay out of the record.
+    #[tokio::test]
+    async fn exec_args_toggle_reduces_audited_command_to_binary() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let exporter = opentelemetry_sdk::logs::InMemoryLogExporter::default();
+        let (handle, worker) = crate::log_export::spawn(
+            exporter.clone(),
+            opentelemetry_sdk::Resource::builder_empty().build(),
+            true,
+        );
+        let bus = crate::tracing_bus::TracingLogBus::new();
+        bus.set_export(handle);
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state).unwrap().config.audit.exec_args = false;
+
+        {
+            let subscriber = tracing_subscriber::registry().with(bus.layer());
+            let _guard = crate::otel_tracing::test_exporter::install_scoped(subscriber);
+            let _ = handle_exec_sandbox(
+                &state,
+                authed_request(ExecSandboxRequest {
+                    sandbox_id: "no-such-sandbox".to_string(),
+                    command: vec![
+                        "curl".to_string(),
+                        "--token".to_string(),
+                        "sk-secret-arg".to_string(),
+                    ],
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap_err();
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let raw = loop {
+            let raw = exporter.get_emitted_logs().unwrap().iter().find_map(|log| {
+                log.record
+                    .attributes_iter()
+                    .find(|(k, _)| k.as_str() == "ocsf.raw")
+                    .map(|(_, v)| format!("{v:?}"))
+            });
+            if let Some(raw) = raw {
+                break raw;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "audit record never arrived"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+        assert!(
+            raw.contains("\\\"command\\\":\\\"curl\\\"") || raw.contains(r#""command":"curl""#),
+            "command must reduce to the binary name: {raw}"
+        );
+        assert!(
+            !raw.contains("sk-secret-arg"),
+            "arguments must not appear when exec_args=false: {raw}"
+        );
+
+        worker.shutdown().await;
     }
 
     #[tokio::test]

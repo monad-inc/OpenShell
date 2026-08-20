@@ -168,32 +168,40 @@ pub fn audited_failure(status: &tonic::Status) -> bool {
 /// Private on purpose: callers go through [`emit_entity_outcome`] /
 /// [`emit_entity_outcome_judged`], which apply the audit `enabled` toggle
 /// and the denial-exclusion rule before reaching here.
-fn emit_entity_event(
-    activity: EntityActivityId,
-    entity: ManagedEntity,
-    principal: &Principal,
-    request_id: Option<&str>,
-    success: bool,
-    message: String,
-    unmapped: Vec<(&'static str, serde_json::Value)>,
-) {
-    let mut builder = EntityManagementBuilder::new(ctx())
-        .activity(activity)
-        .entity(entity)
-        .actor_user(actor_user(principal))
+fn emit_entity_event(success: bool, outcome: EntityOutcome<'_>) {
+    let sandbox_ctx;
+    let event_ctx = match outcome.sandbox {
+        Some((id, name)) => {
+            sandbox_ctx = ctx_for_sandbox(id, name);
+            &sandbox_ctx
+        }
+        None => ctx(),
+    };
+    let mut builder = EntityManagementBuilder::new(event_ctx)
+        .activity(outcome.activity)
+        .entity(outcome.entity)
+        .actor_user(actor_user(outcome.principal))
         .status(if success {
             StatusId::Success
         } else {
             StatusId::Failure
         })
-        .message(message);
-    for (key, value) in unmapped {
+        .message(if success {
+            outcome.success_message
+        } else {
+            outcome.failure_message
+        });
+    for (key, value) in outcome.unmapped {
         builder = builder.unmapped(key, value);
     }
-    if let Some(request_id) = request_id {
+    if let Some(request_id) = outcome.request_id {
         builder = builder.unmapped("request_id", request_id);
     }
-    emit(builder.build());
+    let built = builder.build();
+    match outcome.sandbox {
+        Some((id, _)) => emit_for_sandbox(id, built),
+        None => emit(built),
+    }
 }
 
 /// One mutation's audit facts, gathered by a handler wrapper before/after
@@ -201,11 +209,30 @@ fn emit_entity_event(
 pub struct EntityOutcome<'a> {
     pub activity: EntityActivityId,
     pub entity: ManagedEntity,
+    /// `Some((sandbox_id, sandbox_name))` routes the event into that
+    /// sandbox's stream (mutations about a specific, resolved sandbox);
+    /// `None` rides the gateway lane.
+    pub sandbox: Option<(&'a str, &'a str)>,
     pub principal: &'a Principal,
     pub request_id: Option<&'a str>,
     pub success_message: String,
     pub failure_message: String,
     pub unmapped: Vec<(&'static str, serde_json::Value)>,
+}
+
+/// Emit the Entity Management \[3004\] audit event with an already-known
+/// outcome — for handlers that emit at the store-commit point inside their
+/// inner logic (where the sandbox identity is in scope) rather than from a
+/// wrapper. No-op when the master audit toggle is off.
+pub fn emit_entity(
+    audit: &openshell_core::GatewayAuditConfig,
+    success: bool,
+    outcome: EntityOutcome<'_>,
+) {
+    if !audit.enabled {
+        return;
+    }
+    emit_entity_event(success, outcome);
 }
 
 /// Emit the Entity Management \[3004\] audit event for a finished handler.
@@ -245,20 +272,7 @@ pub fn emit_entity_outcome_judged<T>(
             false
         }
     };
-    let message = if success {
-        outcome.success_message
-    } else {
-        outcome.failure_message
-    };
-    emit_entity_event(
-        outcome.activity,
-        outcome.entity,
-        outcome.principal,
-        outcome.request_id,
-        success,
-        message,
-        outcome.unmapped,
-    );
+    emit_entity_event(success, outcome);
 }
 
 #[cfg(test)]

@@ -2099,6 +2099,7 @@ pub(super) async fn handle_create_provider(
                 uid: provider_response_uid(&result),
                 name: Some(name.clone()),
             },
+            sandbox: None,
             principal: &principal,
             request_id: request_id.as_deref(),
             success_message: format!("provider {name} created in workspace {workspace}"),
@@ -2349,6 +2350,7 @@ pub(super) async fn handle_import_provider_profiles(
                 uid: None,
                 name: (count == 1).then(|| profile_ids[0].clone()),
             },
+            sandbox: None,
             principal: &principal,
             request_id: request_id.as_deref(),
             success_message: format!("{count} provider profile(s) imported"),
@@ -2466,6 +2468,7 @@ pub(super) async fn handle_update_provider_profiles(
         audit::EntityOutcome {
             activity: EntityActivityId::Update,
             entity: ManagedEntity::new("provider_profile", target_id.clone()),
+            sandbox: None,
             principal: &principal,
             request_id: request_id.as_deref(),
             success_message: format!("provider profile {target_id} updated"),
@@ -2658,6 +2661,7 @@ pub(super) async fn handle_delete_provider_profile(
         audit::EntityOutcome {
             activity: EntityActivityId::Delete,
             entity: ManagedEntity::new("provider_profile", id.clone()),
+            sandbox: None,
             principal: &principal,
             request_id: request_id.as_deref(),
             success_message: format!("provider profile {id} deleted"),
@@ -3415,6 +3419,7 @@ pub(super) async fn handle_update_provider(
                 uid: provider_response_uid(&result),
                 name: Some(name.clone()),
             },
+            sandbox: None,
             principal: &principal,
             request_id: request_id.as_deref(),
             success_message: format!("provider {name} updated in workspace {workspace}"),
@@ -3566,6 +3571,7 @@ pub(super) async fn handle_configure_provider_refresh(
         audit::EntityOutcome {
             activity: EntityActivityId::Update,
             entity: ManagedEntity::new("provider_refresh", format!("{provider}/{credential_key}")),
+            sandbox: None,
             principal: &principal,
             request_id: request_id.as_deref(),
             success_message: format!("provider refresh configured for {provider}/{credential_key}"),
@@ -3906,6 +3912,7 @@ pub(super) async fn handle_rotate_provider_credential(
         audit::EntityOutcome {
             activity: EntityActivityId::Update,
             entity: ManagedEntity::new("credential", format!("{provider}/{credential_key}")),
+            sandbox: None,
             principal: &principal,
             request_id: request_id.as_deref(),
             success_message: format!("credential rotated for {provider}/{credential_key}"),
@@ -4015,6 +4022,7 @@ pub(super) async fn handle_delete_provider_refresh(
         audit::EntityOutcome {
             activity: EntityActivityId::Delete,
             entity: ManagedEntity::new("provider_refresh", format!("{provider}/{credential_key}")),
+            sandbox: None,
             principal: &principal,
             request_id: request_id.as_deref(),
             success_message: format!("provider refresh deleted for {provider}/{credential_key}"),
@@ -4136,6 +4144,7 @@ pub(super) async fn handle_delete_provider(
                 uid: None,
                 name: Some(name.clone()),
             },
+            sandbox: None,
             principal: &principal,
             request_id: request_id.as_deref(),
             success_message: format!("provider {name} deleted from workspace {workspace}"),
