@@ -90,6 +90,81 @@ pub fn actor_user(principal: &Principal) -> User {
     }
 }
 
+/// The OCSF actor for background (principal-less) gateway mutations.
+///
+/// Convention: `system:<component>` (e.g. `system:provider-refresh`,
+/// `system:compute-reconcile`, `system:gateway-startup`), user type Other —
+/// timer- and reconciliation-driven state changes appear in the same trail
+/// as request-driven ones, attributed to the component that made them.
+pub fn system_actor(component: &str) -> User {
+    User::new(
+        format!("system:{component}"),
+        format!("system:{component}"),
+        UserTypeId::Other,
+    )
+}
+
+/// One background mutation's audit facts — [`EntityOutcome`] without a
+/// request principal. Consumed by [`emit_system_entity`].
+pub struct SystemEntityOutcome<'a> {
+    pub activity: EntityActivityId,
+    pub entity: ManagedEntity,
+    /// `Some((sandbox_id, sandbox_name))` routes into that sandbox's stream.
+    pub sandbox: Option<(&'a str, &'a str)>,
+    /// Component name; the actor renders as `system:<component>`.
+    pub component: &'a str,
+    pub success_message: String,
+    pub failure_message: String,
+    pub unmapped: Vec<(&'static str, serde_json::Value)>,
+}
+
+/// Emit an Entity Management \[3004\] audit event for a background mutation
+/// with a [`system_actor`]. No-op when the master audit toggle is off.
+pub fn emit_system_entity(
+    audit: &openshell_core::GatewayAuditConfig,
+    success: bool,
+    outcome: SystemEntityOutcome<'_>,
+) {
+    if !audit.enabled {
+        return;
+    }
+    let sandbox_ctx;
+    let event_ctx = match outcome.sandbox {
+        Some((id, name)) => {
+            sandbox_ctx = ctx_for_sandbox(id, name);
+            &sandbox_ctx
+        }
+        None => ctx(),
+    };
+    let mut builder = EntityManagementBuilder::new(event_ctx)
+        .activity(outcome.activity)
+        .entity(outcome.entity)
+        .actor_user(system_actor(outcome.component))
+        .status(if success {
+            StatusId::Success
+        } else {
+            StatusId::Failure
+        })
+        .severity(if success {
+            openshell_ocsf::SeverityId::Informational
+        } else {
+            openshell_ocsf::SeverityId::Low
+        })
+        .message(if success {
+            outcome.success_message
+        } else {
+            outcome.failure_message
+        });
+    for (key, value) in outcome.unmapped {
+        builder = builder.unmapped(key, value);
+    }
+    let built = builder.build();
+    match outcome.sandbox {
+        Some((id, _)) => emit_for_sandbox(id, built),
+        None => emit(built),
+    }
+}
+
 /// Emit a gateway-scoped audit event (no sandbox in play).
 ///
 /// Exports on the gateway lane, without a `sandbox.id` attribute.
@@ -186,6 +261,13 @@ fn emit_entity_event(success: bool, outcome: EntityOutcome<'_>) {
         } else {
             StatusId::Failure
         })
+        // Failed mutations at Low so Warn+ alerting can see them; routine
+        // successes stay Informational.
+        .severity(if success {
+            openshell_ocsf::SeverityId::Informational
+        } else {
+            openshell_ocsf::SeverityId::Low
+        })
         .message(if success {
             outcome.success_message
         } else {
@@ -233,6 +315,59 @@ pub fn emit_entity(
         return;
     }
     emit_entity_event(success, outcome);
+}
+
+/// One gateway configuration mutation's audit facts, for a Device Config
+/// State Change \[5019\] event on the gateway lane. Consumed by
+/// [`emit_config_outcome`].
+pub struct ConfigOutcome<'a> {
+    /// Custom state label (e.g. `inference_route_set`).
+    pub state_label: &'a str,
+    pub principal: &'a Principal,
+    pub request_id: Option<&'a str>,
+    pub success_message: String,
+    pub failure_message: String,
+    pub unmapped: Vec<(&'static str, serde_json::Value)>,
+}
+
+/// Build and emit a Device Config State Change \[5019\] audit event with an
+/// already-known outcome, carrying the acting principal. No-op when the
+/// master audit toggle is off; callers apply [`audited_failure`] before
+/// reporting a failure here.
+pub fn emit_config_outcome(
+    audit: &openshell_core::GatewayAuditConfig,
+    success: bool,
+    outcome: ConfigOutcome<'_>,
+) {
+    if !audit.enabled {
+        return;
+    }
+    let mut builder = openshell_ocsf::ConfigStateChangeBuilder::new(ctx())
+        .state(openshell_ocsf::enums::StateId::Other, outcome.state_label)
+        // Failed mutations at Low so Warn+ alerting can see them.
+        .severity(if success {
+            openshell_ocsf::SeverityId::Informational
+        } else {
+            openshell_ocsf::SeverityId::Low
+        })
+        .status(if success {
+            StatusId::Success
+        } else {
+            StatusId::Failure
+        })
+        .actor_user(actor_user(outcome.principal))
+        .message(if success {
+            outcome.success_message
+        } else {
+            outcome.failure_message
+        });
+    for (key, value) in outcome.unmapped {
+        builder = builder.unmapped(key, value);
+    }
+    if let Some(request_id) = outcome.request_id {
+        builder = builder.unmapped("request_id", request_id);
+    }
+    emit(builder.build());
 }
 
 /// One authentication outcome at the gateway boundary, for an

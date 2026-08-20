@@ -352,7 +352,7 @@ pub(crate) async fn run_server(
         gateway_tls_enabled: config.tls.is_some(),
         endpoint_overrides: &config.compute_driver_endpoints,
     };
-    let compute = build_compute_runtime(
+    let mut compute = build_compute_runtime(
         &config,
         driver_startup,
         store.clone(),
@@ -362,6 +362,7 @@ pub(crate) async fn run_server(
         supervisor_sessions.clone(),
     )
     .await?;
+    compute.set_audit_config(config.audit.clone());
     let gateway_interceptors =
         openshell_gateway_interceptors::initialize(config.gateway_interceptors.clone())
             .await
@@ -494,7 +495,7 @@ pub(crate) async fn run_server(
     // shutdown so the running compute state matches the persisted store.
     // Runs before watchers spawn so the watch loop sees the post-start
     // snapshot on its first poll.
-    ensure_default_workspace(&store).await?;
+    ensure_default_workspace(&store, &config.audit).await?;
 
     let gateway_listeners = bind_gateway_listeners(
         config.bind_address,
@@ -1038,7 +1039,10 @@ fn warn_if_kubernetes_sandbox_jwt_expiry_disabled(config: &Config) {
     }
 }
 
-pub(crate) async fn ensure_default_workspace(store: &Store) -> Result<()> {
+pub(crate) async fn ensure_default_workspace(
+    store: &Store,
+    audit: &openshell_core::GatewayAuditConfig,
+) -> Result<()> {
     use grpc::workspace::{DEFAULT_WORKSPACE_NAME, WORKSPACE_OBJECT_TYPE};
     use openshell_core::proto::Workspace;
     use openshell_core::proto::datamodel::v1::ObjectMeta;
@@ -1085,6 +1089,24 @@ pub(crate) async fn ensure_default_workspace(store: &Store) -> Result<()> {
     {
         Ok(_) => {
             info!("Created default workspace");
+            // A workspace coming into existence belongs on the audit trail
+            // even when startup, not a request, created it.
+            audit::emit_system_entity(
+                audit,
+                true,
+                audit::SystemEntityOutcome {
+                    activity: openshell_ocsf::enums::EntityActivityId::Create,
+                    entity: openshell_ocsf::objects::ManagedEntity::new("workspace", id.clone())
+                        .with_name(DEFAULT_WORKSPACE_NAME),
+                    sandbox: None,
+                    component: "gateway-startup",
+                    success_message: format!(
+                        "default workspace {DEFAULT_WORKSPACE_NAME} created at startup"
+                    ),
+                    failure_message: String::new(),
+                    unmapped: Vec::new(),
+                },
+            );
             Ok(())
         }
         Err(persistence::PersistenceError::UniqueViolation { .. }) => {

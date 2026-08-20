@@ -230,7 +230,12 @@ fn build_update_config_settings_audit_event(
                 "setting_updated"
             },
         )
-        .severity(SeverityId::Informational)
+        // Failed mutations at Low so Warn+ alerting can see them.
+        .severity(if event.success {
+            SeverityId::Informational
+        } else {
+            SeverityId::Low
+        })
         .status(if event.success {
             StatusId::Success
         } else {
@@ -325,7 +330,12 @@ fn build_gateway_policy_audit_event(
     };
     let mut builder = ConfigStateChangeBuilder::new(&ctx)
         .state(StateId::Other, event.state_label)
-        .severity(SeverityId::Informational)
+        // Failed mutations at Low so Warn+ alerting can see them.
+        .severity(if event.success {
+            SeverityId::Informational
+        } else {
+            SeverityId::Low
+        })
         .status(if event.success {
             StatusId::Success
         } else {
@@ -3617,6 +3627,18 @@ async fn ensure_log_stream_sandbox_scope(
 ) -> Result<(), Status> {
     if let Some(validated) = validated_sandbox_id.as_deref() {
         if sandbox_id != validated {
+            // The sneaky variant of a cross-sandbox attempt: authenticate a
+            // stream for one sandbox, then switch ids mid-stream. Escalate
+            // exactly like the up-front scope guard would have.
+            let principal_sandbox_id = match principal {
+                Principal::Sandbox(sandbox) => sandbox.sandbox_id.as_str(),
+                _ => validated,
+            };
+            crate::audit::emit_cross_sandbox_finding(
+                &state.config.audit,
+                principal_sandbox_id,
+                sandbox_id,
+            );
             return Err(Status::permission_denied(
                 "log stream sandbox_id changed after validation",
             ));
@@ -13514,12 +13536,14 @@ mod tests {
             },
         );
         let line = event.format_shorthand();
+        // Failed mutations render at [LOW] so Warn+ alerting can see them.
         assert!(
-            line.starts_with("CONFIG:APPROVED [INFO] FAILED "),
+            line.starts_with("CONFIG:APPROVED [LOW] FAILED "),
             "unexpected shorthand: {line}"
         );
         let json = event.to_json().unwrap();
         assert_eq!(json["status"], "Failure");
+        assert_eq!(json["severity_id"], 2);
         assert_eq!(json["unmapped"]["sandbox"], "demo-sandbox");
     }
 

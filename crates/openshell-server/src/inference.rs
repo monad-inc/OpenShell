@@ -95,49 +95,89 @@ impl Inference for InferenceService {
         request: Request<SetInferenceRouteRequest>,
     ) -> Result<Response<SetInferenceRouteResponse>, Status> {
         let principal = crate::grpc::extract_principal(&request)?;
+        let request_id = crate::audit::request_id(&request);
         let req = request.into_inner();
-        let authz = authorize_workspace(
-            &self.state.store,
-            &self.state.admin_role,
-            &principal,
-            &req.workspace,
-            MinWorkspaceRole::Admin,
-        )
-        .await?;
-        let workspace =
-            crate::grpc::workspace::resolve_workspace(self.state.store.as_ref(), &authz.workspace)
-                .await?
-                .ensure_active()?;
-        let route_name = effective_route_name(&req.route_name)?;
-        let verify = !req.no_verify;
-        let route = upsert_cluster_inference_route_with_credentials(
-            self.state.store.as_ref(),
-            &workspace,
-            Some(&self.state.credentials),
-            route_name,
-            &req.provider_name,
-            &req.model_id,
-            req.timeout_secs,
-            verify,
-        )
-        .await?;
+        let route_label = effective_route_name(&req.route_name)
+            .map_or_else(|_| req.route_name.clone(), ToString::to_string);
+        let provider_name = req.provider_name.clone();
+        let model_id = req.model_id.clone();
+        let workspace_label = req.workspace.clone();
 
-        let config = route
-            .route
-            .config
-            .as_ref()
-            .ok_or_else(|| Status::internal("managed route missing config"))?;
+        let result = async {
+            let authz = authorize_workspace(
+                &self.state.store,
+                &self.state.admin_role,
+                &principal,
+                &req.workspace,
+                MinWorkspaceRole::Admin,
+            )
+            .await?;
+            let workspace = crate::grpc::workspace::resolve_workspace(
+                self.state.store.as_ref(),
+                &authz.workspace,
+            )
+            .await?
+            .ensure_active()?;
+            let route_name = effective_route_name(&req.route_name)?;
+            let verify = !req.no_verify;
+            let route = upsert_cluster_inference_route_with_credentials(
+                self.state.store.as_ref(),
+                &workspace,
+                Some(&self.state.credentials),
+                route_name,
+                &req.provider_name,
+                &req.model_id,
+                req.timeout_secs,
+                verify,
+            )
+            .await?;
 
-        Ok(Response::new(SetInferenceRouteResponse {
-            provider_name: config.provider_name.clone(),
-            model_id: config.model_id.clone(),
-            version: route.route.version,
-            route_name: route_name.to_string(),
-            validation_performed: !route.validation.is_empty(),
-            validated_endpoints: route.validation,
-            timeout_secs: config.timeout_secs,
-            workspace,
-        }))
+            let config = route
+                .route
+                .config
+                .as_ref()
+                .ok_or_else(|| Status::internal("managed route missing config"))?;
+
+            Ok(Response::new(SetInferenceRouteResponse {
+                provider_name: config.provider_name.clone(),
+                model_id: config.model_id.clone(),
+                version: route.route.version,
+                route_name: route_name.to_string(),
+                validation_performed: !route.validation.is_empty(),
+                validated_endpoints: route.validation,
+                timeout_secs: config.timeout_secs,
+                workspace,
+            }))
+        }
+        .await;
+
+        // Route mutations redirect LLM traffic — audit them like any other
+        // gateway config change. Credentials never enter the record.
+        if result.is_ok() || result.as_ref().is_err_and(crate::audit::audited_failure) {
+            crate::audit::emit_config_outcome(
+                &self.state.config.audit,
+                result.is_ok(),
+                crate::audit::ConfigOutcome {
+                    state_label: "inference_route_set",
+                    principal: &principal,
+                    request_id: request_id.as_deref(),
+                    success_message: format!(
+                        "inference route {route_label} set to {provider_name}/{model_id}"
+                    ),
+                    failure_message: format!("inference route {route_label} set failed"),
+                    unmapped: vec![
+                        ("route_name", serde_json::Value::from(route_label.clone())),
+                        ("provider", serde_json::Value::from(provider_name.clone())),
+                        ("model_id", serde_json::Value::from(model_id.clone())),
+                        (
+                            "workspace",
+                            serde_json::Value::from(workspace_label.clone()),
+                        ),
+                    ],
+                },
+            );
+        }
+        result
     }
 
     async fn get_inference_route(
@@ -197,27 +237,62 @@ impl Inference for InferenceService {
         request: Request<DeleteInferenceRouteRequest>,
     ) -> Result<Response<DeleteInferenceRouteResponse>, Status> {
         let principal = crate::grpc::extract_principal(&request)?;
+        let request_id = crate::audit::request_id(&request);
         let req = request.into_inner();
-        let authz = authorize_workspace(
-            &self.state.store,
-            &self.state.admin_role,
-            &principal,
-            &req.workspace,
-            MinWorkspaceRole::Admin,
-        )
-        .await?;
-        let workspace =
-            crate::grpc::workspace::resolve_workspace(self.state.store.as_ref(), &authz.workspace)
-                .await?
-                .name;
-        let route_name = effective_route_name(&req.route_name)?;
-        let deleted = self
-            .state
-            .store
-            .delete_by_name(InferenceRoute::object_type(), &workspace, route_name)
-            .await
-            .map_err(|e| Status::internal(format!("delete route failed: {e}")))?;
-        Ok(Response::new(DeleteInferenceRouteResponse { deleted }))
+        let route_label = effective_route_name(&req.route_name)
+            .map_or_else(|_| req.route_name.clone(), ToString::to_string);
+        let workspace_label = req.workspace.clone();
+
+        let result = async {
+            let authz = authorize_workspace(
+                &self.state.store,
+                &self.state.admin_role,
+                &principal,
+                &req.workspace,
+                MinWorkspaceRole::Admin,
+            )
+            .await?;
+            let workspace = crate::grpc::workspace::resolve_workspace(
+                self.state.store.as_ref(),
+                &authz.workspace,
+            )
+            .await?
+            .name;
+            let route_name = effective_route_name(&req.route_name)?;
+            let deleted = self
+                .state
+                .store
+                .delete_by_name(InferenceRoute::object_type(), &workspace, route_name)
+                .await
+                .map_err(|e| Status::internal(format!("delete route failed: {e}")))?;
+            Ok(Response::new(DeleteInferenceRouteResponse { deleted }))
+        }
+        .await;
+
+        // A no-op delete (route already gone) is not a state change — judge
+        // success from the response's `deleted` flag.
+        let success = matches!(&result, Ok(response) if response.get_ref().deleted);
+        if result.is_ok() || result.as_ref().is_err_and(crate::audit::audited_failure) {
+            crate::audit::emit_config_outcome(
+                &self.state.config.audit,
+                success,
+                crate::audit::ConfigOutcome {
+                    state_label: "inference_route_deleted",
+                    principal: &principal,
+                    request_id: request_id.as_deref(),
+                    success_message: format!("inference route {route_label} deleted"),
+                    failure_message: format!("inference route {route_label} delete failed"),
+                    unmapped: vec![
+                        ("route_name", serde_json::Value::from(route_label.clone())),
+                        (
+                            "workspace",
+                            serde_json::Value::from(workspace_label.clone()),
+                        ),
+                    ],
+                },
+            );
+        }
+        result
     }
 }
 

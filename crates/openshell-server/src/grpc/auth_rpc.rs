@@ -50,8 +50,82 @@ pub async fn handle_get_current_user(
     }))
 }
 
+/// Emit the Entity Management \[3004\] audit event for a token mint/refresh.
+///
+/// Credential issuance with the sandbox principal as actor; the minted JWT
+/// never enters the record — only the subject sandbox and expiry. Routed
+/// into the sandbox's stream on success, the gateway lane on failure.
+fn emit_token_audit(
+    state: &ServerState,
+    principal: &Principal,
+    request_id: Option<&str>,
+    operation: &'static str,
+    activity: openshell_ocsf::enums::EntityActivityId,
+    expires_at_ms: Option<i64>,
+) {
+    let sandbox_id = match principal {
+        Principal::Sandbox(sandbox) => sandbox.sandbox_id.clone(),
+        _ => String::new(),
+    };
+    let success = expires_at_ms.is_some();
+    let mut unmapped = vec![
+        ("operation", serde_json::Value::from(operation)),
+        ("sandbox_id", serde_json::Value::from(sandbox_id.clone())),
+    ];
+    if let Some(expires_at_ms) = expires_at_ms {
+        unmapped.push(("expires_at_ms", serde_json::Value::from(expires_at_ms)));
+    }
+    crate::audit::emit_entity(
+        &state.config.audit,
+        success,
+        crate::audit::EntityOutcome {
+            activity,
+            entity: openshell_ocsf::objects::ManagedEntity::new(
+                "sandbox_token",
+                sandbox_id.clone(),
+            ),
+            sandbox: (success && !sandbox_id.is_empty()).then_some((sandbox_id.as_str(), "")),
+            principal,
+            request_id,
+            success_message: format!("sandbox token {operation} for {sandbox_id}"),
+            failure_message: format!("sandbox token {operation} failed"),
+            unmapped,
+        },
+    );
+}
+
 #[allow(clippy::result_large_err, clippy::unused_async)]
 pub async fn handle_issue_sandbox_token(
+    state: &Arc<ServerState>,
+    request: Request<IssueSandboxTokenRequest>,
+) -> Result<Response<IssueSandboxTokenResponse>, Status> {
+    let principal = crate::audit::principal(&request);
+    let request_id = crate::audit::request_id(&request);
+    let result = handle_issue_sandbox_token_inner(state, request).await;
+    match &result {
+        Ok(response) => emit_token_audit(
+            state,
+            &principal,
+            request_id.as_deref(),
+            "issued",
+            openshell_ocsf::enums::EntityActivityId::Create,
+            Some(response.get_ref().expires_at_ms),
+        ),
+        Err(status) if crate::audit::audited_failure(status) => emit_token_audit(
+            state,
+            &principal,
+            request_id.as_deref(),
+            "issued",
+            openshell_ocsf::enums::EntityActivityId::Create,
+            None,
+        ),
+        Err(_) => {}
+    }
+    result
+}
+
+#[allow(clippy::result_large_err, clippy::unused_async)]
+async fn handle_issue_sandbox_token_inner(
     state: &Arc<ServerState>,
     request: Request<IssueSandboxTokenRequest>,
 ) -> Result<Response<IssueSandboxTokenResponse>, Status> {
@@ -106,6 +180,36 @@ pub async fn handle_issue_sandbox_token(
 
 #[allow(clippy::result_large_err, clippy::unused_async)]
 pub async fn handle_refresh_sandbox_token(
+    state: &Arc<ServerState>,
+    request: Request<RefreshSandboxTokenRequest>,
+) -> Result<Response<RefreshSandboxTokenResponse>, Status> {
+    let principal = crate::audit::principal(&request);
+    let request_id = crate::audit::request_id(&request);
+    let result = handle_refresh_sandbox_token_inner(state, request).await;
+    match &result {
+        Ok(response) => emit_token_audit(
+            state,
+            &principal,
+            request_id.as_deref(),
+            "refreshed",
+            openshell_ocsf::enums::EntityActivityId::Update,
+            Some(response.get_ref().expires_at_ms),
+        ),
+        Err(status) if crate::audit::audited_failure(status) => emit_token_audit(
+            state,
+            &principal,
+            request_id.as_deref(),
+            "refreshed",
+            openshell_ocsf::enums::EntityActivityId::Update,
+            None,
+        ),
+        Err(_) => {}
+    }
+    result
+}
+
+#[allow(clippy::result_large_err, clippy::unused_async)]
+async fn handle_refresh_sandbox_token_inner(
     state: &Arc<ServerState>,
     request: Request<RefreshSandboxTokenRequest>,
 ) -> Result<Response<RefreshSandboxTokenResponse>, Status> {
@@ -292,6 +396,71 @@ mod tests {
             .into_inner();
         assert!(!resp.token.is_empty());
         assert!(resp.expires_at_ms > 0);
+    }
+
+    /// Token minting is credential issuance: it must leave a 3004 record
+    /// carrying the sandbox actor and expiry — and never the JWT itself.
+    #[tokio::test]
+    async fn token_refresh_emits_an_audit_record_without_the_jwt() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let exporter = opentelemetry_sdk::logs::InMemoryLogExporter::default();
+        let (handle, worker) = crate::log_export::spawn(
+            exporter.clone(),
+            opentelemetry_sdk::Resource::builder_empty().build(),
+            true,
+        );
+        let bus = TracingLogBus::new();
+        bus.set_export(handle);
+        let state = state_with_issuer().await;
+
+        let token;
+        {
+            let subscriber = tracing_subscriber::registry().with(bus.layer());
+            let _guard = crate::otel_tracing::test_exporter::install_scoped(subscriber);
+            let mut req = Request::new(RefreshSandboxTokenRequest {});
+            req.extensions_mut().insert(sandbox_principal("sandbox-a"));
+            token = handle_refresh_sandbox_token(&state, req)
+                .await
+                .expect("refresh OK")
+                .into_inner()
+                .token;
+        }
+
+        let audit_record = || {
+            exporter.get_emitted_logs().unwrap().iter().find_map(|log| {
+                log.record
+                    .attributes_iter()
+                    .find(|(k, _)| k.as_str() == "ocsf.raw")
+                    .and_then(|(_, v)| match v {
+                        opentelemetry::logs::AnyValue::String(s) => Some(s.as_str().to_string()),
+                        _ => None,
+                    })
+            })
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let raw = loop {
+            if let Some(raw) = audit_record() {
+                break raw;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "audit record never arrived"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let record: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(record["class_uid"], 3004);
+        assert_eq!(record["entity"]["type"], "sandbox_token");
+        assert_eq!(record["actor"]["user"]["uid"], "sandbox-a");
+        assert_eq!(record["unmapped"]["operation"], "refreshed");
+        assert!(record["unmapped"]["expires_at_ms"].is_i64());
+        assert!(
+            !raw.contains(&token),
+            "the minted JWT must never appear in the audit record"
+        );
+
+        worker.shutdown().await;
     }
 
     #[tokio::test]

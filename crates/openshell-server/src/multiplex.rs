@@ -304,8 +304,11 @@ impl MultiplexService {
     {
         let openshell = OpenShellServer::new(OpenShellService::new(self.state.clone()))
             .max_decoding_message_size(MAX_GRPC_DECODE_SIZE);
-        let openshell =
-            GatewayInterceptorGrpcService::new(openshell, self.state.gateway_interceptors.clone());
+        let openshell = GatewayInterceptorGrpcService::new(
+            openshell,
+            self.state.gateway_interceptors.clone(),
+            self.state.config.audit.clone(),
+        );
         let inference = InferenceServer::new(InferenceService::new(self.state.clone()))
             .max_decoding_message_size(MAX_GRPC_DECODE_SIZE);
         let authz_policy = self.state.config.oidc.as_ref().map(|oidc| AuthzPolicy {
@@ -432,13 +435,19 @@ where
 struct GatewayInterceptorGrpcService<S> {
     inner: S,
     interceptors: Option<GatewayInterceptorRuntime>,
+    audit: openshell_core::GatewayAuditConfig,
 }
 
 impl<S> GatewayInterceptorGrpcService<S> {
-    fn new(inner: S, interceptors: Option<GatewayInterceptorRuntime>) -> Self {
+    fn new(
+        inner: S,
+        interceptors: Option<GatewayInterceptorRuntime>,
+        audit: openshell_core::GatewayAuditConfig,
+    ) -> Self {
         Self {
             inner,
             interceptors,
+            audit,
         }
     }
 }
@@ -462,6 +471,7 @@ where
 
     fn call(&mut self, req: Request<BoxBody>) -> Self::Future {
         let interceptors = self.interceptors.clone();
+        let audit = self.audit.clone();
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
@@ -485,6 +495,45 @@ where
                 Ok(intercepted) => intercepted,
                 Err(status) => return Ok(status.into_http()),
             };
+
+            // An interceptor rewrote the request before dispatch: leave a
+            // companion audit record so the downstream handler's event (which
+            // sees only post-patch values under the caller's principal) is
+            // distinguishable from an unmodified mutation. Correlate via
+            // `request_id`.
+            if !intercepted.modified_by.is_empty() {
+                let principal = parts
+                    .extensions
+                    .get::<Principal>()
+                    .cloned()
+                    .unwrap_or(Principal::Anonymous);
+                let request_id = parts
+                    .headers
+                    .get("x-request-id")
+                    .and_then(|v| v.to_str().ok())
+                    .map(ToString::to_string);
+                crate::audit::emit_config_outcome(
+                    &audit,
+                    true,
+                    crate::audit::ConfigOutcome {
+                        state_label: "request_modified",
+                        principal: &principal,
+                        request_id: request_id.as_deref(),
+                        success_message: format!(
+                            "gateway interceptor(s) {} modified {path}",
+                            intercepted.modified_by.join(",")
+                        ),
+                        failure_message: String::new(),
+                        unmapped: vec![
+                            ("path", serde_json::Value::from(path.clone())),
+                            (
+                                "interceptors",
+                                serde_json::Value::from(intercepted.modified_by.clone()),
+                            ),
+                        ],
+                    },
+                );
+            }
 
             let req = Request::from_parts(
                 parts,
@@ -1863,7 +1912,11 @@ mod tests {
                 )))
             }
         });
-        let mut service = GatewayInterceptorGrpcService::new(inner, Some(runtime));
+        let mut service = GatewayInterceptorGrpcService::new(
+            inner,
+            Some(runtime),
+            openshell_core::GatewayAuditConfig::default(),
+        );
         let request_body = grpc_frame(&CreateSandboxRequest::default().encode_to_vec());
         let request = Request::builder()
             .uri("/openshell.v1.OpenShell/CreateSandbox")

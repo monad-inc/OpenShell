@@ -128,8 +128,11 @@ mod tests {
         assert_eq!(json["unmapped"]["request_id"], "req-42");
 
         let line = event.format_shorthand();
+        // The stable uid rides along with the display name: in the default
+        // push format the shorthand is the only actor identity that leaves
+        // the box, and `preferred_username` alone is self-asserted.
         assert!(
-            line.starts_with("ENTITY:CREATE [INFO] workspace \"team-a\" by alice"),
+            line.starts_with("ENTITY:CREATE [INFO] workspace \"team-a\" by alice(oidc|alice-123)"),
             "unexpected shorthand: {line}"
         );
     }

@@ -163,6 +163,26 @@ fn tag_text(text: &str) -> String {
     escaped
 }
 
+/// Render an actor/user for the shorthand text plane as `name(uid)`.
+///
+/// The display name is often a self-asserted identity claim
+/// (`preferred_username`), so the stable uid must accompany it — in the
+/// default push format the shorthand is the only actor identity that leaves
+/// the box, and a display name alone would let one user pose as another.
+/// The uid is omitted when absent or identical to the name.
+fn user_display(user: &crate::objects::User) -> String {
+    let name = truncate_with_ellipsis(&single_line(&user.name), MAX_MESSAGE_LEN);
+    match user.uid.as_deref() {
+        Some(uid) if uid != user.name => {
+            format!(
+                "{name}({})",
+                truncate_with_ellipsis(&single_line(uid), MAX_MESSAGE_LEN)
+            )
+        }
+        _ => name,
+    }
+}
+
 fn reason_text(text: Option<&str>) -> Option<String> {
     let text = text?;
     if text.is_empty() {
@@ -475,12 +495,7 @@ impl OcsfEvent {
                     .actor
                     .as_ref()
                     .and_then(|a| a.user.as_ref())
-                    .map(|u| {
-                        format!(
-                            " by {}",
-                            truncate_with_ellipsis(&single_line(&u.name), MAX_MESSAGE_LEN)
-                        )
-                    })
+                    .map(|u| format!(" by {}", user_display(u)))
                     .unwrap_or_default();
                 format!(
                     "ENTITY:{activity} {sev}{outcome} {} \"{}\"{actor_str}",
@@ -505,7 +520,7 @@ impl OcsfEvent {
                 let who = e
                     .user
                     .as_ref()
-                    .map(|u| format!(" user:{}", single_line(&u.name)))
+                    .map(|u| format!(" user:{}", user_display(u)))
                     .unwrap_or_default();
                 let from = e
                     .src_endpoint

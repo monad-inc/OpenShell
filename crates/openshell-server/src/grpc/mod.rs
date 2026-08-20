@@ -794,7 +794,9 @@ pub mod test_support {
                 .await
                 .unwrap(),
         );
-        crate::ensure_default_workspace(&store).await.unwrap();
+        crate::ensure_default_workspace(&store, &openshell_core::GatewayAuditConfig::default())
+            .await
+            .unwrap();
         let compute = if driver_name == "test" {
             new_test_runtime(store.clone()).await
         } else {
