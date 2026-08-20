@@ -474,6 +474,10 @@ impl OcsfEvent {
                             .to_uppercase()
                     },
                 );
+                let outcome = match e.base.status.map(crate::enums::StatusId::label) {
+                    Some("Failure") => " FAILED",
+                    _ => "",
+                };
                 let what = e.base.message.as_deref().unwrap_or("config");
                 // Bracketed suffix carries the structured provenance fields a
                 // reviewer needs to scan a CONFIG audit line. Auto-approval
@@ -515,7 +519,7 @@ impl OcsfEvent {
                     .and_then(|a| a.user.as_ref())
                     .map(|u| format!(" by {}", u.name))
                     .unwrap_or_default();
-                format!("CONFIG:{state} {sev} {what}{suffix}{actor_str}")
+                format!("CONFIG:{state} {sev}{outcome} {what}{suffix}{actor_str}")
             }
 
             Self::Base(e) => {

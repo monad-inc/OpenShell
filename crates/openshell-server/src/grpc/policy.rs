@@ -50,14 +50,11 @@ use openshell_core::telemetry::{
     LifecycleOperation, LifecycleResource, PolicyDecisionOperation, TelemetryOutcome,
 };
 use openshell_core::{
-    VERSION,
     endpoint_path::EndpointPathPattern,
     host_pattern::host_matches,
     settings::{self, SettingValueKind},
 };
-use openshell_ocsf::{
-    ConfigStateChangeBuilder, OCSF_TARGET, OcsfEvent, SandboxContext, SeverityId, StateId, StatusId,
-};
+use openshell_ocsf::{ConfigStateChangeBuilder, OcsfEvent, SeverityId, StateId, StatusId};
 use openshell_policy::{
     PolicyMergeOp, ProviderPolicyLayer, compose_effective_policy, merge_policy,
     serialize_sandbox_policy,
@@ -75,7 +72,7 @@ use openshell_providers::normalize_provider_type;
 use prost::Message;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::IpAddr;
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 use tracing::{debug, info, warn};
@@ -298,102 +295,78 @@ fn emit_update_config_settings_audit(
     }
 }
 
-fn emit_gateway_policy_audit_log(
-    sandbox_id: &str,
-    sandbox_name: &str,
-    state_label: &str,
-    detail: impl Into<String>,
+/// Facts for one gateway policy/draft audit event (Device Config State
+/// Change \[5019\]).
+struct PolicyAuditEvent<'a> {
+    /// Resolved sandbox (id, name); routes the event into that sandbox's
+    /// stream. `None` when the mutation failed before the sandbox resolved —
+    /// the event rides the gateway lane, naming the sandbox in `extra`.
+    sandbox: Option<(&'a str, &'a str)>,
+    state_label: &'a str,
+    detail: String,
     version: i64,
-    policy_hash: &str,
-) {
-    let message = build_gateway_policy_audit_message(
-        sandbox_id,
-        sandbox_name,
-        state_label,
-        detail,
-        version,
-        policy_hash,
-        &[],
-    );
-    info!(
-        target: OCSF_TARGET,
-        sandbox_id = %sandbox_id,
-        message = %message
-    );
+    policy_hash: &'a str,
+    success: bool,
+    extra: Vec<(&'static str, serde_json::Value)>,
 }
 
-/// Emit a `CONFIG:APPROVED` audit event for an auto-approval — same event
-/// class as a human approval, with extra unmapped fields carrying the
-/// safety reasoning so the audit is reconstructable. `source` records the
-/// proposer (`mechanistic` or `agent_authored`) for provenance.
-/// `resolved_from` records the scope that supplied the `auto` mode setting
-/// (`gateway`, `sandbox`, or `default`) so operators can see why a given
-/// approval was auto vs manual.
-fn emit_gateway_policy_auto_approve_audit_log(
-    sandbox_id: &str,
-    sandbox_name: &str,
-    detail: impl Into<String>,
-    version: i64,
-    policy_hash: &str,
-    source: &str,
-    resolved_from: &str,
-) {
-    let extra = [
-        ("auto", "true".to_string()),
-        ("source", source.to_string()),
-        ("prover_delta", "empty".to_string()),
-        ("resolved_from", resolved_from.to_string()),
-    ];
-    let message = build_gateway_policy_audit_message(
-        sandbox_id,
-        sandbox_name,
-        "approved",
-        detail,
-        version,
-        policy_hash,
-        &extra,
-    );
-    info!(
-        target: OCSF_TARGET,
-        sandbox_id = %sandbox_id,
-        message = %message
-    );
-}
-
-fn build_gateway_policy_audit_message(
-    sandbox_id: &str,
-    sandbox_name: &str,
-    state_label: &str,
-    detail: impl Into<String>,
-    version: i64,
-    policy_hash: &str,
-    extra_fields: &[(&str, String)],
-) -> String {
-    let ctx = SandboxContext {
-        sandbox_id: sandbox_id.to_string(),
-        sandbox_name: sandbox_name.to_string(),
-        container_image: "openshell/gateway".to_string(),
-        hostname: "openshell-gateway".to_string(),
-        product_version: VERSION.to_string(),
-        proxy_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
-        proxy_port: 0,
+/// Build the policy audit event: `CONFIG:<STATE>` shorthand with the stable
+/// `version`/`hash` suffix, the full document in `ocsf.raw`, and the acting
+/// principal when one is in play (auto-approvals pass the submitting
+/// sandbox's principal).
+fn build_gateway_policy_audit_event(
+    principal: Option<&Principal>,
+    request_id: Option<&str>,
+    event: &PolicyAuditEvent<'_>,
+) -> OcsfEvent {
+    let ctx = match event.sandbox {
+        Some((id, name)) => crate::audit::ctx_for_sandbox(id, name),
+        None => crate::audit::ctx().clone(),
     };
     let mut builder = ConfigStateChangeBuilder::new(&ctx)
-        .state(StateId::Other, state_label)
+        .state(StateId::Other, event.state_label)
         .severity(SeverityId::Informational)
-        .status(StatusId::Success)
-        .message(detail.into());
-    if version > 0 {
-        builder = builder.unmapped("policy_version", format!("v{version}"));
+        .status(if event.success {
+            StatusId::Success
+        } else {
+            StatusId::Failure
+        })
+        .message(event.detail.clone());
+    if let Some(principal) = principal {
+        builder = builder.actor_user(crate::audit::actor_user(principal));
     }
-    if !policy_hash.is_empty() {
-        builder = builder.unmapped("policy_hash", policy_hash.to_string());
+    if event.version > 0 {
+        builder = builder.unmapped("policy_version", format!("v{}", event.version));
     }
-    for (key, value) in extra_fields {
+    if !event.policy_hash.is_empty() {
+        builder = builder.unmapped("policy_hash", event.policy_hash.to_string());
+    }
+    for (key, value) in &event.extra {
         builder = builder.unmapped(key, value.clone());
     }
-    let event: OcsfEvent = builder.build();
-    event.format_shorthand()
+    if let Some(request_id) = request_id {
+        builder = builder.unmapped("request_id", request_id);
+    }
+    builder.build()
+}
+
+/// Emit a policy/draft audit event once the outcome is known. No-op when
+/// the master audit toggle (`[openshell.gateway.audit] enabled`,
+/// `OPENSHELL_AUDIT_EVENTS`) is off.
+fn emit_gateway_policy_audit(
+    state: &ServerState,
+    principal: Option<&Principal>,
+    request_id: Option<&str>,
+    event: &PolicyAuditEvent<'_>,
+) {
+    if !state.config.audit.enabled {
+        return;
+    }
+    let built = build_gateway_policy_audit_event(principal, request_id, event);
+    match event.sandbox {
+        Some((id, _)) => crate::audit::emit_for_sandbox(id, built),
+        None => crate::audit::emit(built),
+    }
 }
 
 fn summarize_cli_policy_merge_op(operation: &PolicyMergeOp) -> String {
@@ -1061,6 +1034,9 @@ struct AutoApproveChunkContext<'a> {
     resolved_from: &'a str,
     current_policy: &'a ProtoSandboxPolicy,
     credential_set: &'a CredentialSet,
+    /// The principal whose submission triggered the auto-approval — the
+    /// audit event's actor.
+    principal: &'a Principal,
 }
 
 async fn auto_approve_chunk(
@@ -1168,16 +1144,32 @@ async fn auto_approve_chunk(
     } else {
         context.source
     };
-    emit_gateway_policy_auto_approve_audit_log(
-        sandbox_id,
-        sandbox_name,
-        format!(
-            "auto-approved: no new prover findings (source={source_label}) — chunk {chunk_id}: {chunk_summary}"
-        ),
-        version,
-        &hash,
-        source_label,
-        context.resolved_from,
+    // Same event class as a human approval; the extra fields carry the
+    // safety reasoning so the audit is reconstructable, and the actor is
+    // the principal whose submission triggered the approval.
+    emit_gateway_policy_audit(
+        state,
+        Some(context.principal),
+        None,
+        &PolicyAuditEvent {
+            sandbox: Some((sandbox_id, sandbox_name)),
+            state_label: "approved",
+            detail: format!(
+                "auto-approved: no new prover findings (source={source_label}) — chunk {chunk_id}: {chunk_summary}"
+            ),
+            version,
+            policy_hash: &hash,
+            success: true,
+            extra: vec![
+                ("auto", serde_json::Value::from("true")),
+                ("source", serde_json::Value::from(source_label)),
+                ("prover_delta", serde_json::Value::from("empty")),
+                (
+                    "resolved_from",
+                    serde_json::Value::from(context.resolved_from),
+                ),
+            ],
+        },
     );
 
     info!(
@@ -2962,28 +2954,40 @@ async fn handle_update_config_inner(
         };
 
         state.sandbox_watch_bus.notify(&sandbox_id);
-        emit_gateway_policy_audit_log(
-            &sandbox_id,
-            sandbox.object_name(),
-            "merged",
-            format!(
-                "gateway merged {} incremental policy operation(s)",
-                merge_ops.len()
-            ),
-            version,
-            &hash,
-        );
-        for operation in &merge_ops {
-            emit_gateway_policy_audit_log(
-                &sandbox_id,
-                sandbox.object_name(),
-                "merged",
-                format!(
-                    "gateway merged incremental policy op: {}",
-                    summarize_cli_policy_merge_op(operation)
+        emit_gateway_policy_audit(
+            state,
+            Some(principal),
+            request_id.as_deref(),
+            &PolicyAuditEvent {
+                sandbox: Some((&sandbox_id, sandbox.object_name())),
+                state_label: "merged",
+                detail: format!(
+                    "gateway merged {} incremental policy operation(s)",
+                    merge_ops.len()
                 ),
                 version,
-                &hash,
+                policy_hash: &hash,
+                success: true,
+                extra: vec![("operation_count", serde_json::Value::from(merge_ops.len()))],
+            },
+        );
+        for operation in &merge_ops {
+            emit_gateway_policy_audit(
+                state,
+                Some(principal),
+                request_id.as_deref(),
+                &PolicyAuditEvent {
+                    sandbox: Some((&sandbox_id, sandbox.object_name())),
+                    state_label: "merged",
+                    detail: format!(
+                        "gateway merged incremental policy op: {}",
+                        summarize_cli_policy_merge_op(operation)
+                    ),
+                    version,
+                    policy_hash: &hash,
+                    success: true,
+                    extra: Vec::new(),
+                },
             );
         }
         info!(
@@ -3556,11 +3560,37 @@ pub(super) async fn handle_submit_policy_analysis(
     state: &Arc<ServerState>,
     request: Request<SubmitPolicyAnalysisRequest>,
 ) -> Result<Response<SubmitPolicyAnalysisResponse>, Status> {
+    let principal = crate::audit::principal(&request);
+    let request_id = crate::audit::request_id(&request);
+    let name = request.get_ref().name.clone();
+    let result = handle_submit_policy_analysis_inner(state, request).await;
+    if let Err(status) = &result {
+        emit_draft_failure_audit(
+            state,
+            &principal,
+            request_id.as_deref(),
+            status,
+            DraftFailureAudit {
+                state_label: "draft_submitted",
+                detail: "policy analysis submission failed".to_string(),
+                sandbox_name: &name,
+                chunk_id: None,
+            },
+        );
+    }
+    result
+}
+
+async fn handle_submit_policy_analysis_inner(
+    state: &Arc<ServerState>,
+    request: Request<SubmitPolicyAnalysisRequest>,
+) -> Result<Response<SubmitPolicyAnalysisResponse>, Status> {
     let principal = request
         .extensions()
         .get::<Principal>()
         .cloned()
         .ok_or_else(|| Status::unauthenticated("missing principal"))?;
+    let request_id = crate::audit::request_id(&request);
     let req = request.into_inner();
     let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
         .await?
@@ -3811,6 +3841,7 @@ pub(super) async fn handle_submit_policy_analysis(
                     resolved_from,
                     current_policy: &current_policy,
                     credential_set: &credential_set,
+                    principal: &principal,
                 },
             )
             .await
@@ -3835,6 +3866,33 @@ pub(super) async fn handle_submit_policy_analysis(
         draft_version = draft_version,
         summaries = req.summaries.len(),
         "SubmitPolicyAnalysis: persisted draft chunks"
+    );
+    // The actor is typically the sandbox principal — the in-sandbox agent
+    // proposing its own policy — which is exactly what the audit trail
+    // needs to distinguish from human edits.
+    emit_gateway_policy_audit(
+        state,
+        Some(&principal),
+        request_id.as_deref(),
+        &PolicyAuditEvent {
+            sandbox: Some((&sandbox_id, sandbox.object_name())),
+            state_label: "draft_submitted",
+            detail: format!(
+                "policy analysis submitted: {accepted} chunk(s) accepted, {rejected} rejected"
+            ),
+            version: 0,
+            policy_hash: "",
+            success: true,
+            extra: vec![
+                ("accepted_chunks", serde_json::Value::from(accepted)),
+                ("rejected_chunks", serde_json::Value::from(rejected)),
+                ("draft_version", serde_json::Value::from(draft_version)),
+                (
+                    "analysis_mode",
+                    serde_json::Value::from(req.analysis_mode.clone()),
+                ),
+            ],
+        },
     );
 
     Ok(Response::new(SubmitPolicyAnalysisResponse {
@@ -3919,13 +3977,72 @@ pub(super) async fn handle_get_draft_policy(
     }))
 }
 
+/// A failed draft mutation's audit facts. The sandbox is carried by name
+/// only, since the failure may have struck before it resolved.
+struct DraftFailureAudit<'a> {
+    state_label: &'static str,
+    detail: String,
+    sandbox_name: &'a str,
+    chunk_id: Option<&'a str>,
+}
+
+/// Emit the gateway-lane Failure audit event for a draft mutation, unless
+/// the rejection was an authentication/authorization denial.
+fn emit_draft_failure_audit(
+    state: &ServerState,
+    principal: &Principal,
+    request_id: Option<&str>,
+    status: &Status,
+    failure: DraftFailureAudit<'_>,
+) {
+    if !crate::audit::audited_failure(status) {
+        return;
+    }
+    let mut extra = vec![("sandbox", serde_json::Value::from(failure.sandbox_name))];
+    if let Some(chunk_id) = failure.chunk_id {
+        extra.push(("chunk_id", serde_json::Value::from(chunk_id)));
+    }
+    emit_gateway_policy_audit(
+        state,
+        Some(principal),
+        request_id,
+        &PolicyAuditEvent {
+            sandbox: None,
+            state_label: failure.state_label,
+            detail: failure.detail,
+            version: 0,
+            policy_hash: "",
+            success: false,
+            extra,
+        },
+    );
+}
+
 pub(super) async fn handle_approve_draft_chunk(
     state: &Arc<ServerState>,
     request: Request<ApproveDraftChunkRequest>,
 ) -> Result<Response<ApproveDraftChunkResponse>, Status> {
+    let principal = crate::audit::principal(&request);
+    let request_id = crate::audit::request_id(&request);
+    let (name, chunk_id) = {
+        let req = request.get_ref();
+        (req.name.clone(), req.chunk_id.clone())
+    };
     let result = handle_approve_draft_chunk_inner(state, request).await;
-    if result.is_err() {
+    if let Err(status) = &result {
         emit_policy_decision_failure(PolicyDecisionOperation::Approve, 1);
+        emit_draft_failure_audit(
+            state,
+            &principal,
+            request_id.as_deref(),
+            status,
+            DraftFailureAudit {
+                state_label: "approved",
+                detail: format!("gateway approve of draft chunk {chunk_id} failed"),
+                sandbox_name: &name,
+                chunk_id: Some(&chunk_id),
+            },
+        );
     }
     result
 }
@@ -3935,6 +4052,7 @@ async fn handle_approve_draft_chunk_inner(
     request: Request<ApproveDraftChunkRequest>,
 ) -> Result<Response<ApproveDraftChunkResponse>, Status> {
     let principal = super::extract_principal(&request)?;
+    let request_id = crate::audit::request_id(&request);
     let req = request.into_inner();
     let authz = authorize_workspace(
         &state.store,
@@ -4015,16 +4133,22 @@ async fn handle_approve_draft_chunk_inner(
         .map_err(|e| Status::internal(format!("update chunk status failed: {e}")))?;
 
     state.sandbox_watch_bus.notify(&sandbox_id);
-    emit_gateway_policy_audit_log(
-        &sandbox_id,
-        sandbox.object_name(),
-        "approved",
-        format!(
-            "gateway approved draft chunk {}: {chunk_summary}",
-            req.chunk_id
-        ),
-        version,
-        &hash,
+    emit_gateway_policy_audit(
+        state,
+        Some(&principal),
+        request_id.as_deref(),
+        &PolicyAuditEvent {
+            sandbox: Some((&sandbox_id, sandbox.object_name())),
+            state_label: "approved",
+            detail: format!(
+                "gateway approved draft chunk {}: {chunk_summary}",
+                req.chunk_id
+            ),
+            version,
+            policy_hash: &hash,
+            success: true,
+            extra: vec![("chunk_id", serde_json::Value::from(req.chunk_id.clone()))],
+        },
     );
 
     info!(
@@ -4048,9 +4172,27 @@ pub(super) async fn handle_reject_draft_chunk(
     state: &Arc<ServerState>,
     request: Request<RejectDraftChunkRequest>,
 ) -> Result<Response<RejectDraftChunkResponse>, Status> {
+    let principal = crate::audit::principal(&request);
+    let request_id = crate::audit::request_id(&request);
+    let (name, chunk_id) = {
+        let req = request.get_ref();
+        (req.name.clone(), req.chunk_id.clone())
+    };
     let result = handle_reject_draft_chunk_inner(state, request).await;
-    if result.is_err() {
+    if let Err(status) = &result {
         emit_policy_decision_failure(PolicyDecisionOperation::Reject, 1);
+        emit_draft_failure_audit(
+            state,
+            &principal,
+            request_id.as_deref(),
+            status,
+            DraftFailureAudit {
+                state_label: "rejected",
+                detail: format!("gateway reject of draft chunk {chunk_id} failed"),
+                sandbox_name: &name,
+                chunk_id: Some(&chunk_id),
+            },
+        );
     }
     result
 }
@@ -4060,6 +4202,7 @@ async fn handle_reject_draft_chunk_inner(
     request: Request<RejectDraftChunkRequest>,
 ) -> Result<Response<RejectDraftChunkResponse>, Status> {
     let principal = super::extract_principal(&request)?;
+    let request_id = crate::audit::request_id(&request);
     let req = request.into_inner();
     let authz = authorize_workspace(
         &state.store,
@@ -4119,16 +4262,22 @@ async fn handle_reject_draft_chunk_inner(
         require_no_global_policy(state).await?;
         let (version, hash) =
             remove_chunk_from_policy(state, &sandbox_id, &workspace, &chunk).await?;
-        emit_gateway_policy_audit_log(
-            &sandbox_id,
-            sandbox.object_name(),
-            "removed",
-            format!(
-                "gateway removed previously approved draft chunk {}: remove-binary {} {}",
-                req.chunk_id, chunk.rule_name, chunk.binary
-            ),
-            version,
-            &hash,
+        emit_gateway_policy_audit(
+            state,
+            Some(&principal),
+            request_id.as_deref(),
+            &PolicyAuditEvent {
+                sandbox: Some((&sandbox_id, sandbox.object_name())),
+                state_label: "removed",
+                detail: format!(
+                    "gateway removed previously approved draft chunk {}: remove-binary {} {}",
+                    req.chunk_id, chunk.rule_name, chunk.binary
+                ),
+                version,
+                policy_hash: &hash,
+                success: true,
+                extra: vec![("chunk_id", serde_json::Value::from(req.chunk_id.clone()))],
+            },
         );
         emit_sandbox_policy_update_success();
     }
@@ -4149,6 +4298,29 @@ async fn handle_reject_draft_chunk_inner(
         .map_err(|e| Status::internal(format!("update chunk status failed: {e}")))?;
 
     state.sandbox_watch_bus.notify(&sandbox_id);
+    let mut extra = vec![("chunk_id", serde_json::Value::from(req.chunk_id.clone()))];
+    // The reviewer's guidance is part of the decision record; free-form but
+    // reviewer-authored, so safe to carry.
+    if !req.reason.is_empty() {
+        extra.push(("reason", serde_json::Value::from(req.reason.clone())));
+    }
+    emit_gateway_policy_audit(
+        state,
+        Some(&principal),
+        request_id.as_deref(),
+        &PolicyAuditEvent {
+            sandbox: Some((&sandbox_id, sandbox.object_name())),
+            state_label: "rejected",
+            detail: format!(
+                "gateway rejected draft chunk {}: {} {}",
+                req.chunk_id, chunk.rule_name, chunk.binary
+            ),
+            version: 0,
+            policy_hash: "",
+            success: true,
+            extra,
+        },
+    );
     emit_policy_decision_success(PolicyDecisionOperation::Reject, 1);
 
     Ok(Response::new(RejectDraftChunkResponse {}))
@@ -4158,9 +4330,24 @@ pub(super) async fn handle_approve_all_draft_chunks(
     state: &Arc<ServerState>,
     request: Request<ApproveAllDraftChunksRequest>,
 ) -> Result<Response<ApproveAllDraftChunksResponse>, Status> {
+    let principal = crate::audit::principal(&request);
+    let request_id = crate::audit::request_id(&request);
+    let name = request.get_ref().name.clone();
     let result = handle_approve_all_draft_chunks_inner(state, request).await;
-    if result.is_err() {
+    if let Err(status) = &result {
         emit_policy_decision_failure(PolicyDecisionOperation::ApproveAll, 0);
+        emit_draft_failure_audit(
+            state,
+            &principal,
+            request_id.as_deref(),
+            status,
+            DraftFailureAudit {
+                state_label: "merged",
+                detail: "gateway bulk-approve of draft chunks failed".to_string(),
+                sandbox_name: &name,
+                chunk_id: None,
+            },
+        );
     }
     result
 }
@@ -4170,6 +4357,7 @@ async fn handle_approve_all_draft_chunks_inner(
     request: Request<ApproveAllDraftChunksRequest>,
 ) -> Result<Response<ApproveAllDraftChunksResponse>, Status> {
     let principal = super::extract_principal(&request)?;
+    let request_id = crate::audit::request_id(&request);
     let req = request.into_inner();
     let authz = authorize_workspace(
         &state.store,
@@ -4287,28 +4475,43 @@ async fn handle_approve_all_draft_chunks_inner(
             .await
             .map_err(|e| Status::internal(format!("update chunk status failed: {e}")))?;
 
-        emit_gateway_policy_audit_log(
-            &sandbox_id,
-            sandbox.object_name(),
-            "approved",
-            format!("gateway approved draft chunk {}: {chunk_summary}", chunk.id),
-            version,
-            &last_hash,
+        emit_gateway_policy_audit(
+            state,
+            Some(&principal),
+            request_id.as_deref(),
+            &PolicyAuditEvent {
+                sandbox: Some((&sandbox_id, sandbox.object_name())),
+                state_label: "approved",
+                detail: format!("gateway approved draft chunk {}: {chunk_summary}", chunk.id),
+                version,
+                policy_hash: &last_hash,
+                success: true,
+                extra: vec![("chunk_id", serde_json::Value::from(chunk.id.clone()))],
+            },
         );
         chunks_approved += 1;
         emit_sandbox_policy_update_success();
     }
 
     state.sandbox_watch_bus.notify(&sandbox_id);
-    emit_gateway_policy_audit_log(
-        &sandbox_id,
-        sandbox.object_name(),
-        "merged",
-        format!(
-            "gateway bulk-approved {chunks_approved} draft chunk(s) and skipped {chunks_skipped}"
-        ),
-        last_version,
-        &last_hash,
+    emit_gateway_policy_audit(
+        state,
+        Some(&principal),
+        request_id.as_deref(),
+        &PolicyAuditEvent {
+            sandbox: Some((&sandbox_id, sandbox.object_name())),
+            state_label: "merged",
+            detail: format!(
+                "gateway bulk-approved {chunks_approved} draft chunk(s) and skipped {chunks_skipped}"
+            ),
+            version: last_version,
+            policy_hash: &last_hash,
+            success: true,
+            extra: vec![
+                ("chunks_approved", serde_json::Value::from(chunks_approved)),
+                ("chunks_skipped", serde_json::Value::from(chunks_skipped)),
+            ],
+        },
     );
 
     info!(
@@ -4336,7 +4539,36 @@ pub(super) async fn handle_edit_draft_chunk(
     state: &Arc<ServerState>,
     request: Request<EditDraftChunkRequest>,
 ) -> Result<Response<EditDraftChunkResponse>, Status> {
+    let principal = crate::audit::principal(&request);
+    let request_id = crate::audit::request_id(&request);
+    let (name, chunk_id) = {
+        let req = request.get_ref();
+        (req.name.clone(), req.chunk_id.clone())
+    };
+    let result = handle_edit_draft_chunk_inner(state, request).await;
+    if let Err(status) = &result {
+        emit_draft_failure_audit(
+            state,
+            &principal,
+            request_id.as_deref(),
+            status,
+            DraftFailureAudit {
+                state_label: "edited",
+                detail: format!("gateway edit of draft chunk {chunk_id} failed"),
+                sandbox_name: &name,
+                chunk_id: Some(&chunk_id),
+            },
+        );
+    }
+    result
+}
+
+async fn handle_edit_draft_chunk_inner(
+    state: &Arc<ServerState>,
+    request: Request<EditDraftChunkRequest>,
+) -> Result<Response<EditDraftChunkResponse>, Status> {
     let principal = super::extract_principal(&request)?;
+    let request_id = crate::audit::request_id(&request);
     let req = request.into_inner();
     let authz = authorize_workspace(
         &state.store,
@@ -4393,6 +4625,23 @@ pub(super) async fn handle_edit_draft_chunk(
         chunk_id = %req.chunk_id,
         "EditDraftChunk: proposed rule updated"
     );
+    emit_gateway_policy_audit(
+        state,
+        Some(&principal),
+        request_id.as_deref(),
+        &PolicyAuditEvent {
+            sandbox: Some((&sandbox_id, sandbox.object_name())),
+            state_label: "edited",
+            detail: format!(
+                "gateway edited pending draft chunk {}: {}",
+                req.chunk_id, chunk.rule_name
+            ),
+            version: 0,
+            policy_hash: "",
+            success: true,
+            extra: vec![("chunk_id", serde_json::Value::from(req.chunk_id.clone()))],
+        },
+    );
 
     Ok(Response::new(EditDraftChunkResponse {}))
 }
@@ -4401,9 +4650,27 @@ pub(super) async fn handle_undo_draft_chunk(
     state: &Arc<ServerState>,
     request: Request<UndoDraftChunkRequest>,
 ) -> Result<Response<UndoDraftChunkResponse>, Status> {
+    let principal = crate::audit::principal(&request);
+    let request_id = crate::audit::request_id(&request);
+    let (name, chunk_id) = {
+        let req = request.get_ref();
+        (req.name.clone(), req.chunk_id.clone())
+    };
     let result = handle_undo_draft_chunk_inner(state, request).await;
-    if result.is_err() {
+    if let Err(status) = &result {
         emit_policy_decision_failure(PolicyDecisionOperation::Undo, 1);
+        emit_draft_failure_audit(
+            state,
+            &principal,
+            request_id.as_deref(),
+            status,
+            DraftFailureAudit {
+                state_label: "removed",
+                detail: format!("gateway undo of approved draft chunk {chunk_id} failed"),
+                sandbox_name: &name,
+                chunk_id: Some(&chunk_id),
+            },
+        );
     }
     result
 }
@@ -4413,6 +4680,7 @@ async fn handle_undo_draft_chunk_inner(
     request: Request<UndoDraftChunkRequest>,
 ) -> Result<Response<UndoDraftChunkResponse>, Status> {
     let principal = super::extract_principal(&request)?;
+    let request_id = crate::audit::request_id(&request);
     let req = request.into_inner();
     let authz = authorize_workspace(
         &state.store,
@@ -4476,16 +4744,22 @@ async fn handle_undo_draft_chunk_inner(
         .map_err(|e| Status::internal(format!("update chunk status failed: {e}")))?;
 
     state.sandbox_watch_bus.notify(&sandbox_id);
-    emit_gateway_policy_audit_log(
-        &sandbox_id,
-        sandbox.object_name(),
-        "removed",
-        format!(
-            "gateway reverted approved draft chunk {}: remove-binary {} {}",
-            req.chunk_id, chunk.rule_name, chunk.binary
-        ),
-        version,
-        &hash,
+    emit_gateway_policy_audit(
+        state,
+        Some(&principal),
+        request_id.as_deref(),
+        &PolicyAuditEvent {
+            sandbox: Some((&sandbox_id, sandbox.object_name())),
+            state_label: "removed",
+            detail: format!(
+                "gateway reverted approved draft chunk {}: remove-binary {} {}",
+                req.chunk_id, chunk.rule_name, chunk.binary
+            ),
+            version,
+            policy_hash: &hash,
+            success: true,
+            extra: vec![("chunk_id", serde_json::Value::from(req.chunk_id.clone()))],
+        },
     );
 
     info!(
@@ -4509,7 +4783,33 @@ pub(super) async fn handle_clear_draft_chunks(
     state: &Arc<ServerState>,
     request: Request<ClearDraftChunksRequest>,
 ) -> Result<Response<ClearDraftChunksResponse>, Status> {
+    let principal = crate::audit::principal(&request);
+    let request_id = crate::audit::request_id(&request);
+    let name = request.get_ref().name.clone();
+    let result = handle_clear_draft_chunks_inner(state, request).await;
+    if let Err(status) = &result {
+        emit_draft_failure_audit(
+            state,
+            &principal,
+            request_id.as_deref(),
+            status,
+            DraftFailureAudit {
+                state_label: "cleared",
+                detail: "gateway clear of pending draft chunks failed".to_string(),
+                sandbox_name: &name,
+                chunk_id: None,
+            },
+        );
+    }
+    result
+}
+
+async fn handle_clear_draft_chunks_inner(
+    state: &Arc<ServerState>,
+    request: Request<ClearDraftChunksRequest>,
+) -> Result<Response<ClearDraftChunksResponse>, Status> {
     let principal = super::extract_principal(&request)?;
+    let request_id = crate::audit::request_id(&request);
     let req = request.into_inner();
     let authz = authorize_workspace(
         &state.store,
@@ -4546,6 +4846,20 @@ pub(super) async fn handle_clear_draft_chunks(
         sandbox_id = %sandbox_id,
         chunks_cleared = deleted,
         "ClearDraftChunks: pending chunks cleared"
+    );
+    emit_gateway_policy_audit(
+        state,
+        Some(&principal),
+        request_id.as_deref(),
+        &PolicyAuditEvent {
+            sandbox: Some((&sandbox_id, sandbox.object_name())),
+            state_label: "cleared",
+            detail: format!("gateway cleared {deleted} pending draft chunk(s)"),
+            version: 0,
+            policy_hash: "",
+            success: true,
+            extra: vec![("chunks_cleared", serde_json::Value::from(deleted))],
+        },
     );
 
     Ok(Response::new(ClearDraftChunksResponse {
@@ -12864,22 +13178,229 @@ mod tests {
         assert_eq!(undo_err.code(), Code::NotFound);
     }
 
+    /// The draft-chunk lifecycle must leave a structured 5019 audit trail:
+    /// a sandbox-principal submission audits as `draft_submitted` with the
+    /// sandbox as actor and routes into that sandbox's stream, a human
+    /// approval audits with the reviewer as actor plus version/hash, and a
+    /// failed approval audits as a gateway-lane Failure.
+    #[tokio::test]
+    async fn draft_chunk_lifecycle_emits_structured_audit_events() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let exporter = opentelemetry_sdk::logs::InMemoryLogExporter::default();
+        let (handle, worker) = crate::log_export::spawn(
+            exporter.clone(),
+            opentelemetry_sdk::Resource::builder_empty().build(),
+            true,
+        );
+        let bus = crate::tracing_bus::TracingLogBus::new();
+        bus.set_export(handle);
+        let state = test_server_state().await;
+        let sandbox_name = "audit-drafts";
+        let sandbox_id = "sb-audit-drafts";
+        state
+            .store
+            .put_message(&test_sandbox(
+                sandbox_id,
+                sandbox_name,
+                ProtoSandboxPolicy::default(),
+                vec![],
+            ))
+            .await
+            .unwrap();
+
+        let chunk_id;
+        {
+            let subscriber = tracing_subscriber::registry().with(bus.layer());
+            let _guard = crate::otel_tracing::test_exporter::install_scoped(subscriber);
+
+            let submit = handle_submit_policy_analysis(
+                &state,
+                with_sandbox(
+                    Request::new(SubmitPolicyAnalysisRequest {
+                        name: sandbox_name.to_string(),
+                        analysis_mode: "agent_authored".to_string(),
+                        proposed_chunks: vec![PolicyChunk {
+                            rule_name: "api_access".to_string(),
+                            proposed_rule: Some(NetworkPolicyRule {
+                                name: "api_access".to_string(),
+                                endpoints: vec![NetworkEndpoint {
+                                    host: "api.example.com".to_string(),
+                                    port: 443,
+                                    ..Default::default()
+                                }],
+                                binaries: vec![NetworkBinary {
+                                    path: "/usr/bin/curl".to_string(),
+                                    ..Default::default()
+                                }],
+                            }),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }),
+                    sandbox_id,
+                ),
+            )
+            .await
+            .unwrap()
+            .into_inner();
+            assert_eq!(submit.accepted_chunks, 1);
+            chunk_id = submit.accepted_chunk_ids[0].clone();
+
+            handle_approve_draft_chunk(
+                &state,
+                with_user(Request::new(ApproveDraftChunkRequest {
+                    name: sandbox_name.to_string(),
+                    chunk_id: chunk_id.clone(),
+                    ..Default::default()
+                })),
+            )
+            .await
+            .unwrap();
+
+            let error = handle_approve_draft_chunk(
+                &state,
+                with_user(Request::new(ApproveDraftChunkRequest {
+                    name: sandbox_name.to_string(),
+                    chunk_id: "no-such-chunk".to_string(),
+                    ..Default::default()
+                })),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code(), Code::NotFound);
+        }
+
+        // Interleaved plain handler logs share the lane; keep the OCSF
+        // records, paired with their sandbox routing attribute.
+        let audit_records = || -> Vec<(serde_json::Value, Option<String>)> {
+            exporter
+                .get_emitted_logs()
+                .unwrap()
+                .iter()
+                .filter_map(|log| {
+                    let raw = log
+                        .record
+                        .attributes_iter()
+                        .find(|(k, _)| k.as_str() == "ocsf.raw")
+                        .map(|(_, v)| v.clone())?;
+                    let opentelemetry::logs::AnyValue::String(raw) = raw else {
+                        panic!("ocsf.raw should be a string");
+                    };
+                    let sandbox_attr = log
+                        .record
+                        .attributes_iter()
+                        .find(|(k, _)| k.as_str() == "sandbox.id")
+                        .and_then(|(_, v)| match v {
+                            opentelemetry::logs::AnyValue::String(s) => {
+                                Some(s.as_str().to_string())
+                            }
+                            _ => None,
+                        });
+                    Some((
+                        serde_json::from_str::<serde_json::Value>(raw.as_str()).unwrap(),
+                        sandbox_attr,
+                    ))
+                })
+                .collect()
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while audit_records().len() < 3 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "audit records never arrived"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let records = audit_records();
+        let find = |label: &str, success: bool| {
+            records
+                .iter()
+                .find(|(json, _)| {
+                    json["state"] == label && (json["status"] == "Success") == success
+                })
+                .unwrap_or_else(|| panic!("no {label} (success={success}) record: {records:?}"))
+        };
+
+        let (submitted, submitted_sandbox) = find("draft_submitted", true);
+        assert_eq!(submitted["class_uid"], 5019);
+        assert_eq!(
+            submitted["actor"]["user"]["name"],
+            format!("sandbox:{sandbox_id}"),
+            "submission actor is the sandbox principal"
+        );
+        assert_eq!(submitted["unmapped"]["accepted_chunks"], 1);
+        assert_eq!(
+            submitted_sandbox.as_deref(),
+            Some(sandbox_id),
+            "draft events route into the sandbox stream"
+        );
+
+        let (approved, _) = find("approved", true);
+        assert_eq!(approved["actor"]["user"]["uid"], "test-user");
+        assert_eq!(approved["unmapped"]["chunk_id"], chunk_id);
+        assert_eq!(approved["unmapped"]["policy_version"], "v1");
+
+        let (failed, failed_sandbox) = find("approved", false);
+        assert_eq!(failed["unmapped"]["chunk_id"], "no-such-chunk");
+        assert_eq!(failed["unmapped"]["sandbox"], sandbox_name);
+        assert!(
+            failed_sandbox.is_none(),
+            "failure events ride the gateway lane"
+        );
+
+        worker.shutdown().await;
+    }
+
     #[test]
-    fn build_gateway_policy_audit_message_formats_ocsf_config_line() {
-        let message = build_gateway_policy_audit_message(
-            "sb-123",
-            "demo-sandbox",
-            "merged",
-            "gateway merged incremental policy op: add-allow api.github.com:443 [POST /repos/*/issues]",
-            7,
-            "sha256:testhash",
-            &[],
+    fn policy_audit_event_formats_ocsf_config_line_with_actor() {
+        let event = build_gateway_policy_audit_event(
+            Some(&audit_test_principal()),
+            Some("req-9"),
+            &PolicyAuditEvent {
+                sandbox: Some(("sb-123", "demo-sandbox")),
+                state_label: "merged",
+                detail: "gateway merged incremental policy op: add-allow api.github.com:443 [POST /repos/*/issues]".to_string(),
+                version: 7,
+                policy_hash: "sha256:testhash",
+                success: true,
+                extra: Vec::new(),
+            },
         );
 
         assert_eq!(
-            message,
-            "CONFIG:MERGED [INFO] gateway merged incremental policy op: add-allow api.github.com:443 [POST /repos/*/issues] [version:v7 hash:sha256:testhash]"
+            event.format_shorthand(),
+            "CONFIG:MERGED [INFO] gateway merged incremental policy op: add-allow api.github.com:443 [POST /repos/*/issues] [version:v7 hash:sha256:testhash] by alice"
         );
+        let json = event.to_json().unwrap();
+        assert_eq!(json["actor"]["user"]["uid"], "oidc|alice-123");
+        assert_eq!(json["metadata"]["uid"], "sb-123");
+        assert_eq!(json["unmapped"]["request_id"], "req-9");
+    }
+
+    #[test]
+    fn failed_policy_audit_events_render_failed_and_carry_failure_status() {
+        let event = build_gateway_policy_audit_event(
+            Some(&audit_test_principal()),
+            None,
+            &PolicyAuditEvent {
+                sandbox: None,
+                state_label: "approved",
+                detail: "gateway approve of draft chunk c-1 failed".to_string(),
+                version: 0,
+                policy_hash: "",
+                success: false,
+                extra: vec![("sandbox", serde_json::Value::from("demo-sandbox"))],
+            },
+        );
+        let line = event.format_shorthand();
+        assert!(
+            line.starts_with("CONFIG:APPROVED [INFO] FAILED "),
+            "unexpected shorthand: {line}"
+        );
+        let json = event.to_json().unwrap();
+        assert_eq!(json["status"], "Failure");
+        assert_eq!(json["unmapped"]["sandbox"], "demo-sandbox");
     }
 
     /// Auto-approval audit messages carry `auto=true`, `source=<mode>`, and
@@ -12889,21 +13410,25 @@ mod tests {
     /// findings" — never "safe" — because the claim is about the prover's
     /// reasoning, not the world.
     #[test]
-    fn build_gateway_policy_audit_message_carries_auto_approve_provenance() {
-        let extra = [
-            ("auto", "true".to_string()),
-            ("source", "agent_authored".to_string()),
-            ("prover_delta", "empty".to_string()),
-        ];
-        let message = build_gateway_policy_audit_message(
-            "sb-123",
-            "demo-sandbox",
-            "approved",
-            "auto-approved: no new prover findings (source=agent_authored) — chunk abc: add-rule x",
-            12,
-            "sha256:autohash",
-            &extra,
+    fn policy_audit_event_carries_auto_approve_provenance() {
+        let event = build_gateway_policy_audit_event(
+            Some(&audit_test_principal()),
+            None,
+            &PolicyAuditEvent {
+                sandbox: Some(("sb-123", "demo-sandbox")),
+                state_label: "approved",
+                detail: "auto-approved: no new prover findings (source=agent_authored) — chunk abc: add-rule x".to_string(),
+                version: 12,
+                policy_hash: "sha256:autohash",
+                success: true,
+                extra: vec![
+                    ("auto", serde_json::Value::from("true")),
+                    ("source", serde_json::Value::from("agent_authored")),
+                    ("prover_delta", serde_json::Value::from("empty")),
+                ],
+            },
         );
+        let message = event.format_shorthand();
         assert!(
             message.contains("CONFIG:APPROVED"),
             "auto-approval reuses CONFIG:APPROVED; got: {message}"
