@@ -40,6 +40,7 @@ gateway's log bus before splitting into the two planes.
 |---|---|---|---|
 | Plain logs (`tracing`) | Sandbox supervisor and gateway | stderr, rolling files in the sandbox; gateway stdout | Pushed to gateway, exported as OTLP log records when `export_logs` is on |
 | OCSF security events (v1.7.0) | Sandbox supervisor (network/HTTP/SSH/process/findings/config) | Human-readable shorthand in the log stream; full-fidelity JSONL file in the sandbox | Same push/export path, with structured `ocsf.*` payload and severity-ranked records |
+| Gateway audit events (OCSF 3004/5019/3002/2004) | Gateway control plane: every state-changing RPC, the authenticator boundary, suspicious-pattern findings | Shorthand on gateway stdout; sandbox-scoped ones in that sandbox's stream | Same export lane, actor-carrying `ocsf.raw` payloads; toggled by `[openshell.gateway.audit]` (on by default) |
 | Traces (spans) | Gateway request handling, store and driver operations | — | OTLP/gRPC when `[openshell.gateway.otlp]` is configured (best-effort) |
 | Metrics | Gateway | Prometheus `/metrics` endpoint | Scraped; not exported over OTLP today |
 
@@ -161,6 +162,46 @@ stays expressible in collector routing. Separately,
 `ocsf_full_payload` in the gateway's OTLP table gates whether the OCSF payload
 (either shape) leaves the gateway at all — with it off, only the shorthand
 summary and severity export.
+
+## Gateway audit events
+
+Every state-changing RPC on the gateway emits one OCSF audit event after its
+outcome is known, so "who changed what, when" is answerable from the SIEM
+alone. Four classes cover the surface:
+
+| Class | What |
+|---|---|
+| Entity Management [3004] | Resource CRUD: workspaces, members, providers, profiles, credentials, sandboxes, ssh sessions, exec/forward session initiation |
+| Device Config State Change [5019] | Config-state transitions: settings (with before/after values), policy loads/merges, draft chunk decisions, service endpoints |
+| Authentication [3002] | Authenticator-boundary outcomes: failures always (mechanism, reason category, peer address), per-request successes behind a toggle |
+| Detection Finding [2004] | Suspicious-pattern escalations, dual-emitted beside the domain denial: cross-sandbox access attempts, sandbox principals reaching admin APIs |
+
+Invariants:
+
+- **The actor is the authenticated principal**, mapped from the session —
+  OIDC subject or certificate CN for users, `sandbox:<id>` service actors for
+  sandbox principals, `anonymous` named honestly — never from request
+  payloads. `unmapped.request_id` ties each event to its request trace.
+- **Failed attempts audit as `Failure`**, including no-op mutations (deleting
+  what does not exist). Authentication and authorization denials are excluded
+  from per-handler events — they are the Authentication class's records.
+- **Events emit at the store commit**, so a change that lands is on record
+  even when a later step fails the RPC.
+- **Secrets never enter records**: credential values, refresh material, ssh
+  bearer tokens (sessions are identified by generated name), exec
+  environment/stdin, and setting values under credential-pattern keys are
+  absent by construction; interpolated request values are escaped so they
+  cannot forge shorthand lines.
+- **Routing follows the subject**: events about a resolved sandbox carry its
+  gateway-stamped `sandbox.id` and land in that sandbox's stream; governance
+  events ride the gateway lane. Payloads are always `raw`.
+
+`[openshell.gateway.audit]` (mirrored by `OPENSHELL_AUDIT_*` env vars and
+`--audit-*` flags) controls the surface: `enabled` is the master switch
+(default on), `auth_success_events` opts into the per-request authentication
+ledger, `exec_args = false` reduces exec records to the binary name, and
+`settings_values = false` drops before/after values. See the
+[gateway config reference](../docs/reference/gateway-config.mdx).
 
 ## Format reference: one event, every surface
 
@@ -380,6 +421,66 @@ Attributes:
 The gateway gap has no `sandbox.id` — it accounts for the shared export queue,
 not any one sandbox.
 
+### 8. Gateway audit events — ENTITY and CONFIG records
+
+Gateway audit events use the same export shapes; the examples below are
+records captured from a live gateway (identifiers illustrative). A workspace
+creation by an mTLS-authenticated user — shorthand body, then the `ocsf.raw`
+payload:
+
+```text
+ENTITY:CREATE [INFO] workspace "audit-e2e" by openshell-client
+```
+
+```json
+{
+  "class_uid": 3004, "class_name": "Entity Management",
+  "category_uid": 3, "category_name": "Identity & Access Management",
+  "activity_id": 1, "activity_name": "Create",
+  "type_uid": 300401,
+  "severity": "Informational", "severity_id": 1,
+  "status": "Success", "status_id": 1,
+  "message": "workspace audit-e2e created",
+  "time": 1787201025635,
+  "entity": { "type": "workspace", "uid": "ae0fdb85-a688-471b-b44c-fd3ad9192e5f", "name": "audit-e2e" },
+  "actor": { "user": { "name": "openshell-client", "uid": "openshell-client", "type": "User", "type_id": 1 } },
+  "unmapped": { "request_id": "694d6ff4-5cbe-4f1d-af9c-01e872c86b65" },
+  "metadata": { "version": "1.7.0", "uid": "", "product": { "name": "OpenShell Sandbox Supervisor", "vendor_name": "OpenShell", "version": "0.9.0" }, "profiles": ["security_control"] }
+}
+```
+
+The record carries no `sandbox.id` attribute (gateway lane); a sandbox-scoped
+audit event (create/exec/ssh) carries the sandbox's id both as the attribute
+and in `metadata.uid`. A failed attempt renders `FAILED` in the shorthand and
+`"status": "Failure"` in the document.
+
+A settings update captures the transition itself:
+
+```text
+CONFIG:SETTING_UPDATED [INFO] global setting proposal_approval_mode updated by openshell-client
+```
+
+```json
+{
+  "class_uid": 5019, "class_name": "Device Config State Change",
+  "state": "setting_updated", "state_id": 2,
+  "severity": "Informational", "severity_id": 1,
+  "status": "Success", "status_id": 1,
+  "message": "global setting proposal_approval_mode updated",
+  "actor": { "user": { "name": "openshell-client", "uid": "openshell-client", "type": "User", "type_id": 1 } },
+  "unmapped": {
+    "scope": "global", "setting_key": "proposal_approval_mode",
+    "before": "auto", "after": "manual", "changed": true,
+    "request_id": "5bc72396-ef9a-4636-8415-5adcd4d9a880"
+  }
+}
+```
+
+Authentication failures (`AUTHN:LOGON [MED] FAILED …`) and Detection Findings
+(`FINDING:* [HIGH] …`) follow the same envelope; failures carry
+`unmapped.mechanism`, `unmapped.reason`, and `src_endpoint` with the peer
+address — never the presented credential.
+
 ### Envelope, resource, and severity
 
 Every exported record carries the same envelope — `sandbox.id`, `log.source`
@@ -493,11 +594,6 @@ deployment that needs more than ~300 K OCSF lines/s per gateway.
 
 ## Known gaps
 
-- **Governance events are sparse.** Gateway-scoped events now export, but
-  most control-plane mutations (workspace membership, settings updates,
-  provider CRUD, policy draft decisions) do not yet *emit* structured audit
-  events carrying the acting principal — the export lane is ready for them,
-  the emissions are future work.
 - **Platform events stay on the visibility plane.** Driver-synthesized
   provisioning progress (image pulls, pod scheduling) feeds `WatchSandbox`
   only. Deliberate: for Kubernetes they duplicate what cluster tooling
