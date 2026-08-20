@@ -334,9 +334,12 @@ pub(super) async fn handle_delete_workspace(
 
     let result = handle_delete_workspace_inner(state, request).await;
 
-    audit::emit_entity_outcome(
+    // A no-op delete (row already gone) is not a state change — judge
+    // success from the response's `deleted` flag, not just the gRPC status.
+    audit::emit_entity_outcome_judged(
         &state.config.audit,
         &result,
+        |response| response.deleted,
         audit::EntityOutcome {
             activity: EntityActivityId::Delete,
             entity: ManagedEntity {
@@ -675,9 +678,12 @@ pub(super) async fn handle_remove_workspace_member(
 
     let result = handle_remove_workspace_member_inner(state, request).await;
 
-    audit::emit_entity_outcome(
+    // Removing a member who was never in the workspace is not a state
+    // change — judge success from the response's `removed` flag.
+    audit::emit_entity_outcome_judged(
         &state.config.audit,
         &result,
+        |response| response.removed,
         audit::EntityOutcome {
             activity: EntityActivityId::Delete,
             entity: ManagedEntity::new(WorkspaceMember::object_type(), subject.clone()),
@@ -926,6 +932,20 @@ mod tests {
             )
             .await
             .unwrap();
+
+            // Policy-draft path: a failed clear on an unknown sandbox would
+            // emit a gateway-lane Failure event if the draft emitter were
+            // ungated.
+            let error = crate::grpc::policy::handle_clear_draft_chunks(
+                &state,
+                authed_request(openshell_core::proto::ClearDraftChunksRequest {
+                    name: "no-such-sandbox".to_string(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code(), Code::NotFound);
 
             // Control: raw emission below the toggle, so the queue ordering
             // proves the suppressed events are absent rather than late.

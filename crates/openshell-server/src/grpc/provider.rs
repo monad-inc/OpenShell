@@ -2649,9 +2649,12 @@ pub(super) async fn handle_delete_provider_profile(
 
     let result = handle_delete_provider_profile_inner(state, request).await;
 
-    audit::emit_entity_outcome(
+    // A no-op delete (profile raced away) is not a state change — judge
+    // success from the response's `deleted` flag.
+    audit::emit_entity_outcome_judged(
         &state.config.audit,
         &result,
+        |response| response.deleted,
         audit::EntityOutcome {
             activity: EntityActivityId::Delete,
             entity: ManagedEntity::new("provider_profile", id.clone()),
@@ -4003,9 +4006,12 @@ pub(super) async fn handle_delete_provider_refresh(
 
     let result = handle_delete_provider_refresh_inner(state, request).await;
 
-    audit::emit_entity_outcome(
+    // A no-op delete (no refresh configured) is not a state change — judge
+    // success from the response's `deleted` flag.
+    audit::emit_entity_outcome_judged(
         &state.config.audit,
         &result,
+        |response| response.deleted,
         audit::EntityOutcome {
             activity: EntityActivityId::Delete,
             entity: ManagedEntity::new("provider_refresh", format!("{provider}/{credential_key}")),
@@ -4117,9 +4123,12 @@ pub(super) async fn handle_delete_provider(
 
     let result = handle_delete_provider_inner(state, request).await;
 
-    audit::emit_entity_outcome(
+    // A no-op delete (provider already gone) is not a state change — judge
+    // success from the response's `deleted` flag.
+    audit::emit_entity_outcome_judged(
         &state.config.audit,
         &result,
+        |response| response.deleted,
         audit::EntityOutcome {
             activity: EntityActivityId::Delete,
             entity: ManagedEntity {

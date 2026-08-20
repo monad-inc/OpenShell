@@ -2788,15 +2788,9 @@ async fn handle_update_config_inner(
                 .await?;
             }
 
-            response_annotations = persist_update_config_annotations(
-                state,
-                &sandbox_id,
-                req.expected_resource_version,
-                &req.annotations,
-                &response_annotations,
-            )
-            .await?;
-
+            // Audit the moment the settings commit lands: if the annotation
+            // persist below fails, the deletion still happened and must be
+            // on record (the wrapper adds a Failure event for the RPC).
             emit_update_config_settings_audit(
                 state,
                 principal,
@@ -2813,6 +2807,15 @@ async fn handle_update_config_inner(
                     after: None,
                 },
             );
+
+            response_annotations = persist_update_config_annotations(
+                state,
+                &sandbox_id,
+                req.expected_resource_version,
+                &req.annotations,
+                &response_annotations,
+            )
+            .await?;
 
             return Ok(update_config_response(
                 0,
@@ -2851,15 +2854,9 @@ async fn handle_update_config_inner(
             .await?;
         }
 
-        response_annotations = persist_update_config_annotations(
-            state,
-            &sandbox_id,
-            req.expected_resource_version,
-            &req.annotations,
-            &response_annotations,
-        )
-        .await?;
-
+        // Audit the moment the settings commit lands: if the annotation
+        // persist below fails, the update still happened and must be on
+        // record (the wrapper adds a Failure event for the RPC).
         emit_update_config_settings_audit(
             state,
             principal,
@@ -2876,6 +2873,15 @@ async fn handle_update_config_inner(
                 after: Some(&audit_after),
             },
         );
+
+        response_annotations = persist_update_config_annotations(
+            state,
+            &sandbox_id,
+            req.expected_resource_version,
+            &req.annotations,
+            &response_annotations,
+        )
+        .await?;
 
         return Ok(update_config_response(
             0,
@@ -4125,14 +4131,9 @@ async fn handle_approve_draft_chunk_inner(
     .await?;
     let chunk_summary = summarize_draft_chunk_rule(&chunk)?;
 
-    let now_ms = current_time_ms();
-    state
-        .store
-        .update_draft_chunk_status(&req.chunk_id, "approved", Some(now_ms), None)
-        .await
-        .map_err(|e| Status::internal(format!("update chunk status failed: {e}")))?;
-
-    state.sandbox_watch_bus.notify(&sandbox_id);
+    // Audit the moment the policy revision is committed: if the chunk
+    // status update below fails, the policy still changed and must be on
+    // record (the wrapper adds a Failure event for the RPC).
     emit_gateway_policy_audit(
         state,
         Some(&principal),
@@ -4150,6 +4151,15 @@ async fn handle_approve_draft_chunk_inner(
             extra: vec![("chunk_id", serde_json::Value::from(req.chunk_id.clone()))],
         },
     );
+
+    let now_ms = current_time_ms();
+    state
+        .store
+        .update_draft_chunk_status(&req.chunk_id, "approved", Some(now_ms), None)
+        .await
+        .map_err(|e| Status::internal(format!("update chunk status failed: {e}")))?;
+
+    state.sandbox_watch_bus.notify(&sandbox_id);
 
     info!(
         sandbox_id = %sandbox_id,
@@ -4468,13 +4478,8 @@ async fn handle_approve_all_draft_chunks_inner(
         last_hash = hash;
         let chunk_summary = summarize_draft_chunk_rule(chunk)?;
 
-        let now_ms = current_time_ms();
-        state
-            .store
-            .update_draft_chunk_status(&chunk.id, "approved", Some(now_ms), None)
-            .await
-            .map_err(|e| Status::internal(format!("update chunk status failed: {e}")))?;
-
+        // Audit right after the policy commit — a failed status update on a
+        // later step must not erase the record of this merge.
         emit_gateway_policy_audit(
             state,
             Some(&principal),
@@ -4489,6 +4494,13 @@ async fn handle_approve_all_draft_chunks_inner(
                 extra: vec![("chunk_id", serde_json::Value::from(chunk.id.clone()))],
             },
         );
+
+        let now_ms = current_time_ms();
+        state
+            .store
+            .update_draft_chunk_status(&chunk.id, "approved", Some(now_ms), None)
+            .await
+            .map_err(|e| Status::internal(format!("update chunk status failed: {e}")))?;
         chunks_approved += 1;
         emit_sandbox_policy_update_success();
     }
@@ -4734,16 +4746,9 @@ async fn handle_undo_draft_chunk_inner(
 
     let (version, hash) = remove_chunk_from_policy(state, &sandbox_id, &workspace, &chunk).await?;
 
-    // Clear any prior rejection_reason on the way back to "pending" so an
-    // agent reading the chunk via policy.local cannot see a stale guidance
-    // string left over from a previous reject → undo round.
-    state
-        .store
-        .update_draft_chunk_status(&req.chunk_id, "pending", None, Some(""))
-        .await
-        .map_err(|e| Status::internal(format!("update chunk status failed: {e}")))?;
-
-    state.sandbox_watch_bus.notify(&sandbox_id);
+    // Audit the moment the policy revision is committed: if the chunk
+    // status update below fails, the rule is still gone and must be on
+    // record (the wrapper adds a Failure event for the RPC).
     emit_gateway_policy_audit(
         state,
         Some(&principal),
@@ -4761,6 +4766,17 @@ async fn handle_undo_draft_chunk_inner(
             extra: vec![("chunk_id", serde_json::Value::from(req.chunk_id.clone()))],
         },
     );
+
+    // Clear any prior rejection_reason on the way back to "pending" so an
+    // agent reading the chunk via policy.local cannot see a stale guidance
+    // string left over from a previous reject → undo round.
+    state
+        .store
+        .update_draft_chunk_status(&req.chunk_id, "pending", None, Some(""))
+        .await
+        .map_err(|e| Status::internal(format!("update chunk status failed: {e}")))?;
+
+    state.sandbox_watch_bus.notify(&sandbox_id);
 
     info!(
         sandbox_id = %sandbox_id,

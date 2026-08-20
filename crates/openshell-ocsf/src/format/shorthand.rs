@@ -204,6 +204,22 @@ fn message_tag(base: &BaseEventData) -> String {
     format!(" [msg:{}]", truncate_with_ellipsis(&text, MAX_MESSAGE_LEN))
 }
 
+/// Flatten a field that appears bare (unquoted, unbracketed) in a shorthand
+/// line. Line breaks and other control characters collapse to spaces so a
+/// value sourced from a request payload or token claim cannot forge
+/// additional lines in the text plane.
+fn single_line(text: &str) -> String {
+    text.chars()
+        .map(|character| {
+            if character == '\n' || character == '\r' || character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
 impl OcsfEvent {
     /// Produce the single-line shorthand for `openshell.log` and gRPC log push.
     ///
@@ -423,16 +439,19 @@ impl OcsfEvent {
                     Some("Failure") => " FAILED",
                     _ => "",
                 };
+                // Entity names, uids, and actor names come from request
+                // payloads and token claims — escape/flatten them so they
+                // cannot forge lines or close the quoted field.
                 let actor_str = e
                     .actor
                     .as_ref()
                     .and_then(|a| a.user.as_ref())
-                    .map(|u| format!(" by {}", u.name))
+                    .map(|u| format!(" by {}", single_line(&u.name)))
                     .unwrap_or_default();
                 format!(
                     "ENTITY:{activity} {sev}{outcome} {} \"{}\"{actor_str}",
-                    e.entity.entity_type,
-                    e.entity.display(),
+                    single_line(&e.entity.entity_type),
+                    escape_quoted_field(e.entity.display()),
                 )
             }
 
@@ -449,7 +468,7 @@ impl OcsfEvent {
                 let who = e
                     .user
                     .as_ref()
-                    .map(|u| format!(" user:{}", u.name))
+                    .map(|u| format!(" user:{}", single_line(&u.name)))
                     .unwrap_or_default();
                 let from = e
                     .src_endpoint
@@ -478,7 +497,9 @@ impl OcsfEvent {
                     Some("Failure") => " FAILED",
                     _ => "",
                 };
-                let what = e.base.message.as_deref().unwrap_or("config");
+                // The message interpolates request-sourced values (chunk rule
+                // names, binaries) — flatten so they cannot forge lines.
+                let what = single_line(e.base.message.as_deref().unwrap_or("config"));
                 // Bracketed suffix carries the structured provenance fields a
                 // reviewer needs to scan a CONFIG audit line. Auto-approval
                 // emits `auto`/`source`/`prover_delta`; every config change
@@ -490,9 +511,11 @@ impl OcsfEvent {
                     .as_ref()
                     .map(|u| {
                         let mut parts: Vec<String> = Vec::new();
+                        // `source` echoes the request's analysis mode —
+                        // escape every value like the generic unmapped path.
                         let mut push = |key: &str| {
                             if let Some(value) = u.get(key).and_then(|v| v.as_str()) {
-                                parts.push(format!("{key}:{value}"));
+                                parts.push(format!("{key}:{}", escape_context_field(value)));
                             }
                         };
                         push("auto");
@@ -500,10 +523,10 @@ impl OcsfEvent {
                         push("prover_delta");
                         push("resolved_from");
                         if let Some(ver) = u.get("policy_version").and_then(|v| v.as_str()) {
-                            parts.push(format!("version:{ver}"));
+                            parts.push(format!("version:{}", escape_context_field(ver)));
                         }
                         if let Some(hash) = u.get("policy_hash").and_then(|v| v.as_str()) {
-                            parts.push(format!("hash:{hash}"));
+                            parts.push(format!("hash:{}", escape_context_field(hash)));
                         }
                         if parts.is_empty() {
                             String::new()
@@ -517,7 +540,7 @@ impl OcsfEvent {
                     .actor
                     .as_ref()
                     .and_then(|a| a.user.as_ref())
-                    .map(|u| format!(" by {}", u.name))
+                    .map(|u| format!(" by {}", single_line(&u.name)))
                     .unwrap_or_default();
                 format!("CONFIG:{state} {sev}{outcome} {what}{suffix}{actor_str}")
             }
@@ -1280,6 +1303,41 @@ mod tests {
              [auto:true source:agent_authored prover_delta:empty resolved_from:sandbox \
              version:v4 hash:sha256:cafe]"
         );
+    }
+
+    /// Request payloads and token claims flow into entity names, actor
+    /// names, and audit messages. None of them may forge extra lines (or
+    /// close the quoted entity field) in the text visibility plane.
+    #[test]
+    fn request_sourced_fields_cannot_forge_shorthand_lines() {
+        use crate::events::EntityManagementEvent;
+
+        let entity_event = OcsfEvent::EntityManagement(EntityManagementEvent {
+            base: base(3004, "Entity Management", 3, "IAM", 1, "Create"),
+            entity: ManagedEntity::new(
+                "workspace_member",
+                "bob\"\nAUTHN:LOGON [INFO] OK user:forged",
+            ),
+            actor: Some(Actor::from_user(User::named("eve\nNET:OPEN [INFO] fake"))),
+        });
+        let line = entity_event.format_shorthand();
+        assert!(!line.contains('\n'), "forged newline survived: {line}");
+
+        let mut config_base = base(5019, "Device Config State Change", 5, "Discovery", 1, "Log");
+        config_base.set_message(
+            "gateway rejected draft chunk c1: evil\nCONFIG:APPROVED [INFO] forged /bin/sh",
+        );
+        config_base.add_unmapped("source", serde_json::json!("agent\nauthored"));
+        let config_event = OcsfEvent::DeviceConfigStateChange(DeviceConfigStateChangeEvent {
+            base: config_base,
+            state: Some(StateId::Other),
+            state_custom_label: Some("REJECTED".to_string()),
+            security_level: None,
+            prev_security_level: None,
+            actor: None,
+        });
+        let line = config_event.format_shorthand();
+        assert!(!line.contains('\n'), "forged newline survived: {line}");
     }
 
     #[test]
