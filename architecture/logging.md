@@ -171,30 +171,53 @@ alone. Four classes cover the surface:
 
 | Class | What |
 |---|---|
-| Entity Management [3004] | Resource CRUD: workspaces, members, providers, profiles, credentials, sandboxes, ssh sessions, exec/forward session initiation |
-| Device Config State Change [5019] | Config-state transitions: settings (with before/after values), policy loads/merges, draft chunk decisions, service endpoints |
-| Authentication [3002] | Authenticator-boundary outcomes: failures always (mechanism, reason category, peer address), per-request successes behind a toggle |
-| Detection Finding [2004] | Suspicious-pattern escalations, dual-emitted beside the domain denial: cross-sandbox access attempts, sandbox principals reaching admin APIs |
+| Entity Management [3004] | Resource CRUD: workspaces, members, providers, profiles, credentials, sandbox tokens, sandboxes, ssh sessions, exec/forward session initiation |
+| Device Config State Change [5019] | Config-state transitions: settings (with before/after values), policy loads/merges/replacements, draft chunk decisions, inference routes, service endpoints, interceptor-modified requests |
+| Authentication [3002] | Authenticator-boundary outcomes: failures always (mechanism, reason category, peer address — including through the WebSocket tunnel), per-request successes behind a toggle |
+| Detection Finding [2004] | Suspicious-pattern escalations, dual-emitted beside the domain denial: cross-sandbox access attempts (up-front and mid-stream `sandbox_id` switches on log push), sandbox principals reaching admin APIs |
 
 Invariants:
 
 - **The actor is the authenticated principal**, mapped from the session —
   OIDC subject or certificate CN for users, `sandbox:<id>` service actors for
   sandbox principals, `anonymous` named honestly — never from request
-  payloads. `unmapped.request_id` ties each event to its request trace.
-- **Failed attempts audit as `Failure`**, including no-op mutations (deleting
-  what does not exist). Authentication and authorization denials are excluded
-  from per-handler events — they are the Authentication class's records.
+  payloads. Shorthand renders actors as `name(uid)`: the display name is a
+  self-asserted claim, so the stable uid rides along. Background mutations
+  (provider-refresh auto-rotation, compute reconciliation, startup
+  bootstrap) audit under `system:<component>` actors.
+  `unmapped.request_id` ties each event to its request trace.
+- **Failed attempts audit as `Failure` at Low severity** (successes stay
+  Informational, so Warn+ alerting sees failures), including no-op mutations
+  (deleting or revoking what does not exist). Authentication and
+  authorization denials are excluded from per-handler events — they are the
+  Authentication class's records. One known exception: the five sandbox RPCs
+  that resolve sandboxes through the anti-probing NotFound remap audit
+  cross-workspace denials as NotFound failures, deliberately
+  indistinguishable from genuine misses.
 - **Events emit at the store commit**, so a change that lands is on record
-  even when a later step fails the RPC.
-- **Secrets never enter records**: credential values, refresh material, ssh
-  bearer tokens (sessions are identified by generated name), exec
-  environment/stdin, and setting values under credential-pattern keys are
-  absent by construction; interpolated request values are escaped so they
-  cannot forge shorthand lines.
+  even when a later step fails the RPC — including auto-approved policy
+  merges, refresh-state writes whose expiry propagation fails afterward,
+  and the profiles a mid-batch import created before failing
+  (`unmapped.imported_before_failure`).
+- **Secrets never enter records**: credential values, refresh material,
+  minted sandbox JWTs, ssh bearer tokens (sessions are identified by
+  generated name), exec environment/stdin, and setting values under
+  credential-pattern keys are absent by construction; interpolated request
+  values are escaped so they cannot forge shorthand lines.
 - **Routing follows the subject**: events about a resolved sandbox carry its
   gateway-stamped `sandbox.id` and land in that sandbox's stream; governance
-  events ride the gateway lane. Payloads are always `raw`.
+  events ride the gateway lane. Payloads are always `raw`. Sandbox-pushed
+  log fields that collide with the gateway-stamped identity attributes are
+  dropped at ingestion, so a sandbox cannot masquerade as another sandbox or
+  the gateway in exported records.
+- **A modified request is a marked request**: when a gateway interceptor's
+  `modify_operation` patches actually change a mutation, a companion 5019
+  `request_modified` event names the interceptors, correlated by
+  `request_id` with the handler's own event.
+- **The trail survives coarse log levels**: the gateway pins the `ocsf`
+  tracing target at INFO, so `RUST_LOG=warn` quiets diagnostics without
+  severing audit events; an explicit `ocsf` directive in the filter still
+  wins, and the `enabled` toggle remains the supported off switch.
 
 `[openshell.gateway.audit]` (mirrored by `OPENSHELL_AUDIT_*` env vars and
 `--audit-*` flags) controls the surface: `enabled` is the master switch
@@ -202,6 +225,17 @@ Invariants:
 ledger, `exec_args = false` reduces exec records to the binary name, and
 `settings_values = false` drops before/after values. See the
 [gateway config reference](../docs/reference/gateway-config.mdx).
+
+Authentication failure reasons stay low-cardinality
+(`rejected_credential`, `authenticator_error`, `missing_credentials`,
+`missing_client_certificate`, `anonymous`); infrastructure failures
+(JWKS refresh, TokenReview outages) report `authenticator_error` so an IdP
+outage does not read as a credential-stuffing spike. Note the failure lane
+is always on while audit is enabled and an unauthenticated attacker can
+drive it at request rate: under sustained flood the bounded export queue
+sheds load and accounts it as `telemetry_gap` records, which can crowd out
+other audit records — alert on `telemetry_gap` and rate-limit upstream if
+this lane is internet-exposed.
 
 ## Format reference: one event, every surface
 
