@@ -29,6 +29,7 @@ use opentelemetry_sdk::propagation::TraceContextPropagator;
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::future::Future;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -265,6 +266,22 @@ impl MultiplexService {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        self.serve_with_peer_identity_on_listener_from(stream, peer_identity, listener_scope, None)
+            .await
+    }
+
+    /// Like [`Self::serve_with_peer_identity_on_listener`], additionally
+    /// carrying the connection's remote address for audit `src_endpoint`.
+    pub(crate) async fn serve_with_peer_identity_on_listener_from<S>(
+        &self,
+        stream: S,
+        peer_identity: Option<Identity>,
+        listener_scope: GatewayListenerScope,
+        peer_addr: Option<SocketAddr>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         let openshell = OpenShellServer::new(OpenShellService::new(self.state.clone()))
             .max_decoding_message_size(MAX_GRPC_DECODE_SIZE);
         let openshell =
@@ -289,7 +306,8 @@ impl MultiplexService {
                 .flatten(),
             self.state.config.mtls_auth.enabled,
             self.state.config.auth.allow_unauthenticated_users,
-        );
+        )
+        .with_audit(self.state.config.audit.clone(), peer_addr);
         let grpc_service =
             GrpcRateLimitService::new(grpc_service, self.state.grpc_rate_limiter.clone());
         let http_service = http_router(self.state.clone());
@@ -911,6 +929,10 @@ pub struct AuthGrpcRouter<S> {
     peer_identity: Option<Identity>,
     mtls_auth_enabled: bool,
     allow_unauthenticated_users: bool,
+    /// Audit toggles for Authentication \[3002\] boundary events.
+    audit: openshell_core::GatewayAuditConfig,
+    /// Remote socket address of the connection, for audit `src_endpoint`.
+    peer_addr: Option<SocketAddr>,
 }
 
 impl<S> AuthGrpcRouter<S> {
@@ -938,7 +960,21 @@ impl<S> AuthGrpcRouter<S> {
             peer_identity,
             mtls_auth_enabled,
             allow_unauthenticated_users,
+            audit: openshell_core::GatewayAuditConfig::default(),
+            peer_addr: None,
         }
+    }
+
+    /// Attach the audit toggles and connection peer address for
+    /// Authentication \[3002\] boundary events.
+    fn with_audit(
+        mut self,
+        audit: openshell_core::GatewayAuditConfig,
+        peer_addr: Option<SocketAddr>,
+    ) -> Self {
+        self.audit = audit;
+        self.peer_addr = peer_addr;
+        self
     }
 }
 
@@ -979,6 +1015,8 @@ where
         let peer_identity = self.peer_identity.clone();
         let mtls_auth_enabled = self.mtls_auth_enabled;
         let allow_unauthenticated_users = self.allow_unauthenticated_users;
+        let audit = self.audit.clone();
+        let peer_addr = self.peer_addr;
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
@@ -991,6 +1029,37 @@ where
                 return inner.ready().await?.call(req).await;
             }
 
+            // Audit facts for Authentication [3002] boundary events. The
+            // mechanism reflects what the request presented; token material
+            // never leaves the headers.
+            let has_peer_identity = peer_identity.is_some();
+            let mechanism = if req.headers().contains_key(http::header::AUTHORIZATION) {
+                "bearer"
+            } else if mtls_auth_enabled && has_peer_identity {
+                "mtls"
+            } else {
+                "none"
+            };
+            let request_id = req
+                .headers()
+                .get("x-request-id")
+                .and_then(|v| v.to_str().ok())
+                .map(ToString::to_string);
+            let authn_failure = |reason: &str, detail: &str| {
+                crate::audit::emit_authn_failure(
+                    &audit,
+                    &crate::audit::AuthnOutcome {
+                        mechanism,
+                        reason: Some(reason),
+                        detail: Some(detail),
+                        principal: None,
+                        peer_addr,
+                        path: &path,
+                        request_id: request_id.as_deref(),
+                    },
+                );
+            };
+
             let principal = if let Some(chain) = chain {
                 match chain.authenticate(req.headers(), &path).await {
                     Ok(Some(p)) => p,
@@ -998,15 +1067,24 @@ where
                         (true, Some(identity)) => Principal::User(UserPrincipal { identity }),
                         _ if allow_unauthenticated_users => unauthenticated_dev_user_principal(),
                         _ => {
+                            authn_failure("missing_credentials", "missing authorization header");
                             return Ok(status_response(tonic::Status::unauthenticated(
                                 "missing authorization header",
                             )));
                         }
                     },
-                    Err(status) => return Ok(status_response(status)),
+                    Err(status) => {
+                        // An authenticator applied and rejected the caller —
+                        // invalid/expired token, unknown kid, rejected
+                        // sandbox JWT. The status message is gateway-
+                        // authored; the presented credential never is.
+                        authn_failure("rejected_credential", status.message());
+                        return Ok(status_response(status));
+                    }
                 }
             } else if mtls_auth_enabled {
                 let Some(identity) = peer_identity else {
+                    authn_failure("missing_client_certificate", "missing client certificate");
                     return Ok(status_response(tonic::Status::unauthenticated(
                         "missing client certificate",
                     )));
@@ -1023,6 +1101,9 @@ where
 
             match principal {
                 Principal::User(ref user) => {
+                    // Routine user RBAC denials below stay plain log lines
+                    // (taxonomy Q4) — a governance noise floor, not
+                    // authentication failures or findings.
                     if !crate::auth::method_authz::is_user_callable(&path) {
                         return Ok(status_response(tonic::Status::permission_denied(
                             "this method requires a sandbox principal",
@@ -1034,19 +1115,43 @@ where
                         return Ok(status_response(status));
                     }
                 }
-                Principal::Sandbox(_) => {
+                Principal::Sandbox(ref sandbox) => {
                     if !crate::auth::sandbox_methods::is_sandbox_callable(&path) {
+                        // A sandbox principal reaching for a user/admin API
+                        // is a suspicious pattern, not a routine denial.
+                        crate::audit::emit_sandbox_admin_attempt_finding(
+                            &audit,
+                            &sandbox.sandbox_id,
+                            &path,
+                        );
                         return Ok(status_response(tonic::Status::permission_denied(
                             "sandbox principals may not call this method",
                         )));
                     }
                 }
                 Principal::Anonymous => {
+                    authn_failure(
+                        "anonymous",
+                        "anonymous callers may not call authenticated methods",
+                    );
                     return Ok(status_response(tonic::Status::unauthenticated(
                         "anonymous callers may not call authenticated methods",
                     )));
                 }
             }
+
+            crate::audit::emit_authn_success(
+                &audit,
+                &crate::audit::AuthnOutcome {
+                    mechanism,
+                    reason: None,
+                    detail: None,
+                    principal: Some(&principal),
+                    peer_addr,
+                    path: &path,
+                    request_id: request_id.as_deref(),
+                },
+            );
 
             req.extensions_mut().insert(principal);
             inner.ready().await?.call(req).await
@@ -1543,13 +1648,13 @@ mod tests {
         )
     }
 
-    async fn start_http_server_with_middleware() -> std::net::SocketAddr {
+    async fn start_http_server_with_middleware() -> SocketAddr {
         start_http_server_with_middleware_on_listener(GatewayListenerScope::Primary).await
     }
 
     async fn start_http_server_with_middleware_on_listener(
         listener_scope: GatewayListenerScope,
-    ) -> std::net::SocketAddr {
+    ) -> SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -1577,7 +1682,7 @@ mod tests {
     }
 
     async fn http1_request(
-        addr: std::net::SocketAddr,
+        addr: SocketAddr,
         method: &str,
         path: &str,
         headers: &[(&str, &str)],
@@ -1602,7 +1707,7 @@ mod tests {
     }
 
     async fn http1_get(
-        addr: std::net::SocketAddr,
+        addr: SocketAddr,
         path: &str,
         headers: &[(&str, &str)],
     ) -> Response<Incoming> {
@@ -2556,6 +2661,276 @@ mod tests {
                 },
                 trust_domain: Some("openshell".to_string()),
             })
+        }
+
+        /// The authenticator boundary must leave an Authentication [3002]
+        /// trail: a rejected credential emits a Medium failure carrying
+        /// mechanism, reason category, and peer address — never the token;
+        /// successes emit only behind `auth_success_events`; a sandbox
+        /// principal reaching a user API and a cross-sandbox scope denial
+        /// each dual-emit a High Detection Finding [2004].
+        #[tokio::test]
+        async fn auth_boundary_emits_authn_events_and_findings() {
+            use tracing_subscriber::layer::SubscriberExt as _;
+
+            let exporter = opentelemetry_sdk::logs::InMemoryLogExporter::default();
+            let (handle, worker) = crate::log_export::spawn(
+                exporter.clone(),
+                opentelemetry_sdk::Resource::builder_empty().build(),
+                true,
+            );
+            let bus = crate::tracing_bus::TracingLogBus::new();
+            bus.set_export(handle);
+            let audit_cfg = openshell_core::GatewayAuditConfig {
+                auth_success_events: true,
+                ..Default::default()
+            };
+            let peer: SocketAddr = "203.0.113.9:52011".parse().unwrap();
+
+            {
+                let subscriber = tracing_subscriber::registry().with(bus.layer());
+                let _guard = crate::otel_tracing::test_exporter::install_scoped(subscriber);
+
+                // 1) Rejected bearer credential.
+                let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(
+                    Err(tonic::Status::unauthenticated("token expired")),
+                ))]);
+                let (recorder, _) = PrincipalRecorder::new();
+                let mut router = AuthGrpcRouter::with_peer_identity(
+                    recorder,
+                    Some(chain),
+                    None,
+                    None,
+                    false,
+                    false,
+                )
+                .with_audit(audit_cfg.clone(), Some(peer));
+                let mut req = empty_request("/openshell.v1.OpenShell/ListSandboxes");
+                req.headers_mut().insert(
+                    http::header::AUTHORIZATION,
+                    "Bearer sk-secret-bearer-token".parse().unwrap(),
+                );
+                router.call(req).await.unwrap();
+
+                // 2) Authenticated request — success ledger enabled.
+                let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(
+                    Ok(Some(user_principal("alice"))),
+                ))]);
+                let (recorder, _) = PrincipalRecorder::new();
+                let mut router = AuthGrpcRouter::with_peer_identity(
+                    recorder,
+                    Some(chain),
+                    None,
+                    None,
+                    false,
+                    false,
+                )
+                .with_audit(audit_cfg.clone(), Some(peer));
+                router
+                    .call(empty_request("/openshell.v1.OpenShell/ListSandboxes"))
+                    .await
+                    .unwrap();
+
+                // 3) Sandbox principal reaching a user-only API — finding.
+                let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(
+                    Ok(Some(sandbox_principal())),
+                ))]);
+                let (recorder, _) = PrincipalRecorder::new();
+                let mut router = AuthGrpcRouter::with_peer_identity(
+                    recorder,
+                    Some(chain),
+                    None,
+                    None,
+                    false,
+                    false,
+                )
+                .with_audit(audit_cfg.clone(), Some(peer));
+                let res = router
+                    .call(empty_request("/openshell.v1.OpenShell/CreateWorkspace"))
+                    .await
+                    .unwrap();
+                assert_eq!(grpc_status(&res).as_deref(), Some("7"), "permission denied");
+
+                // 4) Cross-sandbox scope denial — finding.
+                crate::auth::guard::ensure_sandbox_scope(
+                    &sandbox_principal(),
+                    "other-sandbox",
+                    &audit_cfg,
+                )
+                .expect_err("must deny");
+            }
+
+            let records = || -> Vec<serde_json::Value> {
+                exporter
+                    .get_emitted_logs()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|log| {
+                        log.record
+                            .attributes_iter()
+                            .find(|(k, _)| k.as_str() == "ocsf.raw")
+                            .map(|(_, v)| v.clone())
+                    })
+                    .map(|raw| {
+                        let opentelemetry::logs::AnyValue::String(raw) = raw else {
+                            panic!("ocsf.raw should be a string");
+                        };
+                        serde_json::from_str::<serde_json::Value>(raw.as_str()).unwrap()
+                    })
+                    .collect()
+            };
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while records().len() < 4 {
+                assert!(Instant::now() < deadline, "audit records never arrived");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let records = records();
+
+            let failure = &records[0];
+            assert_eq!(failure["class_uid"], 3002);
+            assert_eq!(failure["status"], "Failure");
+            assert_eq!(failure["severity_id"], 3, "failures are Medium");
+            assert_eq!(failure["unmapped"]["mechanism"], "bearer");
+            assert_eq!(failure["unmapped"]["reason"], "rejected_credential");
+            assert_eq!(failure["src_endpoint"]["ip"], "203.0.113.9");
+            assert!(
+                !failure.to_string().contains("sk-secret-bearer-token"),
+                "the presented credential must never enter the audit record"
+            );
+
+            let success = &records[1];
+            assert_eq!(success["class_uid"], 3002);
+            assert_eq!(success["status"], "Success");
+            assert_eq!(success["user"]["uid"], "alice");
+
+            let admin_attempt = &records[2];
+            assert_eq!(admin_attempt["class_uid"], 2004);
+            assert_eq!(admin_attempt["severity_id"], 4, "findings are High");
+            assert_eq!(
+                admin_attempt["finding_info"]["title"],
+                "Sandbox principal attempted admin operation"
+            );
+
+            let cross_sandbox = &records[3];
+            assert_eq!(cross_sandbox["class_uid"], 2004);
+            assert_eq!(
+                cross_sandbox["finding_info"]["title"],
+                "Cross-sandbox access attempt"
+            );
+
+            worker.shutdown().await;
+        }
+
+        /// Without `auth_success_events`, authenticated requests emit no
+        /// per-request ledger record; failures still emit while the master
+        /// toggle is on, and nothing emits when it is off.
+        #[tokio::test]
+        async fn authn_success_ledger_is_opt_in_and_master_toggle_wins() {
+            use tracing_subscriber::layer::SubscriberExt as _;
+
+            let exporter = opentelemetry_sdk::logs::InMemoryLogExporter::default();
+            let (handle, worker) = crate::log_export::spawn(
+                exporter.clone(),
+                opentelemetry_sdk::Resource::builder_empty().build(),
+                true,
+            );
+            let bus = crate::tracing_bus::TracingLogBus::new();
+            bus.set_export(handle);
+
+            {
+                let subscriber = tracing_subscriber::registry().with(bus.layer());
+                let _guard = crate::otel_tracing::test_exporter::install_scoped(subscriber);
+
+                // Success with default toggles: no ledger record.
+                let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(
+                    Ok(Some(user_principal("alice"))),
+                ))]);
+                let (recorder, _) = PrincipalRecorder::new();
+                let mut router = AuthGrpcRouter::with_peer_identity(
+                    recorder,
+                    Some(chain),
+                    None,
+                    None,
+                    false,
+                    false,
+                )
+                .with_audit(openshell_core::GatewayAuditConfig::default(), None);
+                router
+                    .call(empty_request("/openshell.v1.OpenShell/ListSandboxes"))
+                    .await
+                    .unwrap();
+
+                // Rejection with the master toggle off: nothing at all.
+                let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(
+                    Err(tonic::Status::unauthenticated("nope")),
+                ))]);
+                let (recorder, _) = PrincipalRecorder::new();
+                let disabled = openshell_core::GatewayAuditConfig {
+                    enabled: false,
+                    auth_success_events: true,
+                    ..Default::default()
+                };
+                let mut router = AuthGrpcRouter::with_peer_identity(
+                    recorder,
+                    Some(chain),
+                    None,
+                    None,
+                    false,
+                    false,
+                )
+                .with_audit(disabled, None);
+                router
+                    .call(empty_request("/openshell.v1.OpenShell/ListSandboxes"))
+                    .await
+                    .unwrap();
+
+                // Control: rejection with the master toggle on — the only
+                // record this test should produce, proving the two calls
+                // above were suppressed rather than late.
+                let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(
+                    Err(tonic::Status::unauthenticated("nope")),
+                ))]);
+                let (recorder, _) = PrincipalRecorder::new();
+                let mut router = AuthGrpcRouter::with_peer_identity(
+                    recorder,
+                    Some(chain),
+                    None,
+                    None,
+                    false,
+                    false,
+                )
+                .with_audit(openshell_core::GatewayAuditConfig::default(), None);
+                router
+                    .call(empty_request("/openshell.v1.OpenShell/ListSandboxes"))
+                    .await
+                    .unwrap();
+            }
+
+            let ocsf_count = || {
+                exporter
+                    .get_emitted_logs()
+                    .unwrap()
+                    .iter()
+                    .filter(|log| {
+                        log.record
+                            .attributes_iter()
+                            .any(|(k, _)| k.as_str() == "ocsf.raw")
+                    })
+                    .count()
+            };
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while ocsf_count() < 1 {
+                assert!(Instant::now() < deadline, "control record never arrived");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(
+                ocsf_count(),
+                1,
+                "only the control rejection may emit: successes need the \
+                 ledger toggle and a disabled master toggle silences failures"
+            );
+
+            worker.shutdown().await;
         }
 
         #[tokio::test]

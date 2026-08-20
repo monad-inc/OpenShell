@@ -769,10 +769,11 @@ fn spawn_gateway_connection(
                         Ok(tls_stream) => {
                             let peer_identity = multiplex::extract_peer_identity(&tls_stream);
                             if let Err(e) = service
-                                .serve_with_peer_identity_on_listener(
+                                .serve_with_peer_identity_on_listener_from(
                                     tls_stream,
                                     peer_identity,
                                     listener_scope,
+                                    Some(addr),
                                 )
                                 .await
                             {
@@ -799,7 +800,10 @@ fn spawn_gateway_connection(
         });
     } else {
         tokio::spawn(async move {
-            if let Err(e) = service.serve_on_listener(stream, listener_scope).await {
+            if let Err(e) = service
+                .serve_with_peer_identity_on_listener_from(stream, None, listener_scope, Some(addr))
+                .await
+            {
                 if is_benign_connection_close(e.as_ref()) {
                     debug!(error = %e, client = %addr, "Connection closed");
                 } else {

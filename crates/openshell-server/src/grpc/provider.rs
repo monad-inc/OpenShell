@@ -2036,7 +2036,7 @@ async fn authorize_and_resolve_profile_workspace(
     min_workspace_role: MinWorkspaceRole,
 ) -> Result<super::workspace::ResolvedWorkspace, Status> {
     if workspace.is_empty() {
-        require_platform_admin(&state.admin_role, principal)?;
+        require_platform_admin(&state.admin_role, principal, &state.config.audit)?;
         Ok(super::workspace::ResolvedWorkspace {
             name: String::new(),
             terminating: false,
@@ -2214,7 +2214,7 @@ pub(super) async fn handle_list_providers(
     let limit = clamp_limit(request.limit, 100, MAX_PAGE_SIZE);
 
     let providers = if request.all_workspaces {
-        require_platform_admin(&state.admin_role, &principal)?;
+        require_platform_admin(&state.admin_role, &principal, &state.config.audit)?;
         let all: Vec<Provider> = state
             .store
             .list_all_messages(limit, request.offset)

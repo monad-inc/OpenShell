@@ -1835,6 +1835,7 @@ async fn persist_existing_policy_projection(
 
 async fn resolve_sandbox_by_name_for_principal(
     store: &Store,
+    audit: &openshell_core::GatewayAuditConfig,
     workspace: &str,
     principal: &Principal,
     name: &str,
@@ -1851,15 +1852,14 @@ async fn resolve_sandbox_by_name_for_principal(
                     "sandbox not found or not owned by caller",
                 ));
             };
-            crate::auth::guard::ensure_sandbox_scope(principal, sandbox.object_id()).map_err(
-                |status| {
+            crate::auth::guard::ensure_sandbox_scope(principal, sandbox.object_id(), audit)
+                .map_err(|status| {
                     if status.code() == tonic::Code::PermissionDenied {
                         Status::permission_denied("sandbox not found or not owned by caller")
                     } else {
                         status
                     }
-                },
-            )?;
+                })?;
             Ok(sandbox)
         }
         Principal::User(_) => sandbox.ok_or_else(|| Status::not_found("sandbox not found")),
@@ -1879,7 +1879,7 @@ pub(super) async fn handle_get_sandbox_config(
 ) -> Result<Response<GetSandboxConfigResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let sandbox_id = request.get_ref().sandbox_id.clone();
-    crate::auth::guard::enforce_sandbox_scope(&request, &sandbox_id)?;
+    crate::auth::guard::enforce_sandbox_scope(&request, &sandbox_id, &state.config.audit)?;
     drop(request);
 
     let sandbox =
@@ -2329,7 +2329,7 @@ pub(super) async fn handle_get_sandbox_provider_environment(
 ) -> Result<Response<GetSandboxProviderEnvironmentResponse>, Status> {
     let sandbox_id = request.get_ref().sandbox_id.clone();
     let supports_static_credential_bindings = request.get_ref().supports_static_credential_bindings;
-    crate::auth::guard::enforce_sandbox_scope(&request, &sandbox_id)?;
+    crate::auth::guard::enforce_sandbox_scope(&request, &sandbox_id, &state.config.audit)?;
     drop(request);
 
     let sandbox = state
@@ -2486,7 +2486,7 @@ async fn handle_update_config_inner(
     let req = request.into_inner();
     validate_annotations(&req.annotations, "annotations")?;
     let workspace = if req.global {
-        require_platform_admin(&state.admin_role, principal)?;
+        require_platform_admin(&state.admin_role, principal, &state.config.audit)?;
         String::new()
     } else {
         let min_role = if sandbox_caller {
@@ -2510,6 +2510,7 @@ async fn handle_update_config_inner(
         validate_sandbox_caller_update(&req)?;
         resolve_sandbox_by_name_for_principal(
             state.store.as_ref(),
+            &state.config.audit,
             &workspace,
             principal,
             &req.name,
@@ -3248,7 +3249,7 @@ pub(super) async fn handle_get_sandbox_policy_status(
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
     let workspace = if req.global {
-        require_platform_admin(&state.admin_role, &principal)?;
+        require_platform_admin(&state.admin_role, &principal, &state.config.audit)?;
         String::new()
     } else {
         let authz = authorize_workspace(
@@ -3316,7 +3317,7 @@ pub(super) async fn handle_list_sandbox_policies(
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
     let workspace = if req.global {
-        require_platform_admin(&state.admin_role, &principal)?;
+        require_platform_admin(&state.admin_role, &principal, &state.config.audit)?;
         String::new()
     } else {
         let authz = authorize_workspace(
@@ -3367,7 +3368,7 @@ pub(super) async fn handle_report_policy_status(
     request: Request<ReportPolicyStatusRequest>,
 ) -> Result<Response<ReportPolicyStatusResponse>, Status> {
     let sandbox_id = request.get_ref().sandbox_id.clone();
-    crate::auth::guard::enforce_sandbox_scope(&request, &sandbox_id)?;
+    crate::auth::guard::enforce_sandbox_scope(&request, &sandbox_id, &state.config.audit)?;
     let req = request.into_inner();
     if req.sandbox_id.is_empty() {
         return Err(Status::invalid_argument("sandbox_id is required"));
@@ -3547,7 +3548,7 @@ async fn ensure_log_stream_sandbox_scope(
         return Ok(());
     }
 
-    crate::auth::guard::ensure_sandbox_scope(principal, sandbox_id)?;
+    crate::auth::guard::ensure_sandbox_scope(principal, sandbox_id, &state.config.audit)?;
     state
         .store
         .get_message::<Sandbox>(sandbox_id)
@@ -3607,6 +3608,7 @@ async fn handle_submit_policy_analysis_inner(
 
     let sandbox = resolve_sandbox_by_name_for_principal(
         state.store.as_ref(),
+        &state.config.audit,
         &workspace,
         &principal,
         &req.name,
@@ -3936,6 +3938,7 @@ pub(super) async fn handle_get_draft_policy(
 
     let sandbox = resolve_sandbox_by_name_for_principal(
         state.store.as_ref(),
+        &state.config.audit,
         &workspace,
         &principal,
         &req.name,

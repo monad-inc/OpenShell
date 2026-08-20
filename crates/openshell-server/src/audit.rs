@@ -235,6 +235,149 @@ pub fn emit_entity(
     emit_entity_event(success, outcome);
 }
 
+/// One authentication outcome at the gateway boundary, for an
+/// Authentication \[3002\] audit event. Never carries token or credential
+/// material — `detail` must be a gateway-authored status message.
+pub struct AuthnOutcome<'a> {
+    /// Credential mechanism the request presented (`bearer`, `mtls`,
+    /// `local_dev`, `none`).
+    pub mechanism: &'a str,
+    /// Low-cardinality failure category (`rejected_credential`,
+    /// `missing_credentials`, `missing_client_certificate`, `anonymous`).
+    /// `None` for successes.
+    pub reason: Option<&'a str>,
+    /// Gateway-authored status message for failures.
+    pub detail: Option<&'a str>,
+    /// The authenticated principal, for success events.
+    pub principal: Option<&'a Principal>,
+    pub peer_addr: Option<std::net::SocketAddr>,
+    /// Request path, for correlation (`/openshell.v1.OpenShell/...`).
+    pub path: &'a str,
+    pub request_id: Option<&'a str>,
+}
+
+fn build_authn_event(success: bool, outcome: &AuthnOutcome<'_>) -> OcsfEvent {
+    use openshell_ocsf::enums::AuthProtocolId;
+
+    // The OCSF auth-protocol vocabulary is coarse; the exact mechanism
+    // travels in `unmapped.mechanism`.
+    let mut builder = openshell_ocsf::AuthenticationBuilder::new(ctx())
+        .auth_protocol(match outcome.mechanism {
+            "bearer" => AuthProtocolId::OpenId,
+            "mtls" => AuthProtocolId::Other,
+            _ => AuthProtocolId::Unknown,
+        })
+        .status(if success {
+            StatusId::Success
+        } else {
+            StatusId::Failure
+        })
+        .severity(if success {
+            openshell_ocsf::SeverityId::Informational
+        } else {
+            openshell_ocsf::SeverityId::Medium
+        })
+        .unmapped("mechanism", outcome.mechanism)
+        .unmapped("path", outcome.path);
+    if let Some(principal) = outcome.principal {
+        builder = builder.user(actor_user(principal));
+    }
+    if let Some(reason) = outcome.reason {
+        builder = builder.unmapped("reason", reason);
+    }
+    if let Some(detail) = outcome.detail {
+        builder = builder.status_detail(detail);
+    }
+    if let Some(addr) = outcome.peer_addr {
+        builder = builder.src_endpoint(openshell_ocsf::Endpoint::from_ip(addr.ip(), addr.port()));
+    }
+    if let Some(request_id) = outcome.request_id {
+        builder = builder.unmapped("request_id", request_id);
+    }
+    builder.build()
+}
+
+/// Emit an Authentication \[3002\] failure event — one per rejected request
+/// at the authenticator boundary. Always on while audit events are enabled.
+pub fn emit_authn_failure(audit: &openshell_core::GatewayAuditConfig, outcome: &AuthnOutcome<'_>) {
+    if !audit.enabled {
+        return;
+    }
+    emit(build_authn_event(false, outcome));
+}
+
+/// Emit an Authentication \[3002\] success event — one per authenticated
+/// request. Behind `[openshell.gateway.audit] auth_success_events`
+/// (`OPENSHELL_AUDIT_AUTH_SUCCESS_EVENTS`, default off): a complete
+/// authentication ledger multiplies volume by the request rate.
+pub fn emit_authn_success(audit: &openshell_core::GatewayAuditConfig, outcome: &AuthnOutcome<'_>) {
+    if !audit.enabled || !audit.auth_success_events {
+        return;
+    }
+    emit(build_authn_event(true, outcome));
+}
+
+/// Dual-emit a Detection Finding \[2004\] for a cross-sandbox access
+/// attempt: a sandbox principal addressed a sandbox it does not own. The
+/// domain denial log/status remains the primary record; this is the
+/// escalation for security monitoring.
+pub fn emit_cross_sandbox_finding(
+    audit: &openshell_core::GatewayAuditConfig,
+    principal_sandbox_id: &str,
+    requested_sandbox_id: &str,
+) {
+    if !audit.enabled {
+        return;
+    }
+    let event = openshell_ocsf::DetectionFindingBuilder::new(ctx())
+        .finding_info(
+            openshell_ocsf::FindingInfo::new("OSGW-CROSS-SANDBOX", "Cross-sandbox access attempt")
+                .with_desc("a sandbox principal addressed a sandbox it does not own"),
+        )
+        .severity(openshell_ocsf::SeverityId::High)
+        .is_alert(true)
+        .evidence_pairs(&[
+            ("principal_sandbox_id", principal_sandbox_id),
+            ("requested_sandbox_id", requested_sandbox_id),
+        ])
+        .message(format!(
+            "cross-sandbox access denied: {principal_sandbox_id} addressed {requested_sandbox_id}"
+        ))
+        .build();
+    emit(event);
+}
+
+/// Dual-emit a Detection Finding \[2004\] for a sandbox principal that
+/// attempted an operation reserved for users or platform admins.
+pub fn emit_sandbox_admin_attempt_finding(
+    audit: &openshell_core::GatewayAuditConfig,
+    principal_sandbox_id: &str,
+    operation: &str,
+) {
+    if !audit.enabled {
+        return;
+    }
+    let event = openshell_ocsf::DetectionFindingBuilder::new(ctx())
+        .finding_info(
+            openshell_ocsf::FindingInfo::new(
+                "OSGW-SANDBOX-ADMIN-ATTEMPT",
+                "Sandbox principal attempted admin operation",
+            )
+            .with_desc("a sandbox principal attempted an operation reserved for users or admins"),
+        )
+        .severity(openshell_ocsf::SeverityId::High)
+        .is_alert(true)
+        .evidence_pairs(&[
+            ("principal_sandbox_id", principal_sandbox_id),
+            ("operation", operation),
+        ])
+        .message(format!(
+            "sandbox principal {principal_sandbox_id} attempted admin operation {operation}"
+        ))
+        .build();
+    emit(event);
+}
+
 /// Emit the Entity Management \[3004\] audit event for a finished handler.
 ///
 /// No-op when the master audit toggle (`[openshell.gateway.audit] enabled`,

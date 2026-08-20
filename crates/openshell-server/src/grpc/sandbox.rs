@@ -462,7 +462,7 @@ pub(super) async fn handle_list_sandboxes(
     let limit = clamp_limit(request.limit, 100, MAX_PAGE_SIZE);
 
     let sandboxes: Vec<Sandbox> = if request.all_workspaces {
-        require_platform_admin(&state.admin_role, &principal)?;
+        require_platform_admin(&state.admin_role, &principal, &state.config.audit)?;
         if request.label_selector.is_empty() {
             state
                 .store
