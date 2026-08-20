@@ -206,7 +206,11 @@ where
             && let Some(ocsf_event) = openshell_ocsf::clone_current_event()
         {
             (
-                ocsf_event.format_shorthand(),
+                // The bridge already rendered the shorthand into the tracing
+                // message; re-render only if a producer bypassed it.
+                visitor
+                    .message
+                    .unwrap_or_else(|| ocsf_event.format_shorthand()),
                 openshell_ocsf::format::attributes::raw_event_fields(&ocsf_event),
             )
         } else {
@@ -246,6 +250,10 @@ fn is_export_feedback_target(target: &str) -> bool {
     target.starts_with("openshell_server::log_export")
         || target.starts_with("opentelemetry")
         || target.starts_with("tonic")
+        // `tower::buffer` drives the tonic export channel; `tower_http`
+        // (server middleware) is deliberately not matched.
+        || target == "tower"
+        || target.starts_with("tower::")
         || target.starts_with("h2")
         || target.starts_with("hyper")
         || target.starts_with("rustls")

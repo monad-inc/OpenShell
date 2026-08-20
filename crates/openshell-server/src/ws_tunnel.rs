@@ -19,17 +19,24 @@
 //! the public listener or negotiate a second local TLS hop.
 
 use axum::{
-    Router,
+    Extension, Router,
     extract::{State, WebSocketUpgrade, ws::Message},
     response::IntoResponse,
     routing::get,
 };
 use futures::{SinkExt, StreamExt};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, warn};
 
 use crate::ServerState;
+
+/// The tunneled connection's remote address, stamped on requests by
+/// [`crate::http::http_router`] so the in-memory multiplex connection the
+/// tunnel spawns keeps a `src_endpoint` in authentication audit events.
+#[derive(Clone, Copy, Debug)]
+pub struct TunnelPeerAddr(pub Option<SocketAddr>);
 
 /// Create the WebSocket tunnel router.
 pub fn router(state: Arc<ServerState>) -> Router {
@@ -41,10 +48,12 @@ pub fn router(state: Arc<ServerState>) -> Router {
 /// Handle the WebSocket upgrade request.
 async fn ws_tunnel_handler(
     State(state): State<Arc<ServerState>>,
+    peer_addr: Option<Extension<TunnelPeerAddr>>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
+    let peer_addr = peer_addr.and_then(|Extension(TunnelPeerAddr(addr))| addr);
     ws.on_upgrade(move |socket| async move {
-        if let Err(e) = handle_ws_tunnel(socket, state).await {
+        if let Err(e) = handle_ws_tunnel(socket, state, peer_addr).await {
             warn!(error = %e, "WebSocket tunnel connection failed");
         }
     })
@@ -54,6 +63,7 @@ async fn ws_tunnel_handler(
 async fn handle_ws_tunnel(
     ws: axum::extract::ws::WebSocket,
     state: Arc<ServerState>,
+    peer_addr: Option<SocketAddr>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let service = crate::MultiplexService::new(state);
     let (tunnel_stream, service_stream) = tokio::io::duplex(64 * 1024);
@@ -63,7 +73,7 @@ async fn handle_ws_tunnel(
     let (tunnel_read, tunnel_write) = tokio::io::split(tunnel_stream);
 
     let service_task = tokio::spawn(async move {
-        if let Err(e) = service.serve(service_stream).await {
+        if let Err(e) = service.serve_from(service_stream, peer_addr).await {
             debug!(error = %e, "WS tunnel: multiplex service error");
         }
     });

@@ -1124,6 +1124,28 @@ mod tests {
     }
 
     #[test]
+    fn service_endpoint_events_carry_the_acting_principal() {
+        let actor = openshell_ocsf::objects::User::new(
+            "alice",
+            "oidc|alice-123",
+            openshell_ocsf::objects::UserTypeId::User,
+        );
+        let event = build_service_endpoint_config_event(
+            &endpoint(),
+            "http://my-sandbox--web.local/",
+            true,
+            Some(actor.clone()),
+        );
+        let json = event.to_json().unwrap();
+        assert_eq!(json["actor"]["user"]["name"], "alice");
+        assert_eq!(json["actor"]["user"]["uid"], "oidc|alice-123");
+
+        let event = build_service_endpoint_delete_event(&endpoint(), Some(actor));
+        let json = event.to_json().unwrap();
+        assert_eq!(json["actor"]["user"]["name"], "alice");
+    }
+
+    #[test]
     fn service_endpoint_delete_event_includes_endpoint_metadata() {
         let event = build_service_endpoint_delete_event(&endpoint(), None);
         let json = event.to_json().unwrap();

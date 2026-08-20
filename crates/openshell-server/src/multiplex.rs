@@ -224,6 +224,26 @@ impl MultiplexService {
             .await
     }
 
+    /// Serve an in-memory connection that fronts a known remote peer — the
+    /// WebSocket tunnel's case — so authentication audit events keep the
+    /// tunneled client's `src_endpoint`.
+    pub(crate) async fn serve_from<S>(
+        &self,
+        stream: S,
+        peer_addr: Option<SocketAddr>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        self.serve_with_peer_identity_on_listener_from(
+            stream,
+            None,
+            GatewayListenerScope::Primary,
+            peer_addr,
+        )
+        .await
+    }
+
     /// Serve a connection and preserve its listener scope in request
     /// extensions for downstream routing and policy decisions.
     pub(crate) async fn serve_on_listener<S>(
@@ -310,7 +330,7 @@ impl MultiplexService {
         .with_audit(self.state.config.audit.clone(), peer_addr);
         let grpc_service =
             GrpcRateLimitService::new(grpc_service, self.state.grpc_rate_limiter.clone());
-        let http_service = http_router(self.state.clone());
+        let http_service = http_router(self.state.clone(), peer_addr);
 
         let grpc_service = request_id_middleware!(grpc_service);
         let http_service = request_id_middleware!(http_service);
@@ -1060,12 +1080,20 @@ where
                 );
             };
 
-            let principal = if let Some(chain) = chain {
+            // Failure events carry `mechanism` — what the request presented.
+            // Success events instead carry what actually authenticated the
+            // request, so a dev-mode principal audits as `local_dev` rather
+            // than implying a stray Authorization header was validated.
+            let (principal, authn_mechanism) = if let Some(chain) = chain {
                 match chain.authenticate(req.headers(), &path).await {
-                    Ok(Some(p)) => p,
+                    Ok(Some(p)) => (p, mechanism),
                     Ok(None) => match (mtls_auth_enabled, peer_identity) {
-                        (true, Some(identity)) => Principal::User(UserPrincipal { identity }),
-                        _ if allow_unauthenticated_users => unauthenticated_dev_user_principal(),
+                        (true, Some(identity)) => {
+                            (Principal::User(UserPrincipal { identity }), "mtls")
+                        }
+                        _ if allow_unauthenticated_users => {
+                            (unauthenticated_dev_user_principal(), "local_dev")
+                        }
                         _ => {
                             authn_failure("missing_credentials", "missing authorization header");
                             return Ok(status_response(tonic::Status::unauthenticated(
@@ -1078,7 +1106,18 @@ where
                         // invalid/expired token, unknown kid, rejected
                         // sandbox JWT. The status message is gateway-
                         // authored; the presented credential never is.
-                        authn_failure("rejected_credential", status.message());
+                        // Infrastructure failures (JWKS refresh down,
+                        // TokenReview unreachable) are not credential
+                        // rejections — mislabeling them would paint an IdP
+                        // outage as a credential-stuffing spike.
+                        let reason = if status.code() == tonic::Code::Internal
+                            || status.code() == tonic::Code::Unavailable
+                        {
+                            "authenticator_error"
+                        } else {
+                            "rejected_credential"
+                        };
+                        authn_failure(reason, status.message());
                         return Ok(status_response(status));
                     }
                 }
@@ -1089,14 +1128,14 @@ where
                         "missing client certificate",
                     )));
                 };
-                Principal::User(UserPrincipal { identity })
+                (Principal::User(UserPrincipal { identity }), "mtls")
             } else if allow_unauthenticated_users {
-                unauthenticated_dev_user_principal()
+                (unauthenticated_dev_user_principal(), "local_dev")
             } else {
                 // No auth configured — dev / fronting-proxy deployments.
                 // Inject a local-dev principal so downstream handlers that
                 // call extract_principal() always find one.
-                unauthenticated_dev_user_principal()
+                (unauthenticated_dev_user_principal(), "local_dev")
             };
 
             match principal {
@@ -1143,7 +1182,7 @@ where
             crate::audit::emit_authn_success(
                 &audit,
                 &crate::audit::AuthnOutcome {
-                    mechanism,
+                    mechanism: authn_mechanism,
                     reason: None,
                     detail: None,
                     principal: Some(&principal),
@@ -2928,6 +2967,105 @@ mod tests {
                 1,
                 "only the control rejection may emit: successes need the \
                  ledger toggle and a disabled master toggle silences failures"
+            );
+
+            worker.shutdown().await;
+        }
+
+        /// Findings must honor the master audit toggle: a sandbox principal
+        /// probing an admin API and a cross-sandbox scope denial emit
+        /// nothing with `enabled = false`, and a control run proves the
+        /// suppression rather than lateness.
+        #[tokio::test]
+        async fn findings_honor_the_master_audit_toggle() {
+            use tracing_subscriber::layer::SubscriberExt as _;
+
+            let exporter = opentelemetry_sdk::logs::InMemoryLogExporter::default();
+            let (handle, worker) = crate::log_export::spawn(
+                exporter.clone(),
+                opentelemetry_sdk::Resource::builder_empty().build(),
+                true,
+            );
+            let bus = crate::tracing_bus::TracingLogBus::new();
+            bus.set_export(handle);
+            let disabled = openshell_core::GatewayAuditConfig {
+                enabled: false,
+                ..Default::default()
+            };
+
+            {
+                let subscriber = tracing_subscriber::registry().with(bus.layer());
+                let _guard = crate::otel_tracing::test_exporter::install_scoped(subscriber);
+
+                // Sandbox principal on a user-only API, master toggle off.
+                let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(
+                    Ok(Some(sandbox_principal())),
+                ))]);
+                let (recorder, _) = PrincipalRecorder::new();
+                let mut router = AuthGrpcRouter::with_peer_identity(
+                    recorder,
+                    Some(chain),
+                    None,
+                    None,
+                    false,
+                    false,
+                )
+                .with_audit(disabled.clone(), None);
+                router
+                    .call(empty_request("/openshell.v1.OpenShell/CreateWorkspace"))
+                    .await
+                    .unwrap();
+
+                // Cross-sandbox scope denial, master toggle off.
+                crate::auth::guard::ensure_sandbox_scope(
+                    &sandbox_principal(),
+                    "other-sandbox",
+                    &disabled,
+                )
+                .expect_err("must deny");
+
+                // Control: same admin probe with the toggle on — the only
+                // record this test may produce.
+                let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(
+                    Ok(Some(sandbox_principal())),
+                ))]);
+                let (recorder, _) = PrincipalRecorder::new();
+                let mut router = AuthGrpcRouter::with_peer_identity(
+                    recorder,
+                    Some(chain),
+                    None,
+                    None,
+                    false,
+                    false,
+                )
+                .with_audit(openshell_core::GatewayAuditConfig::default(), None);
+                router
+                    .call(empty_request("/openshell.v1.OpenShell/CreateWorkspace"))
+                    .await
+                    .unwrap();
+            }
+
+            let finding_count = || {
+                exporter
+                    .get_emitted_logs()
+                    .unwrap()
+                    .iter()
+                    .filter(|log| {
+                        log.record
+                            .attributes_iter()
+                            .any(|(k, _)| k.as_str() == "ocsf.raw")
+                    })
+                    .count()
+            };
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while finding_count() < 1 {
+                assert!(Instant::now() < deadline, "control record never arrived");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(
+                finding_count(),
+                1,
+                "a disabled master toggle must silence findings"
             );
 
             worker.shutdown().await;

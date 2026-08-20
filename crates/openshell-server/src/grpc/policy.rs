@@ -1120,6 +1120,14 @@ async fn auto_approve_chunk(
         provider_names,
     )
     .await?;
+    // Summarize before the merge so a decode failure cannot land between
+    // the policy commit and its audit event.
+    let chunk_summary = summarize_draft_chunk_rule(&chunk)?;
+    let source_label = if context.source.is_empty() {
+        "unspecified"
+    } else {
+        context.source
+    };
     let (version, hash) = merge_chunk_into_policy(
         state.store.as_ref(),
         sandbox_id,
@@ -1128,22 +1136,9 @@ async fn auto_approve_chunk(
         &provider_layers,
     )
     .await?;
-    let chunk_summary = summarize_draft_chunk_rule(&chunk)?;
-
-    let now_ms = current_time_ms();
-    state
-        .store
-        .update_draft_chunk_status(chunk_id, "approved", Some(now_ms), None)
-        .await
-        .map_err(|e| Status::internal(format!("update chunk status failed: {e}")))?;
-
-    state.sandbox_watch_bus.notify(sandbox_id);
-
-    let source_label = if context.source.is_empty() {
-        "unspecified"
-    } else {
-        context.source
-    };
+    // Emit at the policy commit, before the fallible chunk-status update —
+    // if that update fails the chunk stays pending, but the policy revision
+    // is durably in effect and must already be on the audit trail.
     // Same event class as a human approval; the extra fields carry the
     // safety reasoning so the audit is reconstructable, and the actor is
     // the principal whose submission triggered the approval.
@@ -1171,6 +1166,15 @@ async fn auto_approve_chunk(
             ],
         },
     );
+
+    let now_ms = current_time_ms();
+    state
+        .store
+        .update_draft_chunk_status(chunk_id, "approved", Some(now_ms), None)
+        .await
+        .map_err(|e| Status::internal(format!("update chunk status failed: {e}")))?;
+
+    state.sandbox_watch_bus.notify(sandbox_id);
 
     info!(
         sandbox_id = %sandbox_id,
@@ -2622,6 +2626,23 @@ async fn handle_update_config_inner(
                     Status::internal(format!("persist global policy revision failed: {e}"))
                 })?;
 
+            // Audit at the revision commit — a wholesale policy replacement
+            // must be at least as visible as an incremental merge.
+            emit_gateway_policy_audit(
+                state,
+                Some(principal),
+                request_id.as_deref(),
+                &PolicyAuditEvent {
+                    sandbox: None,
+                    state_label: "updated",
+                    detail: "global policy replaced".to_string(),
+                    version: next_version,
+                    policy_hash: &hash,
+                    success: true,
+                    extra: vec![("scope", serde_json::Value::from("global"))],
+                },
+            );
+
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_millis() as i64);
@@ -3087,7 +3108,7 @@ async fn handle_update_config_inner(
 
     let payload = new_policy.encode_to_vec();
     let hash = deterministic_policy_hash(&new_policy);
-    let (_next_version, committed_annotations) = {
+    let (committed_version, committed_annotations) = {
         let mut committed = None;
         for attempt in 1..=MERGE_RETRY_LIMIT {
             let latest = state
@@ -3168,6 +3189,25 @@ async fn handle_update_config_inner(
         })?
     };
     response_annotations = committed_annotations;
+    // Audit at the revision commit — a full policy replacement must be at
+    // least as visible as the incremental merge path above.
+    emit_gateway_policy_audit(
+        state,
+        Some(principal),
+        request_id.as_deref(),
+        &PolicyAuditEvent {
+            sandbox: Some((&sandbox_id, sandbox.object_name())),
+            state_label: "updated",
+            detail: format!("sandbox policy replaced for {}", sandbox.object_name()),
+            version: committed_version,
+            policy_hash: &hash,
+            success: true,
+            extra: vec![(
+                "sandbox_sync",
+                serde_json::Value::from(sandbox_caller.to_string()),
+            )],
+        },
+    );
     state.sandbox_watch_bus.notify(&sandbox_id);
 
     if backfill_policy.is_some() {
@@ -3213,6 +3253,26 @@ async fn handle_update_config_inner(
         )
         .await
         .map_err(|e| Status::internal(format!("persist policy revision failed: {e}")))?;
+
+    // Rarely-reached re-commit (a concurrent writer superseded the atomic
+    // write above); audit it like any other committed revision.
+    emit_gateway_policy_audit(
+        state,
+        Some(principal),
+        request_id.as_deref(),
+        &PolicyAuditEvent {
+            sandbox: Some((&sandbox_id, sandbox.object_name())),
+            state_label: "updated",
+            detail: format!("sandbox policy replaced for {}", sandbox.object_name()),
+            version: next_version,
+            policy_hash: &hash,
+            success: true,
+            extra: vec![(
+                "sandbox_sync",
+                serde_json::Value::from(sandbox_caller.to_string()),
+            )],
+        },
+    );
 
     let _ = state
         .store
@@ -3526,11 +3586,27 @@ pub(super) async fn handle_push_sandbox_logs(
             let mut log = log;
             log.source = "sandbox".to_string();
             log.sandbox_id.clone_from(&batch.sandbox_id);
+            sanitize_pushed_log_fields(&mut log);
             state.tracing_log_bus.publish_external(log);
         }
     }
 
     Ok(Response::new(PushSandboxLogsResponse {}))
+}
+
+/// Strip pushed field keys that collide with the identity attributes the
+/// gateway stamps on every exported record (`sandbox.id`, `log.source`,
+/// `log.target`, `log.level`, `log.ocsf`). A pushed field with one of those
+/// keys would export as a duplicate attribute and let a compromised sandbox
+/// masquerade as another sandbox — or as the gateway — in downstream
+/// consumers that resolve duplicate keys last-wins.
+fn sanitize_pushed_log_fields(log: &mut SandboxLogLine) {
+    log.fields.retain(|key, _| {
+        !matches!(
+            key.as_str(),
+            "sandbox.id" | "log.source" | "log.target" | "log.level" | "log.ocsf"
+        )
+    });
 }
 
 async fn ensure_log_stream_sandbox_scope(
@@ -6009,6 +6085,31 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tonic::Code;
+
+    #[test]
+    fn pushed_log_fields_cannot_shadow_gateway_identity_attributes() {
+        let mut log = SandboxLogLine {
+            fields: HashMap::from([
+                ("sandbox.id".to_string(), "victim-sb".to_string()),
+                ("log.source".to_string(), "gateway".to_string()),
+                ("log.target".to_string(), "audit".to_string()),
+                ("log.level".to_string(), "OCSF".to_string()),
+                ("log.ocsf".to_string(), "true".to_string()),
+                ("ocsf.raw".to_string(), "{}".to_string()),
+                ("custom.field".to_string(), "kept".to_string()),
+            ]),
+            ..Default::default()
+        };
+        sanitize_pushed_log_fields(&mut log);
+        assert_eq!(
+            log.fields.keys().count(),
+            2,
+            "only non-reserved keys survive: {:?}",
+            log.fields
+        );
+        assert!(log.fields.contains_key("ocsf.raw"));
+        assert!(log.fields.contains_key("custom.field"));
+    }
 
     /// Wrap a request with a user `Principal` so handler scope guards treat
     /// the test caller as a CLI user. Most handler tests exercise
@@ -15850,6 +15951,143 @@ mod tests {
                 "same-hash-signature".to_string(),
             )])
         );
+    }
+
+    #[tokio::test]
+    async fn update_config_full_policy_replacements_emit_audit_events() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let exporter = opentelemetry_sdk::logs::InMemoryLogExporter::default();
+        let (handle, worker) = crate::log_export::spawn(
+            exporter.clone(),
+            opentelemetry_sdk::Resource::builder_empty().build(),
+            true,
+        );
+        let bus = crate::tracing_bus::TracingLogBus::new();
+        bus.set_export(handle);
+        let state = test_server_state().await;
+        let policy = test_policy_with_rule("sandbox_only", "sandbox.example.com");
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-audit-replace",
+                "audit-replace",
+                policy.clone(),
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+
+        {
+            let subscriber = tracing_subscriber::registry().with(bus.layer());
+            let _guard = crate::otel_tracing::test_exporter::install_scoped(subscriber);
+
+            // Sandbox-scoped full replacement.
+            let mut replaced = policy.clone();
+            replaced
+                .network_policies
+                .extend(test_policy_with_rule("extra_rule", "extra.example.com").network_policies);
+            handle_update_config(
+                &state,
+                with_user(Request::new(UpdateConfigRequest {
+                    name: "audit-replace".to_string(),
+                    policy: Some(replaced.clone()),
+                    ..Default::default()
+                })),
+            )
+            .await
+            .unwrap();
+
+            // Idempotent re-set: no revision, no audit record.
+            handle_update_config(
+                &state,
+                with_user(Request::new(UpdateConfigRequest {
+                    name: "audit-replace".to_string(),
+                    policy: Some(replaced),
+                    ..Default::default()
+                })),
+            )
+            .await
+            .unwrap();
+
+            // Global full-policy set.
+            handle_update_config(
+                &state,
+                authed_request(UpdateConfigRequest {
+                    global: true,
+                    policy: Some(test_policy_with_rule("global_rule", "global.example.com")),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        }
+
+        let audit_records = || -> Vec<(serde_json::Value, Option<String>)> {
+            exporter
+                .get_emitted_logs()
+                .unwrap()
+                .iter()
+                .filter_map(|log| {
+                    let raw = log
+                        .record
+                        .attributes_iter()
+                        .find(|(k, _)| k.as_str() == "ocsf.raw")
+                        .map(|(_, v)| v.clone())?;
+                    let opentelemetry::logs::AnyValue::String(raw) = raw else {
+                        panic!("ocsf.raw should be a string");
+                    };
+                    let sandbox_attr = log
+                        .record
+                        .attributes_iter()
+                        .find(|(k, _)| k.as_str() == "sandbox.id")
+                        .and_then(|(_, v)| match v {
+                            opentelemetry::logs::AnyValue::String(s) => {
+                                Some(s.as_str().to_string())
+                            }
+                            _ => None,
+                        });
+                    Some((
+                        serde_json::from_str::<serde_json::Value>(raw.as_str()).unwrap(),
+                        sandbox_attr,
+                    ))
+                })
+                .collect()
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while audit_records().len() < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "audit records never arrived"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // Give any stray idempotent-path record a chance to surface.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let records = audit_records();
+        assert_eq!(
+            records.len(),
+            2,
+            "one record per committed revision, none for the idempotent re-set"
+        );
+
+        let (sandbox_replace, route) = &records[0];
+        assert_eq!(sandbox_replace["class_uid"], 5019);
+        assert_eq!(sandbox_replace["state"], "updated");
+        assert_eq!(sandbox_replace["status"], "Success");
+        assert_eq!(sandbox_replace["unmapped"]["policy_version"], "v1");
+        assert!(
+            sandbox_replace["actor"]["user"]["name"].is_string(),
+            "full replacements carry the acting principal"
+        );
+        assert_eq!(route.as_deref(), Some("sb-audit-replace"));
+
+        let (global_replace, route) = &records[1];
+        assert_eq!(global_replace["state"], "updated");
+        assert_eq!(global_replace["unmapped"]["scope"], "global");
+        assert!(route.is_none(), "global policy rides the gateway lane");
+
+        worker.shutdown().await;
     }
 
     #[tokio::test]

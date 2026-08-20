@@ -499,6 +499,29 @@ fn prepare_server_config(args: &mut RunArgs, matches: &ArgMatches) -> Result<Ser
     })
 }
 
+/// Build the gateway's log filter, pinning the `ocsf` target at INFO.
+///
+/// Audit and security events ride tracing under the `ocsf` target; a coarse
+/// `RUST_LOG=warn` (or `log_level = "warn"`) must quiet diagnostics without
+/// silently severing the audit trail — that is the `[openshell.gateway.audit]
+/// enabled` toggle's job. An explicit `ocsf` directive in the operator's own
+/// filter still wins.
+fn gateway_env_filter(log_level: &str) -> EnvFilter {
+    build_gateway_env_filter(std::env::var("RUST_LOG").ok(), log_level)
+}
+
+fn build_gateway_env_filter(rust_log: Option<String>, log_level: &str) -> EnvFilter {
+    let fallback = || (EnvFilter::new(log_level), log_level.to_string());
+    let (filter, spec) = rust_log.map_or_else(fallback, |spec| {
+        EnvFilter::try_new(&spec).map_or_else(|_| fallback(), |filter| (filter, spec))
+    });
+    if spec.contains("ocsf") {
+        filter
+    } else {
+        filter.add_directive("ocsf=info".parse().expect("static directive parses"))
+    }
+}
+
 async fn run_from_args(mut args: RunArgs, matches: ArgMatches) -> Result<()> {
     let prepared = prepare_server_config(&mut args, &matches)?;
 
@@ -508,8 +531,7 @@ async fn run_from_args(mut args: RunArgs, matches: ArgMatches) -> Result<()> {
         .as_ref()
         .and_then(|f| f.openshell.gateway.otlp.as_ref());
     let (tracing_handle, setup_error) = crate::tracing_setup::install(
-        EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new(&prepared.config.log_level)),
+        gateway_env_filter(&prepared.config.log_level),
         &tracing_log_bus,
         otlp_config,
     );
@@ -2015,5 +2037,34 @@ default_image = "k8s-specific:1.0"
             .try_into::<openshell_driver_kubernetes::KubernetesComputeConfig>()
             .expect("deserializes");
         assert_eq!(parsed.default_image, "k8s-specific:1.0");
+    }
+
+    #[test]
+    fn coarse_log_levels_keep_the_audit_trail_flowing() {
+        // `RUST_LOG=warn` quiets diagnostics; it must not silently sever the
+        // OCSF audit stream — that's the audit `enabled` toggle's job.
+        for spec in [None, Some("warn".to_string()), Some("error".to_string())] {
+            let filter = super::build_gateway_env_filter(spec.clone(), "warn");
+            assert!(
+                filter.to_string().contains("ocsf=info"),
+                "expected ocsf=info pin for spec {spec:?}, got: {filter}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_ocsf_directives_win_over_the_pin() {
+        let filter = super::build_gateway_env_filter(Some("warn,ocsf=off".to_string()), "info");
+        let rendered = filter.to_string();
+        assert!(rendered.contains("ocsf=off"), "got: {rendered}");
+        assert!(!rendered.contains("ocsf=info"), "got: {rendered}");
+    }
+
+    #[test]
+    fn invalid_rust_log_falls_back_to_the_configured_level() {
+        let filter = super::build_gateway_env_filter(Some("no[t-a-filter".to_string()), "debug");
+        let rendered = filter.to_string();
+        assert!(rendered.contains("debug"), "got: {rendered}");
+        assert!(rendered.contains("ocsf=info"), "got: {rendered}");
     }
 }

@@ -28,26 +28,40 @@ pub fn clone_current_event() -> Option<OcsfEvent> {
     CURRENT_EVENT.with(|cell| cell.borrow().clone())
 }
 
+/// Clears the thread-local on scope exit — including a panicking layer.
+/// Without this, a mid-dispatch panic (caught at the task boundary) would
+/// leave a stale event that a later unrelated `ocsf`-target line on the same
+/// thread silently substitutes for its own content.
+struct ClearCurrentEvent;
+
+impl Drop for ClearCurrentEvent {
+    fn drop(&mut self) {
+        let _ = CURRENT_EVENT.try_with(|cell| {
+            cell.borrow_mut().take();
+        });
+    }
+}
+
 /// Emit an `OcsfEvent` through the tracing subscriber.
 ///
 /// The OCSF layers (`OcsfShorthandLayer`, `OcsfJsonlLayer`) format it
 /// as shorthand (`openshell.log`) and JSONL (`openshell-ocsf.log`).
 ///
 /// Both layers receive the event — `clone_current_event()` is non-consuming.
+/// The tracing message is the shorthand rendering, so subscribers without an
+/// OCSF-aware layer (a gateway's stdout fmt layer, for one) still show the
+/// event's content rather than an opaque marker.
 pub fn emit_ocsf_event(event: OcsfEvent) {
+    let shorthand = event.format_shorthand();
     // Store the event in thread-local so layers can access it
     CURRENT_EVENT.with(|cell| {
         *cell.borrow_mut() = Some(event);
     });
+    let _clear = ClearCurrentEvent;
 
     // Emit a tracing event with the `ocsf` target.
     // The layers detect this target and clone the OcsfEvent from thread-local.
-    tracing::info!(target: "ocsf", "ocsf_event");
-
-    // Clear the thread-local after dispatch completes.
-    CURRENT_EVENT.with(|cell| {
-        cell.borrow_mut().take();
-    });
+    tracing::info!(target: "ocsf", "{shorthand}");
 }
 
 /// Emit an `OcsfEvent` scoped to a specific sandbox.
@@ -58,15 +72,13 @@ pub fn emit_ocsf_event(event: OcsfEvent) {
 /// by gateway-side emitters; sandbox-side emitters are already scoped by the
 /// push layer.
 pub fn emit_ocsf_event_for_sandbox(sandbox_id: &str, event: OcsfEvent) {
+    let shorthand = event.format_shorthand();
     CURRENT_EVENT.with(|cell| {
         *cell.borrow_mut() = Some(event);
     });
+    let _clear = ClearCurrentEvent;
 
-    tracing::info!(target: "ocsf", sandbox_id = %sandbox_id, "ocsf_event");
-
-    CURRENT_EVENT.with(|cell| {
-        cell.borrow_mut().take();
-    });
+    tracing::info!(target: "ocsf", sandbox_id = %sandbox_id, "{shorthand}");
 }
 
 /// Convenience macro for emitting an `OcsfEvent`.

@@ -495,6 +495,12 @@ type RelayStreamResponse = Response<
 /// pending relay; subsequent frames carry raw bytes forward to the
 /// gateway-side waiter. Bytes flowing the other way are chunked and sent as
 /// `RelayFrame::data` messages back over the response stream.
+///
+/// **Test/embedding harness only**: this stateless variant runs with audit
+/// findings disabled (no `GatewayAuditConfig` in reach), so cross-sandbox
+/// claim denials are not escalated as Detection Findings. Production traffic
+/// must go through [`handle_relay_stream_for_state`], which the gateway's
+/// gRPC service uses.
 pub async fn handle_relay_stream(
     registry: &SupervisorSessionRegistry,
     request: Request<tonic::Streaming<RelayFrame>>,

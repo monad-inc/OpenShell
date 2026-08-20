@@ -142,12 +142,33 @@ fn escape_context_field(text: &str) -> String {
     escaped
 }
 
+/// Flatten a value that appears inside a bracketed context tag but may
+/// legitimately contain spaces (reasons, messages, command lines). Control
+/// characters (terminal escapes included) collapse to spaces, and brackets
+/// and backslashes are escaped, so workload-sourced text cannot forge extra
+/// lines or lookalike tags or drive the operator's terminal.
+fn tag_text(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '[' => escaped.push_str("\\["),
+            ']' => escaped.push_str("\\]"),
+            character if character == '\n' || character == '\r' || character.is_control() => {
+                escaped.push(' ');
+            }
+            character => escaped.push(character),
+        }
+    }
+    escaped
+}
+
 fn reason_text(text: Option<&str>) -> Option<String> {
     let text = text?;
     if text.is_empty() {
         return None;
     }
-    let text = text.replace(['\n', '\r'], " ");
+    let text = tag_text(text);
     Some(truncate_with_ellipsis(&text, MAX_REASON_LEN))
 }
 
@@ -200,7 +221,7 @@ fn message_tag(base: &BaseEventData) -> String {
     if text.is_empty() {
         return String::new();
     }
-    let text = text.replace(['\n', '\r'], " ");
+    let text = tag_text(text);
     format!(" [msg:{}]", truncate_with_ellipsis(&text, MAX_MESSAGE_LEN))
 }
 
@@ -237,7 +258,7 @@ impl OcsfEvent {
                     .actor
                     .as_ref()
                     .and_then(|a| a.process.as_ref())
-                    .map(|p| format!("{}({})", p.name, p.pid))
+                    .map(|p| format!("{}({})", single_line(&p.name), p.pid))
                     .unwrap_or_default();
                 let dst = e
                     .dst_endpoint
@@ -300,7 +321,7 @@ impl OcsfEvent {
                     .actor
                     .as_ref()
                     .and_then(|a| a.process.as_ref())
-                    .map(|p| format!("{}({})", p.name, p.pid))
+                    .map(|p| format!("{}({})", single_line(&p.name), p.pid))
                     .unwrap_or_default();
                 let url_str = e
                     .http_request
@@ -384,7 +405,10 @@ impl OcsfEvent {
 
             Self::ProcessActivity(e) => {
                 let activity = e.base.activity_name.to_uppercase();
-                let proc_str = format!("{}({})", e.process.name, e.process.pid);
+                // Process names and command lines are workload-chosen —
+                // flatten/escape them so a sandboxed process cannot forge
+                // extra shorthand lines or lookalike tags.
+                let proc_str = format!("{}({})", single_line(&e.process.name), e.process.pid);
                 let exit_ctx = e
                     .exit_code
                     .map(|c| format!(" [exit:{c}]"))
@@ -393,7 +417,12 @@ impl OcsfEvent {
                     .process
                     .cmd_line
                     .as_ref()
-                    .map(|c| format!(" [cmd:{c}]"))
+                    .map(|c| {
+                        format!(
+                            " [cmd:{}]",
+                            truncate_with_ellipsis(&tag_text(c), MAX_MESSAGE_LEN)
+                        )
+                    })
                     .unwrap_or_default();
 
                 format!("PROC:{activity} {sev} {proc_str}{exit_ctx}{cmd_ctx}")
@@ -446,12 +475,20 @@ impl OcsfEvent {
                     .actor
                     .as_ref()
                     .and_then(|a| a.user.as_ref())
-                    .map(|u| format!(" by {}", single_line(&u.name)))
+                    .map(|u| {
+                        format!(
+                            " by {}",
+                            truncate_with_ellipsis(&single_line(&u.name), MAX_MESSAGE_LEN)
+                        )
+                    })
                     .unwrap_or_default();
                 format!(
                     "ENTITY:{activity} {sev}{outcome} {} \"{}\"{actor_str}",
                     single_line(&e.entity.entity_type),
-                    escape_quoted_field(e.entity.display()),
+                    truncate_with_ellipsis(
+                        &escape_quoted_field(e.entity.display()),
+                        MAX_REASON_LEN
+                    ),
                 )
             }
 
@@ -546,7 +583,10 @@ impl OcsfEvent {
             }
 
             Self::Base(e) => {
-                let message = e.base.message.as_deref().unwrap_or("");
+                // The fallback arm renders whatever a producer supplied —
+                // flatten/escape like every other arm so it cannot become
+                // the unescaped path.
+                let message = single_line(e.base.message.as_deref().unwrap_or(""));
                 let unmapped_ctx = e
                     .base
                     .unmapped
@@ -561,7 +601,11 @@ impl OcsfEvent {
                             .take(3) // Limit to 3 most important fields
                             .map(|(k, v)| {
                                 let val = v.as_str().map_or_else(|| v.to_string(), String::from);
-                                format!("{k}:{val}")
+                                format!(
+                                    "{}:{}",
+                                    escape_context_field(k),
+                                    escape_context_field(&val)
+                                )
                             })
                             .collect();
                         Some(format!(" [{}]", fields.join(" ")))
@@ -1111,6 +1155,34 @@ mod tests {
         assert_eq!(
             shorthand,
             "PROC:LAUNCH [INFO] python3(42) [cmd:python3 /app/main.py]"
+        );
+    }
+
+    #[test]
+    fn process_names_and_cmd_lines_cannot_forge_shorthand_lines() {
+        // A sandboxed workload chooses its own argv and comm — the exact
+        // party this log stream surveils must not be able to forge lines,
+        // lookalike tags, or terminal escapes.
+        let event = OcsfEvent::ProcessActivity(ProcessActivityEvent {
+            base: base(1007, "Process Activity", 1, "System Activity", 1, "Launch"),
+            process: Process::new("sh\nNET:OPEN [INFO] ALLOWED forged", 7)
+                .with_cmd_line("run]\x1b[2J[sev:HIGH] --flag"),
+            actor: None,
+            launch_type: Some(LaunchTypeId::Spawn),
+            exit_code: None,
+            action: None,
+            disposition: None,
+        });
+
+        let shorthand = event.format_shorthand();
+        assert!(!shorthand.contains('\n'), "no forged lines: {shorthand}");
+        assert!(
+            !shorthand.contains('\x1b'),
+            "no terminal escapes: {shorthand}"
+        );
+        assert!(
+            shorthand.contains("run\\]"),
+            "cmd brackets are escaped: {shorthand}"
         );
     }
 

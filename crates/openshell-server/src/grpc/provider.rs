@@ -2334,11 +2334,21 @@ pub(super) async fn handle_import_provider_profiles(
         .collect();
     let count = profile_ids.len();
 
-    let result = handle_import_provider_profiles_inner(state, request).await;
+    let mut committed_profiles = Vec::new();
+    let result =
+        handle_import_provider_profiles_inner(state, request, &mut committed_profiles).await;
 
     let mut unmapped = profile_audit_unmapped(&workspace);
     unmapped.push(("profile_count", serde_json::Value::from(count)));
     unmapped.push(("profiles", serde_json::Value::from(profile_ids.clone())));
+    // A mid-batch failure leaves earlier profiles durably created; the
+    // failure event must name them or those creations vanish from the trail.
+    if result.is_err() && !committed_profiles.is_empty() {
+        unmapped.push((
+            "imported_before_failure",
+            serde_json::Value::from(committed_profiles.clone()),
+        ));
+    }
     audit::emit_entity_outcome_judged(
         &state.config.audit,
         &result,
@@ -2364,6 +2374,7 @@ pub(super) async fn handle_import_provider_profiles(
 async fn handle_import_provider_profiles_inner(
     state: &Arc<ServerState>,
     request: Request<ImportProviderProfilesRequest>,
+    committed_profiles: &mut Vec<String>,
 ) -> Result<Response<ImportProviderProfilesResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let request = request.into_inner();
@@ -2432,6 +2443,7 @@ async fn handle_import_provider_profiles_inner(
             )
             .await
             .map_err(|e| Status::internal(format!("persist provider profile failed: {e}")))?;
+        committed_profiles.push(stored.object_id().to_string());
         if let Some(metadata) = stored.metadata.as_mut() {
             metadata.resource_version = result.resource_version;
         }
@@ -3561,40 +3573,45 @@ pub(super) async fn handle_configure_provider_refresh(
     let credential_key = req.credential_key.trim().to_string();
     let strategy = crate::provider_refresh::refresh_strategy_name(req.strategy);
 
-    let result = handle_configure_provider_refresh_inner(state, request).await;
+    let mut committed = false;
+    let result = handle_configure_provider_refresh_inner(state, request, &mut committed).await;
 
     // Identity fields only — refresh material and secret key names never
     // enter the audit record.
-    audit::emit_entity_outcome(
-        &state.config.audit,
-        &result,
-        audit::EntityOutcome {
-            activity: EntityActivityId::Update,
-            entity: ManagedEntity::new("provider_refresh", format!("{provider}/{credential_key}")),
-            sandbox: None,
-            principal: &principal,
-            request_id: request_id.as_deref(),
-            success_message: format!("provider refresh configured for {provider}/{credential_key}"),
-            failure_message: format!(
-                "provider refresh configure for {provider}/{credential_key} failed"
+    let outcome = audit::EntityOutcome {
+        activity: EntityActivityId::Update,
+        entity: ManagedEntity::new("provider_refresh", format!("{provider}/{credential_key}")),
+        sandbox: None,
+        principal: &principal,
+        request_id: request_id.as_deref(),
+        success_message: format!("provider refresh configured for {provider}/{credential_key}"),
+        failure_message: format!(
+            "provider refresh configure for {provider}/{credential_key} failed"
+        ),
+        unmapped: vec![
+            ("workspace", serde_json::Value::from(workspace)),
+            ("provider", serde_json::Value::from(provider.clone())),
+            (
+                "credential_key",
+                serde_json::Value::from(credential_key.clone()),
             ),
-            unmapped: vec![
-                ("workspace", serde_json::Value::from(workspace)),
-                ("provider", serde_json::Value::from(provider.clone())),
-                (
-                    "credential_key",
-                    serde_json::Value::from(credential_key.clone()),
-                ),
-                ("strategy", serde_json::Value::from(strategy)),
-            ],
-        },
-    );
+            ("strategy", serde_json::Value::from(strategy)),
+        ],
+    };
+    if committed && result.is_err() {
+        // The refresh state was durably written before a later step failed —
+        // the audit trail records the state change, not the RPC status.
+        audit::emit_entity(&state.config.audit, true, outcome);
+    } else {
+        audit::emit_entity_outcome(&state.config.audit, &result, outcome);
+    }
     result
 }
 
 async fn handle_configure_provider_refresh_inner(
     state: &Arc<ServerState>,
     request: Request<ConfigureProviderRefreshRequest>,
+    committed: &mut bool,
 ) -> Result<Response<ConfigureProviderRefreshResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let request = request.into_inner();
@@ -3860,6 +3877,9 @@ async fn handle_configure_provider_refresh_inner(
         state_record.last_refresh_at_ms = existing.last_refresh_at_ms;
     }
     crate::provider_refresh::put_refresh_state(state.store.as_ref(), &state_record).await?;
+    // The refresh configuration is durable from here; the audit event must
+    // record it even if the expiry propagation below fails.
+    *committed = true;
 
     if let Some(expires_at_ms) = request.expires_at_ms {
         let updated = Provider {
@@ -4011,40 +4031,47 @@ pub(super) async fn handle_delete_provider_refresh(
     let provider = req.provider.trim().to_string();
     let credential_key = req.credential_key.trim().to_string();
 
-    let result = handle_delete_provider_refresh_inner(state, request).await;
+    let mut committed = false;
+    let result = handle_delete_provider_refresh_inner(state, request, &mut committed).await;
 
     // A no-op delete (no refresh configured) is not a state change — judge
     // success from the response's `deleted` flag.
-    audit::emit_entity_outcome_judged(
-        &state.config.audit,
-        &result,
-        |response| response.deleted,
-        audit::EntityOutcome {
-            activity: EntityActivityId::Delete,
-            entity: ManagedEntity::new("provider_refresh", format!("{provider}/{credential_key}")),
-            sandbox: None,
-            principal: &principal,
-            request_id: request_id.as_deref(),
-            success_message: format!("provider refresh deleted for {provider}/{credential_key}"),
-            failure_message: format!(
-                "provider refresh delete for {provider}/{credential_key} failed"
+    let outcome = audit::EntityOutcome {
+        activity: EntityActivityId::Delete,
+        entity: ManagedEntity::new("provider_refresh", format!("{provider}/{credential_key}")),
+        sandbox: None,
+        principal: &principal,
+        request_id: request_id.as_deref(),
+        success_message: format!("provider refresh deleted for {provider}/{credential_key}"),
+        failure_message: format!("provider refresh delete for {provider}/{credential_key} failed"),
+        unmapped: vec![
+            ("workspace", serde_json::Value::from(workspace)),
+            ("provider", serde_json::Value::from(provider.clone())),
+            (
+                "credential_key",
+                serde_json::Value::from(credential_key.clone()),
             ),
-            unmapped: vec![
-                ("workspace", serde_json::Value::from(workspace)),
-                ("provider", serde_json::Value::from(provider.clone())),
-                (
-                    "credential_key",
-                    serde_json::Value::from(credential_key.clone()),
-                ),
-            ],
-        },
-    );
+        ],
+    };
+    if committed && result.is_err() {
+        // The refresh state was durably deleted before a later step failed —
+        // the audit trail records the state change, not the RPC status.
+        audit::emit_entity(&state.config.audit, true, outcome);
+    } else {
+        audit::emit_entity_outcome_judged(
+            &state.config.audit,
+            &result,
+            |response| response.deleted,
+            outcome,
+        );
+    }
     result
 }
 
 async fn handle_delete_provider_refresh_inner(
     state: &Arc<ServerState>,
     request: Request<DeleteProviderRefreshRequest>,
+    committed: &mut bool,
 ) -> Result<Response<DeleteProviderRefreshResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let request = request.into_inner();
@@ -4087,6 +4114,9 @@ async fn handle_delete_provider_refresh_inner(
         credential_key,
     )
     .await?;
+    // The primary state change is durable from here; the audit event must
+    // record it even if the expiry cleanup below fails.
+    *committed = deleted_refresh_state;
 
     // A refresh co-manages the expiry of its primary credential and every pinned
     // additional output. Clear each expiry this refresh still owns, leaving

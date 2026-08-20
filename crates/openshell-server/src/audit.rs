@@ -243,8 +243,8 @@ pub struct AuthnOutcome<'a> {
     /// `local_dev`, `none`).
     pub mechanism: &'a str,
     /// Low-cardinality failure category (`rejected_credential`,
-    /// `missing_credentials`, `missing_client_certificate`, `anonymous`).
-    /// `None` for successes.
+    /// `authenticator_error`, `missing_credentials`,
+    /// `missing_client_certificate`, `anonymous`). `None` for successes.
     pub reason: Option<&'a str>,
     /// Gateway-authored status message for failures.
     pub detail: Option<&'a str>,

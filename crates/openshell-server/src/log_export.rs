@@ -27,8 +27,18 @@
 //!
 //! Loss therefore remains possible — under outage the gateway prefers bounded
 //! memory over unbounded buffering — but it is always visible and alertable
-//! downstream. Crash durability (a disk spool with acknowledged checkpoints) is
-//! Phase 2.
+//! downstream, with two disclosed exceptions:
+//!
+//! - **Shutdown**: the final flush attempts each remaining batch once; if the
+//!   collector is down at exit, what is still queued is lost with no gap
+//!   record (there is no later export to carry one). `architecture/logging.md`
+//!   lists this in the loss matrix.
+//! - **Duplicates**: delivery is at-least-once. An export whose response is
+//!   lost after the collector committed the batch is retried, so consumers
+//!   must tolerate occasional duplicate records (they carry no idempotency
+//!   id).
+//!
+//! Crash durability (a disk spool with acknowledged checkpoints) is Phase 2.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};

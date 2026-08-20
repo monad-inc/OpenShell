@@ -983,6 +983,13 @@ async fn handle_delete_sandbox_inner(
         sandbox_name = %name,
         "DeleteSandbox request completed successfully"
     );
+    if result.deleted {
+        // The audit/info lines above re-created this sandbox's tail entry
+        // after compute's cleanup (the export tap has already captured
+        // them); drop it again so deleted sandboxes don't leak tail state
+        // for the gateway's lifetime.
+        state.tracing_log_bus.remove(&result.sandbox_id);
+    }
     Ok(Response::new(DeleteSandboxResponse {
         deleted: result.deleted,
     }))
@@ -1468,17 +1475,21 @@ pub(super) async fn handle_exec_sandbox(
     if req.sandbox_id.is_empty() {
         return Err(Status::invalid_argument("sandbox_id is required"));
     }
-    if req.command.is_empty() {
-        return Err(Status::invalid_argument("command is required"));
-    }
-    if req.environment.keys().any(|key| !is_valid_env_key(key)) {
-        return Err(Status::invalid_argument(
-            "environment keys must match ^[A-Za-z_][A-Za-z0-9_]*$",
-        ));
-    }
-    validate_exec_request_fields(&req)?;
 
     let setup = async {
+        // Field validation lives inside the audited setup block so a
+        // malformed exec attempt leaves the same Failure record as a
+        // rejected well-formed one.
+        if req.command.is_empty() {
+            return Err(Status::invalid_argument("command is required"));
+        }
+        if req.environment.keys().any(|key| !is_valid_env_key(key)) {
+            return Err(Status::invalid_argument(
+                "environment keys must match ^[A-Za-z_][A-Za-z0-9_]*$",
+            ));
+        }
+        validate_exec_request_fields(&req)?;
+
         let sandbox = fetch_and_authorize_sandbox(state, &principal, &req.sandbox_id).await?;
 
         if SandboxPhase::try_from(sandbox.phase()).ok() != Some(SandboxPhase::Ready) {
@@ -1637,14 +1648,21 @@ pub(super) async fn handle_forward_tcp(
         ));
     };
 
-    let target = validate_tcp_forward_init(&init)?;
-    // Non-secret target description for the audit record.
+    // Validation failures flow into the audited setup result below so a
+    // malformed forward attempt leaves the same Failure record as a
+    // rejected well-formed one.
+    let target = validate_tcp_forward_init(&init);
+    // Non-secret target description for the audit record. The host is
+    // loopback-validated but distinct values (127.0.0.2 vs 127.0.0.1) are
+    // meaningful, so record it alongside the port.
     let target_label = match &target {
-        relay_open::Target::Ssh(_) => "ssh".to_string(),
-        relay_open::Target::Tcp(tcp) => format!("tcp:{}", tcp.port),
+        Ok(relay_open::Target::Ssh(_)) => "ssh".to_string(),
+        Ok(relay_open::Target::Tcp(tcp)) => format!("tcp:{}:{}", tcp.host, tcp.port),
+        Err(_) => "invalid".to_string(),
     };
 
     let setup = async {
+        let target = target?;
         let sandbox = fetch_and_authorize_sandbox(state, &principal, &init.sandbox_id).await?;
 
         if SandboxPhase::try_from(sandbox.phase()).ok() != Some(SandboxPhase::Ready) {
@@ -1976,7 +1994,11 @@ async fn bridge_forward_tcp_stream(
 // Interactive exec handler (bidirectional stdin streaming)
 // ---------------------------------------------------------------------------
 
-fn validate_interactive_exec_start(
+/// Extract the start request from the first stream message. Only the
+/// degenerate cases with nothing to attribute are rejected here — field
+/// validation happens inside the audited setup block so malformed attempts
+/// leave a Failure record.
+fn extract_interactive_exec_start(
     msg: Option<ExecSandboxInput>,
 ) -> Result<ExecSandboxRequest, Status> {
     use openshell_core::proto::exec_sandbox_input::Payload;
@@ -1993,6 +2015,11 @@ fn validate_interactive_exec_start(
     if req.sandbox_id.is_empty() {
         return Err(Status::invalid_argument("sandbox_id is required"));
     }
+
+    Ok(req)
+}
+
+fn validate_interactive_exec_fields(req: &ExecSandboxRequest) -> Result<(), Status> {
     if req.command.is_empty() {
         return Err(Status::invalid_argument("command is required"));
     }
@@ -2001,9 +2028,7 @@ fn validate_interactive_exec_start(
             "environment keys must match ^[A-Za-z_][A-Za-z0-9_]*$",
         ));
     }
-    validate_exec_request_fields(&req)?;
-
-    Ok(req)
+    validate_exec_request_fields(req)
 }
 
 pub(super) async fn handle_exec_sandbox_interactive(
@@ -2021,9 +2046,10 @@ pub(super) async fn handle_exec_sandbox_interactive(
         .await
         .map_err(|e| Status::internal(format!("failed to read first message: {e}")))?;
 
-    let req = validate_interactive_exec_start(first_msg)?;
+    let req = extract_interactive_exec_start(first_msg)?;
 
     let setup = async {
+        validate_interactive_exec_fields(&req)?;
         let sandbox = fetch_and_authorize_sandbox(state, &principal, &req.sandbox_id).await?;
 
         if SandboxPhase::try_from(sandbox.phase()).ok() != Some(SandboxPhase::Ready) {
@@ -2360,6 +2386,13 @@ async fn handle_revoke_ssh_session_inner(
             e
         }
     })?;
+
+    // Already revoked: a no-op, not a fresh state change. Report it as
+    // such so the wrapper audits Failure instead of a duplicate Success —
+    // an investigator must be able to tell when revocation took effect.
+    if session.revoked {
+        return Ok(Response::new(RevokeSshSessionResponse { revoked: false }));
+    }
 
     let resource_version = session
         .metadata
@@ -3394,12 +3427,31 @@ mod tests {
                         "-H".to_string(),
                         "Authorization: Bearer sk-exec-arg".to_string(),
                     ],
+                    environment: HashMap::from([(
+                        "SECRET_ENV".to_string(),
+                        "sk-env-secret".to_string(),
+                    )]),
+                    stdin: b"sk-stdin-secret".to_vec(),
                     ..Default::default()
                 }),
             )
             .await
             .unwrap_err();
             assert_eq!(error.code(), tonic::Code::NotFound);
+
+            // Malformed request: rejected before any sandbox resolution, but
+            // still audited like any other exec rejection.
+            let error = handle_exec_sandbox(
+                &state,
+                authed_request(ExecSandboxRequest {
+                    sandbox_id: "sandbox-audit-sb".to_string(),
+                    command: Vec::new(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
 
             handle_revoke_ssh_session(
                 &state,
@@ -3409,6 +3461,17 @@ mod tests {
             )
             .await
             .unwrap();
+
+            // Re-revoking the same token is a no-op, not a fresh revocation.
+            let response = handle_revoke_ssh_session(
+                &state,
+                authed_request(RevokeSshSessionRequest {
+                    token: token.clone(),
+                }),
+            )
+            .await
+            .unwrap();
+            assert!(!response.get_ref().revoked);
 
             // Detaching a provider that was never attached: Ok(detached=false).
             let response = handle_detach_sandbox_provider(
@@ -3456,7 +3519,7 @@ mod tests {
                 .collect()
         };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while audit_records().len() < 4 {
+        while audit_records().len() < 6 {
             assert!(
                 std::time::Instant::now() < deadline,
                 "audit records never arrived"
@@ -3485,12 +3548,27 @@ mod tests {
         );
         assert!(exec_route.is_none(), "rejections ride the gateway lane");
 
-        let (revoke, _) = &records[2];
+        let (malformed_exec, malformed_route) = &records[2];
+        assert_eq!(malformed_exec["status"], "Failure");
+        assert_eq!(malformed_exec["unmapped"]["operation"], "exec");
+        assert!(
+            malformed_route.is_none(),
+            "malformed exec attempts are audited on the gateway lane"
+        );
+
+        let (revoke, _) = &records[3];
         assert_eq!(revoke["entity"]["type"], "ssh_session");
         assert_eq!(revoke["unmapped"]["operation"], "revoke");
         assert_eq!(revoke["status"], "Success");
 
-        let (detach, _) = &records[3];
+        let (re_revoke, _) = &records[4];
+        assert_eq!(re_revoke["unmapped"]["operation"], "revoke");
+        assert_eq!(
+            re_revoke["status"], "Failure",
+            "re-revoking an already-revoked session is a no-op, not a fresh revocation"
+        );
+
+        let (detach, _) = &records[5];
         assert_eq!(detach["unmapped"]["operation"], "detach_provider");
         assert_eq!(
             detach["status"], "Failure",
@@ -3498,9 +3576,18 @@ mod tests {
         );
 
         for (record, _) in &records {
+            let rendered = record.to_string();
             assert!(
-                !record.to_string().contains(&token),
+                !rendered.contains(&token),
                 "ssh bearer token must never appear in any audit record"
+            );
+            assert!(
+                !rendered.contains("sk-env-secret") && !rendered.contains("SECRET_ENV"),
+                "environment variables must never appear in any audit record"
+            );
+            assert!(
+                !rendered.contains("sk-stdin-secret"),
+                "stdin must never appear in any audit record"
             );
         }
 
@@ -3927,11 +4014,11 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     }
 
-    // ---- validate_interactive_exec_start ----
+    // ---- extract_interactive_exec_start / validate_interactive_exec_fields ----
 
     #[test]
     fn interactive_exec_rejects_empty_stream() {
-        let err = validate_interactive_exec_start(None).unwrap_err();
+        let err = extract_interactive_exec_start(None).unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
         assert!(err.message().contains("expected start message"));
     }
@@ -3942,7 +4029,7 @@ mod tests {
         let msg = ExecSandboxInput {
             payload: Some(exec_sandbox_input::Payload::Stdin(b"hello".to_vec())),
         };
-        let err = validate_interactive_exec_start(Some(msg)).unwrap_err();
+        let err = extract_interactive_exec_start(Some(msg)).unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
         assert!(err.message().contains("start payload"));
     }
@@ -3955,7 +4042,7 @@ mod tests {
                 ExecSandboxWindowResize { cols: 80, rows: 24 },
             )),
         };
-        let err = validate_interactive_exec_start(Some(msg)).unwrap_err();
+        let err = extract_interactive_exec_start(Some(msg)).unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
         assert!(err.message().contains("start payload"));
     }
@@ -3963,7 +4050,7 @@ mod tests {
     #[test]
     fn interactive_exec_rejects_none_payload() {
         let msg = ExecSandboxInput { payload: None };
-        let err = validate_interactive_exec_start(Some(msg)).unwrap_err();
+        let err = extract_interactive_exec_start(Some(msg)).unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 
@@ -3976,7 +4063,7 @@ mod tests {
                 ..Default::default()
             })),
         };
-        let err = validate_interactive_exec_start(Some(msg)).unwrap_err();
+        let err = extract_interactive_exec_start(Some(msg)).unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
         assert!(err.message().contains("sandbox_id"));
     }
@@ -3990,7 +4077,8 @@ mod tests {
                 ..Default::default()
             })),
         };
-        let err = validate_interactive_exec_start(Some(msg)).unwrap_err();
+        let req = extract_interactive_exec_start(Some(msg)).unwrap();
+        let err = validate_interactive_exec_fields(&req).unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
         assert!(err.message().contains("command"));
     }
@@ -4006,7 +4094,8 @@ mod tests {
                 ..Default::default()
             })),
         };
-        let err = validate_interactive_exec_start(Some(msg)).unwrap_err();
+        let req = extract_interactive_exec_start(Some(msg)).unwrap();
+        let err = validate_interactive_exec_fields(&req).unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
         assert!(err.message().contains("environment"));
     }
@@ -4024,7 +4113,8 @@ mod tests {
                 ..Default::default()
             })),
         };
-        let req = validate_interactive_exec_start(Some(msg)).unwrap();
+        let req = extract_interactive_exec_start(Some(msg)).unwrap();
+        validate_interactive_exec_fields(&req).unwrap();
         assert_eq!(req.sandbox_id, "test-id");
         assert_eq!(req.command, vec!["bash"]);
         assert!(req.tty);
