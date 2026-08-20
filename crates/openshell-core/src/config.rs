@@ -439,6 +439,9 @@ pub struct Config {
     /// Gateway user authentication behavior.
     pub auth: GatewayAuthConfig,
 
+    /// Gateway audit event depth toggles.
+    pub audit: GatewayAuditConfig,
+
     /// Disabled-by-default gateway interceptor service configs.
     pub gateway_interceptors: Vec<GatewayInterceptorConfig>,
 
@@ -615,6 +618,48 @@ pub struct GatewayAuthConfig {
     pub allow_unauthenticated_users: bool,
 }
 
+/// `[openshell.gateway.audit]` — gateway audit event depth toggles.
+///
+/// Audit events themselves are always on; these toggles trade record detail
+/// (or volume, for authentication successes) against privacy and throughput.
+/// Keys matching known credential patterns are redacted from settings audit
+/// events regardless of `settings_values`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayAuditConfig {
+    /// Also emit an Authentication event for every successfully
+    /// authenticated request, producing a complete authentication ledger.
+    /// Off by default: failures are always emitted, successes multiply
+    /// volume by the request rate.
+    #[serde(default)]
+    pub auth_success_events: bool,
+
+    /// Record the full command line in sandbox exec audit events. When
+    /// `false`, the record carries only the binary name — for deployments
+    /// whose command lines may contain secrets.
+    #[serde(default = "default_true")]
+    pub exec_args: bool,
+
+    /// Record before/after values of changed settings in settings audit
+    /// events. When `false`, only the key names are recorded.
+    #[serde(default = "default_true")]
+    pub settings_values: bool,
+}
+
+impl Default for GatewayAuditConfig {
+    fn default() -> Self {
+        Self {
+            auth_success_events: false,
+            exec_args: true,
+            settings_values: true,
+        }
+    }
+}
+
+const fn default_true() -> bool {
+    true
+}
+
 /// One configured gateway interceptor service.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -782,6 +827,7 @@ impl Config {
             tls,
             oidc: None,
             auth: GatewayAuthConfig::default(),
+            audit: GatewayAuditConfig::default(),
             gateway_interceptors: Vec::new(),
             provider_profile_sources: vec![
                 GatewayProviderProfileSourceConfig::Builtin,

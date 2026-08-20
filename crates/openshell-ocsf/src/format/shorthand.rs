@@ -509,7 +509,13 @@ impl OcsfEvent {
                     })
                     .unwrap_or_default();
 
-                format!("CONFIG:{state} {sev} {what}{suffix}")
+                let actor_str = e
+                    .actor
+                    .as_ref()
+                    .and_then(|a| a.user.as_ref())
+                    .map(|u| format!(" by {}", u.name))
+                    .unwrap_or_default();
+                format!("CONFIG:{state} {sev} {what}{suffix}{actor_str}")
             }
 
             Self::Base(e) => {
@@ -1230,6 +1236,7 @@ mod tests {
             state_custom_label: Some("LOADED".to_string()),
             security_level: None,
             prev_security_level: None,
+            actor: None,
         });
 
         let shorthand = event.format_shorthand();
@@ -1259,6 +1266,7 @@ mod tests {
             state_custom_label: Some("APPROVED".to_string()),
             security_level: None,
             prev_security_level: None,
+            actor: None,
         });
 
         let shorthand = event.format_shorthand();

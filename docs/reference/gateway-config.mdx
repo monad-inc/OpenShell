@@ -155,6 +155,12 @@ allow_unauthenticated_users = false
 [openshell.gateway.mtls_auth]
 enabled = false
 
+# Audit event depth toggles. Omit the table to keep the defaults shown here.
+[openshell.gateway.audit]
+auth_success_events = false
+exec_args           = true
+settings_values     = true
+
 # OTLP export. Omit this table entirely to disable it.
 [openshell.gateway.otlp]
 endpoint     = "http://otel-collector.observability.svc:4317"
@@ -307,6 +313,23 @@ OTEL_TRACES_SAMPLER=parentbased_traceidratio OTEL_TRACES_SAMPLER_ARG=0.1
 `OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` are deliberately ignored. Enablement has one source, so an environment variable cannot silently turn export on or redirect it. `OTEL_RESOURCE_ATTRIBUTES` does apply and adds attributes, but a `service_name` set here wins over `OTEL_SERVICE_NAME`.
 
 The gateway flushes buffered spans during shutdown, so spans from in-flight requests survive a `SIGTERM`.
+
+## Audit Events
+
+The gateway emits an OCSF audit event for every state-changing operation — workspace, member, provider, sandbox, credential, policy, and settings mutations — carrying the authenticated principal as the actor. Audit events are always on and ride the same export pipeline as other gateway events. `[openshell.gateway.audit]` controls their depth, not their existence; omit the table to keep the defaults.
+
+```toml
+[openshell.gateway.audit]
+auth_success_events = false  # emit an event per authenticated request too
+exec_args           = true   # record full command lines in exec audit events
+settings_values     = true   # record before/after values in settings audit events
+```
+
+`auth_success_events` adds a success event for every authenticated request, producing a complete authentication ledger for deployments that accept the volume. Authentication failures are always emitted.
+
+`exec_args = false` reduces sandbox exec audit records to the binary name. Use it when command lines may carry secrets.
+
+`settings_values = false` reduces settings audit records to the changed key names. Regardless of this toggle, values under keys matching credential patterns are always redacted.
 
 ## Supervisor Middleware Services
 

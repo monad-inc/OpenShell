@@ -18,10 +18,13 @@ use openshell_core::proto::{
     SshSession, StoredProviderCredentialRefreshState, StoredProviderProfile, Workspace,
     WorkspaceMember, WorkspaceRole,
 };
+use openshell_ocsf::enums::EntityActivityId;
+use openshell_ocsf::objects::ManagedEntity;
 use prost::Message;
 use tonic::{Request, Response, Status};
 
 use crate::ServerState;
+use crate::audit;
 use crate::auth::principal::Principal;
 use crate::auth::workspace_authz::{AuthGrant, MinWorkspaceRole, authorize_workspace};
 use crate::persistence::{
@@ -140,6 +143,42 @@ pub async fn resolve_workspace(
 }
 
 pub(super) async fn handle_create_workspace(
+    state: &Arc<ServerState>,
+    request: Request<CreateWorkspaceRequest>,
+) -> Result<Response<CreateWorkspaceResponse>, Status> {
+    let principal = audit::principal(&request);
+    let request_id = audit::request_id(&request);
+    let name = request.get_ref().name.clone();
+
+    let result = handle_create_workspace_inner(state, request).await;
+
+    let uid = result.as_ref().ok().and_then(|resp| {
+        resp.get_ref()
+            .workspace
+            .as_ref()
+            .and_then(|w| w.metadata.as_ref())
+            .map(|m| m.id.clone())
+    });
+    audit::emit_entity_outcome(
+        &result,
+        audit::EntityOutcome {
+            activity: EntityActivityId::Create,
+            entity: ManagedEntity {
+                entity_type: WORKSPACE_OBJECT_TYPE.to_string(),
+                uid,
+                name: Some(name.clone()),
+            },
+            principal: &principal,
+            request_id: request_id.as_deref(),
+            success_message: format!("workspace {name} created"),
+            failure_message: format!("workspace {name} create failed"),
+            unmapped: Vec::new(),
+        },
+    );
+    result
+}
+
+async fn handle_create_workspace_inner(
     state: &Arc<ServerState>,
     request: Request<CreateWorkspaceRequest>,
 ) -> Result<Response<CreateWorkspaceResponse>, Status> {
@@ -285,6 +324,35 @@ pub(super) async fn handle_list_workspaces(
 }
 
 pub(super) async fn handle_delete_workspace(
+    state: &Arc<ServerState>,
+    request: Request<DeleteWorkspaceRequest>,
+) -> Result<Response<DeleteWorkspaceResponse>, Status> {
+    let principal = audit::principal(&request);
+    let request_id = audit::request_id(&request);
+    let name = request.get_ref().name.clone();
+
+    let result = handle_delete_workspace_inner(state, request).await;
+
+    audit::emit_entity_outcome(
+        &result,
+        audit::EntityOutcome {
+            activity: EntityActivityId::Delete,
+            entity: ManagedEntity {
+                entity_type: WORKSPACE_OBJECT_TYPE.to_string(),
+                uid: None,
+                name: Some(name.clone()),
+            },
+            principal: &principal,
+            request_id: request_id.as_deref(),
+            success_message: format!("workspace {name} deleted"),
+            failure_message: format!("workspace {name} delete failed"),
+            unmapped: Vec::new(),
+        },
+    );
+    result
+}
+
+async fn handle_delete_workspace_inner(
     state: &Arc<ServerState>,
     request: Request<DeleteWorkspaceRequest>,
 ) -> Result<Response<DeleteWorkspaceResponse>, Status> {
@@ -438,7 +506,55 @@ pub(super) async fn handle_delete_workspace(
     Ok(Response::new(DeleteWorkspaceResponse { deleted }))
 }
 
+/// Normalize a request's workspace field the way `resolve_workspace` does, so
+/// audit events name the workspace the mutation actually targeted.
+pub(super) fn audit_workspace_name(workspace: &str) -> &str {
+    if workspace.is_empty() {
+        DEFAULT_WORKSPACE_NAME
+    } else {
+        workspace
+    }
+}
+
 pub(super) async fn handle_add_workspace_member(
+    state: &Arc<ServerState>,
+    request: Request<AddWorkspaceMemberRequest>,
+) -> Result<Response<AddWorkspaceMemberResponse>, Status> {
+    let principal = audit::principal(&request);
+    let request_id = audit::request_id(&request);
+    let req = request.get_ref();
+    let subject = req.principal_subject.clone();
+    let workspace = audit_workspace_name(&req.workspace).to_string();
+    let role = WorkspaceRole::try_from(req.role)
+        .ok()
+        .and_then(|r| match r {
+            WorkspaceRole::User => Some("user"),
+            WorkspaceRole::Admin => Some("admin"),
+            WorkspaceRole::Unspecified => None,
+        });
+
+    let result = handle_add_workspace_member_inner(state, request).await;
+
+    let mut unmapped = vec![("workspace", serde_json::Value::from(workspace.clone()))];
+    if let Some(role) = role {
+        unmapped.push(("role", serde_json::Value::from(role)));
+    }
+    audit::emit_entity_outcome(
+        &result,
+        audit::EntityOutcome {
+            activity: EntityActivityId::Create,
+            entity: ManagedEntity::new(WorkspaceMember::object_type(), subject.clone()),
+            principal: &principal,
+            request_id: request_id.as_deref(),
+            success_message: format!("member {subject} added to workspace {workspace}"),
+            failure_message: format!("member {subject} add to workspace {workspace} failed"),
+            unmapped,
+        },
+    );
+    result
+}
+
+async fn handle_add_workspace_member_inner(
     state: &Arc<ServerState>,
     request: Request<AddWorkspaceMemberRequest>,
 ) -> Result<Response<AddWorkspaceMemberResponse>, Status> {
@@ -548,6 +664,33 @@ pub(super) async fn handle_remove_workspace_member(
     state: &Arc<ServerState>,
     request: Request<RemoveWorkspaceMemberRequest>,
 ) -> Result<Response<RemoveWorkspaceMemberResponse>, Status> {
+    let principal = audit::principal(&request);
+    let request_id = audit::request_id(&request);
+    let req = request.get_ref();
+    let subject = req.principal_subject.clone();
+    let workspace = audit_workspace_name(&req.workspace).to_string();
+
+    let result = handle_remove_workspace_member_inner(state, request).await;
+
+    audit::emit_entity_outcome(
+        &result,
+        audit::EntityOutcome {
+            activity: EntityActivityId::Delete,
+            entity: ManagedEntity::new(WorkspaceMember::object_type(), subject.clone()),
+            principal: &principal,
+            request_id: request_id.as_deref(),
+            success_message: format!("member {subject} removed from workspace {workspace}"),
+            failure_message: format!("member {subject} remove from workspace {workspace} failed"),
+            unmapped: vec![("workspace", serde_json::Value::from(workspace.clone()))],
+        },
+    );
+    result
+}
+
+async fn handle_remove_workspace_member_inner(
+    state: &Arc<ServerState>,
+    request: Request<RemoveWorkspaceMemberRequest>,
+) -> Result<Response<RemoveWorkspaceMemberResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
 
@@ -617,6 +760,117 @@ mod tests {
     use tonic::{Code, Request};
 
     use crate::grpc::test_support::{authed_request, test_server_state};
+
+    /// Workspace mutations must leave an audit trail: 3004 events with the
+    /// authenticated actor, entity identity, and request correlation, routed
+    /// onto the gateway export lane (no `sandbox.id`). Exercises create,
+    /// membership add (with the workspace in `unmapped`), and an audited
+    /// failure (deleting the default workspace).
+    #[tokio::test]
+    async fn workspace_mutations_emit_entity_audit_events() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let exporter = opentelemetry_sdk::logs::InMemoryLogExporter::default();
+        let (handle, worker) = crate::log_export::spawn(
+            exporter.clone(),
+            opentelemetry_sdk::Resource::builder_empty().build(),
+            true,
+        );
+        let bus = crate::tracing_bus::TracingLogBus::new();
+        bus.set_export(handle);
+        let state = test_server_state().await;
+
+        {
+            let subscriber = tracing_subscriber::registry().with(bus.layer());
+            let _guard = crate::otel_tracing::test_exporter::install_scoped(subscriber);
+
+            let mut request = authed_request(CreateWorkspaceRequest {
+                name: "audit-ws".to_string(),
+                labels: HashMap::new(),
+            });
+            request
+                .metadata_mut()
+                .insert("x-request-id", "req-42".parse().unwrap());
+            handle_create_workspace(&state, request).await.unwrap();
+
+            handle_add_workspace_member(
+                &state,
+                authed_request(AddWorkspaceMemberRequest {
+                    workspace: "audit-ws".to_string(),
+                    principal_subject: "bob".to_string(),
+                    role: WorkspaceRole::User.into(),
+                }),
+            )
+            .await
+            .unwrap();
+
+            let error = handle_delete_workspace(
+                &state,
+                authed_request(DeleteWorkspaceRequest {
+                    name: DEFAULT_WORKSPACE_NAME.to_string(),
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code(), Code::FailedPrecondition);
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while exporter.get_emitted_logs().unwrap().len() < 3 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "audit records never arrived"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let emitted = exporter.get_emitted_logs().unwrap();
+        let raw_json = |record: &opentelemetry_sdk::logs::SdkLogRecord| {
+            let raw = record
+                .attributes_iter()
+                .find(|(k, _)| k.as_str() == "ocsf.raw")
+                .map(|(_, v)| v.clone())
+                .expect("ocsf.raw attribute");
+            let opentelemetry::logs::AnyValue::String(raw) = raw else {
+                panic!("ocsf.raw should be a string");
+            };
+            serde_json::from_str::<serde_json::Value>(raw.as_str()).unwrap()
+        };
+
+        let create = &emitted[0].record;
+        assert!(
+            !create
+                .attributes_iter()
+                .any(|(k, _)| k.as_str() == "sandbox.id"),
+            "gateway audit events carry no sandbox.id"
+        );
+        let create_json = raw_json(create);
+        assert_eq!(create_json["class_uid"], 3004);
+        assert_eq!(create_json["activity_id"], 1);
+        assert_eq!(create_json["entity"]["type"], "workspace");
+        assert_eq!(create_json["entity"]["name"], "audit-ws");
+        assert!(
+            create_json["entity"]["uid"]
+                .as_str()
+                .is_some_and(|uid| !uid.is_empty()),
+            "created entity carries its store id"
+        );
+        assert_eq!(create_json["actor"]["user"]["uid"], "dev-user");
+        assert_eq!(create_json["unmapped"]["request_id"], "req-42");
+        assert_eq!(create_json["status"], "Success");
+
+        let member_json = raw_json(&emitted[1].record);
+        assert_eq!(member_json["entity"]["type"], "workspace_member");
+        assert_eq!(member_json["entity"]["uid"], "bob");
+        assert_eq!(member_json["unmapped"]["workspace"], "audit-ws");
+        assert_eq!(member_json["unmapped"]["role"], "user");
+
+        let delete_json = raw_json(&emitted[2].record);
+        assert_eq!(delete_json["activity_id"], 4);
+        assert_eq!(delete_json["entity"]["name"], "default");
+        assert_eq!(delete_json["status"], "Failure");
+
+        worker.shutdown().await;
+    }
 
     #[tokio::test]
     async fn create_workspace_returns_metadata() {

@@ -386,6 +386,23 @@ server:
     # the human-readable summary. No effect unless exportLogs is true.
     ocsfFullPayload: false
 
+  # Gateway audit event depth toggles. Renders the [openshell.gateway.audit]
+  # table only when a value differs from the gateway's built-in default.
+  # Audit events themselves are always on.
+  audit:
+    # -- Also emit an Authentication event for every successfully
+    # authenticated request, producing a complete authentication ledger.
+    # Failures are always emitted; successes multiply volume by request rate.
+    authSuccessEvents: false
+    # -- Record the full command line in sandbox exec audit events. Set false
+    # for deployments whose command lines may carry secrets; records then
+    # carry only the binary name.
+    execArgs: true
+    # -- Record before/after values of changed settings in settings audit
+    # events. Set false to record key names only. Keys matching credential
+    # patterns are always redacted regardless of this toggle.
+    settingsValues: true
+
 # NetworkPolicy restricting SSH ingress on sandbox pods to the gateway only.
 networkPolicy:
   # -- Create a NetworkPolicy restricting SSH ingress on sandbox pods to the gateway.

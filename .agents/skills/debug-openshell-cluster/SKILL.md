@@ -142,6 +142,19 @@ rather than expecting a startup crash.
 rg -n 'otlp|endpoint|export_logs' /etc/openshell/gateway.toml
 ```
 
+Gateway audit events (OCSF Entity Management / Config State Change records
+for every state-changing RPC, with the authenticated principal as actor) are
+always on. The `[openshell.gateway.audit]` table (Helm `server.audit.*`)
+tunes their depth only: `auth_success_events` adds per-request authentication
+success events, `exec_args = false` strips exec command lines, and
+`settings_values = false` strips before/after setting values. Helm renders
+the table only when a toggle differs from its default, so its absence from
+`gateway.toml` means defaults.
+
+```shell
+rg -n 'audit|auth_success_events|exec_args|settings_values' /etc/openshell/gateway.toml
+```
+
 ### Step 4: Check Docker-Backed Gateways
 
 ```bash

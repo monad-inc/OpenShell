@@ -156,6 +156,144 @@ fn emit_policy_decision_failure(operation: PolicyDecisionOperation, rule_count: 
     );
 }
 
+/// One `update_config` settings mutation, captured for its audit event.
+struct SettingsAuditEvent<'a> {
+    /// `Some((sandbox_id, sandbox_name))` routes the event into that
+    /// sandbox's stream; `None` rides the gateway lane.
+    sandbox: Option<(&'a str, &'a str)>,
+    /// Request-named sandbox, for failure context when resolution never
+    /// happened. Redundant with `sandbox` on success paths.
+    sandbox_name: Option<&'a str>,
+    workspace: Option<&'a str>,
+    key: &'a str,
+    deleted: bool,
+    changed: bool,
+    success: bool,
+    before: Option<&'a StoredSettingValue>,
+    after: Option<&'a StoredSettingValue>,
+}
+
+/// A stored setting value as it appears in audit events. Bytes summarize to
+/// a length marker: the only Bytes setting is the policy payload, which has
+/// its own audit trail and would bloat every record here.
+fn stored_setting_audit_value(value: &StoredSettingValue) -> serde_json::Value {
+    match value {
+        StoredSettingValue::String(v) => serde_json::Value::from(v.clone()),
+        StoredSettingValue::Bool(v) => serde_json::Value::from(*v),
+        StoredSettingValue::Int(v) => serde_json::Value::from(*v),
+        StoredSettingValue::Bytes(hex) => {
+            serde_json::Value::from(format!("<{} bytes>", hex.len() / 2))
+        }
+    }
+}
+
+/// Build the Device Config State Change \[5019\] audit event for an
+/// `update_config` settings mutation.
+///
+/// Before/after values ride along when `settings_values` allows (the
+/// `[openshell.gateway.audit]` toggle, default on), and keys matching
+/// credential patterns are always redacted regardless of the toggle.
+fn build_update_config_settings_audit_event(
+    settings_values: bool,
+    principal: &Principal,
+    request_id: Option<&str>,
+    event: &SettingsAuditEvent<'_>,
+) -> OcsfEvent {
+    let scope = if event.workspace.is_some() {
+        "sandbox"
+    } else {
+        "global"
+    };
+    let action = if event.deleted { "delete" } else { "update" };
+    let key = event.key;
+    let message = if event.success {
+        format!("{scope} setting {key} {action}d")
+    } else {
+        format!("{scope} setting {key} {action} failed")
+    };
+
+    let sandbox_ctx;
+    let ctx = match event.sandbox {
+        Some((id, name)) => {
+            sandbox_ctx = crate::audit::ctx_for_sandbox(id, name);
+            &sandbox_ctx
+        }
+        None => crate::audit::ctx(),
+    };
+    let mut builder = ConfigStateChangeBuilder::new(ctx)
+        .state(
+            if event.deleted {
+                StateId::Disabled
+            } else {
+                StateId::Enabled
+            },
+            if event.deleted {
+                "setting_deleted"
+            } else {
+                "setting_updated"
+            },
+        )
+        .severity(SeverityId::Informational)
+        .status(if event.success {
+            StatusId::Success
+        } else {
+            StatusId::Failure
+        })
+        .actor_user(crate::audit::actor_user(principal))
+        .message(message)
+        .unmapped("scope", scope)
+        .unmapped("setting_key", key)
+        .unmapped("changed", event.changed);
+    if let Some(workspace) = event.workspace {
+        builder = builder.unmapped("workspace", workspace);
+    }
+    if let Some(name) = event.sandbox.map(|(_, name)| name).or(event.sandbox_name) {
+        builder = builder.unmapped("sandbox", name);
+    }
+    if settings_values {
+        let redacted = crate::audit::is_credential_like_key(key);
+        let render = |value: &StoredSettingValue| {
+            if redacted {
+                serde_json::Value::from("[REDACTED]")
+            } else {
+                stored_setting_audit_value(value)
+            }
+        };
+        if let Some(before) = event.before {
+            builder = builder.unmapped("before", render(before));
+        }
+        if let Some(after) = event.after {
+            builder = builder.unmapped("after", render(after));
+        }
+    }
+    if let Some(request_id) = request_id {
+        builder = builder.unmapped("request_id", request_id);
+    }
+
+    builder.build()
+}
+
+/// Emit the settings-mutation audit event once the outcome is known:
+/// sandbox-scoped mutations land in that sandbox's stream, global ones ride
+/// the gateway lane.
+fn emit_update_config_settings_audit(
+    state: &ServerState,
+    principal: &Principal,
+    request_id: Option<&str>,
+    event: &SettingsAuditEvent<'_>,
+) {
+    let built = build_update_config_settings_audit_event(
+        state.config.audit.settings_values,
+        principal,
+        request_id,
+        event,
+    );
+    match event.sandbox {
+        Some((id, _)) => crate::audit::emit_for_sandbox(id, built),
+        None => crate::audit::emit(built),
+    }
+}
+
 fn emit_gateway_policy_audit_log(
     sandbox_id: &str,
     sandbox_name: &str,
@@ -2296,12 +2434,48 @@ pub(super) async fn handle_update_config(
 ) -> Result<Response<UpdateConfigResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let sandbox_caller = matches!(&principal, Principal::Sandbox(_));
+    let request_id = crate::audit::request_id(&request);
     let update = request.get_ref();
     let should_emit_policy_failure = should_emit_config_update_policy_telemetry(sandbox_caller)
         && (update.policy.is_some() || !update.merge_operations.is_empty());
+    // Captured for the failure audit event; success paths emit inline where
+    // the before/after values are known.
+    let setting_audit = {
+        let key = update.setting_key.trim();
+        (!key.is_empty()).then(|| {
+            (
+                key.to_string(),
+                update.global,
+                update.delete_setting,
+                super::workspace::audit_workspace_name(&update.workspace).to_string(),
+                update.name.clone(),
+            )
+        })
+    };
     let result = handle_update_config_inner(state, request, &principal, sandbox_caller).await;
     if result.is_err() && should_emit_policy_failure {
         emit_sandbox_policy_update_failure();
+    }
+    if let Err(status) = &result
+        && let Some((key, global, deleted, workspace, name)) = &setting_audit
+        && crate::audit::audited_failure(status)
+    {
+        emit_update_config_settings_audit(
+            state,
+            &principal,
+            request_id.as_deref(),
+            &SettingsAuditEvent {
+                sandbox: None,
+                sandbox_name: (!global && !name.is_empty()).then_some(name.as_str()),
+                workspace: (!global).then_some(workspace.as_str()),
+                key,
+                deleted: *deleted,
+                changed: false,
+                success: false,
+                before: None,
+                after: None,
+            },
+        );
     }
     result
 }
@@ -2312,6 +2486,7 @@ async fn handle_update_config_inner(
     principal: &Principal,
     sandbox_caller: bool,
 ) -> Result<Response<UpdateConfigResponse>, Status> {
+    let request_id = crate::audit::request_id(&request);
     let req = request.into_inner();
     validate_annotations(&req.annotations, "annotations")?;
     let workspace = if req.global {
@@ -2502,6 +2677,8 @@ async fn handle_update_config_inner(
         let mut global_settings = load_global_settings(state.store.as_ref()).await?;
         let provider_composition_was_enabled =
             provider_policy_composition_enabled_in(&global_settings)?;
+        let audit_before = global_settings.settings.get(key).cloned();
+        let mut audit_after = None;
         let changed = if req.delete_setting {
             global_settings.settings.remove(key).is_some()
         } else {
@@ -2510,6 +2687,7 @@ async fn handle_update_config_inner(
                 .as_ref()
                 .ok_or_else(|| Status::invalid_argument("setting_value is required"))?;
             let stored = proto_setting_to_stored(key, setting)?;
+            audit_after = Some(stored.clone());
             upsert_setting_value(&mut global_settings.settings, key, stored)
         };
 
@@ -2536,6 +2714,23 @@ async fn handle_update_config_inner(
                     .await;
             }
         }
+
+        emit_update_config_settings_audit(
+            state,
+            principal,
+            request_id.as_deref(),
+            &SettingsAuditEvent {
+                sandbox: None,
+                sandbox_name: None,
+                workspace: None,
+                key,
+                deleted: req.delete_setting,
+                changed,
+                success: true,
+                before: audit_before.as_ref(),
+                after: audit_after.as_ref(),
+            },
+        );
 
         return Ok(update_config_response(
             0,
@@ -2584,7 +2779,8 @@ async fn handle_update_config_inner(
             let mut sandbox_settings =
                 load_sandbox_settings(state.store.as_ref(), &workspace, sandbox.object_name())
                     .await?;
-            let removed = sandbox_settings.settings.remove(key).is_some();
+            let removed_value = sandbox_settings.settings.remove(key);
+            let removed = removed_value.is_some();
             if removed {
                 sandbox_settings.revision = sandbox_settings.revision.wrapping_add(1);
                 save_sandbox_settings(
@@ -2604,6 +2800,23 @@ async fn handle_update_config_inner(
                 &response_annotations,
             )
             .await?;
+
+            emit_update_config_settings_audit(
+                state,
+                principal,
+                request_id.as_deref(),
+                &SettingsAuditEvent {
+                    sandbox: Some((&sandbox_id, sandbox.object_name())),
+                    sandbox_name: None,
+                    workspace: Some(&workspace),
+                    key,
+                    deleted: true,
+                    changed: removed,
+                    success: true,
+                    before: removed_value.as_ref(),
+                    after: None,
+                },
+            );
 
             return Ok(update_config_response(
                 0,
@@ -2628,6 +2841,8 @@ async fn handle_update_config_inner(
 
         let mut sandbox_settings =
             load_sandbox_settings(state.store.as_ref(), &workspace, sandbox.object_name()).await?;
+        let audit_before = sandbox_settings.settings.get(key).cloned();
+        let audit_after = stored.clone();
         let changed = upsert_setting_value(&mut sandbox_settings.settings, key, stored);
         if changed {
             sandbox_settings.revision = sandbox_settings.revision.wrapping_add(1);
@@ -2648,6 +2863,23 @@ async fn handle_update_config_inner(
             &response_annotations,
         )
         .await?;
+
+        emit_update_config_settings_audit(
+            state,
+            principal,
+            request_id.as_deref(),
+            &SettingsAuditEvent {
+                sandbox: Some((&sandbox_id, sandbox.object_name())),
+                sandbox_name: None,
+                workspace: Some(&workspace),
+                key,
+                deleted: false,
+                changed,
+                success: true,
+                before: audit_before.as_ref(),
+                after: Some(&audit_after),
+            },
+        );
 
         return Ok(update_config_response(
             0,
@@ -14069,6 +14301,283 @@ mod tests {
             StoredSettingValue::String("warn".to_string()),
         );
         assert!(changed);
+    }
+
+    // ---- Settings audit events ----
+
+    fn audit_test_principal() -> Principal {
+        Principal::User(UserPrincipal {
+            identity: Identity {
+                subject: "oidc|alice-123".to_string(),
+                display_name: Some("alice".to_string()),
+                roles: vec![],
+                scopes: vec![],
+                provider: IdentityProvider::Oidc,
+            },
+        })
+    }
+
+    #[test]
+    fn settings_audit_event_carries_values_actor_and_request_id() {
+        let before = StoredSettingValue::String("manual".to_string());
+        let after = StoredSettingValue::String("auto".to_string());
+        let event = build_update_config_settings_audit_event(
+            true,
+            &audit_test_principal(),
+            Some("req-7"),
+            &SettingsAuditEvent {
+                sandbox: None,
+                sandbox_name: None,
+                workspace: None,
+                key: "proposal_approval_mode",
+                deleted: false,
+                changed: true,
+                success: true,
+                before: Some(&before),
+                after: Some(&after),
+            },
+        );
+
+        let json = event.to_json().unwrap();
+        assert_eq!(json["class_uid"], 5019);
+        assert_eq!(json["state"], "setting_updated");
+        assert_eq!(json["actor"]["user"]["name"], "alice");
+        assert_eq!(json["actor"]["user"]["uid"], "oidc|alice-123");
+        assert_eq!(json["unmapped"]["scope"], "global");
+        assert_eq!(json["unmapped"]["setting_key"], "proposal_approval_mode");
+        assert_eq!(json["unmapped"]["changed"], true);
+        assert_eq!(json["unmapped"]["before"], "manual");
+        assert_eq!(json["unmapped"]["after"], "auto");
+        assert_eq!(json["unmapped"]["request_id"], "req-7");
+
+        let line = event.format_shorthand();
+        assert!(
+            line.starts_with(
+                "CONFIG:SETTING_UPDATED [INFO] global setting proposal_approval_mode updated"
+            ) && line.ends_with("by alice"),
+            "unexpected shorthand: {line}"
+        );
+    }
+
+    #[test]
+    fn settings_audit_values_reduce_to_key_names_when_toggled_off() {
+        let before = StoredSettingValue::Bool(false);
+        let after = StoredSettingValue::Bool(true);
+        let event = build_update_config_settings_audit_event(
+            false,
+            &audit_test_principal(),
+            None,
+            &SettingsAuditEvent {
+                sandbox: None,
+                sandbox_name: None,
+                workspace: None,
+                key: "providers_v2_enabled",
+                deleted: false,
+                changed: true,
+                success: true,
+                before: Some(&before),
+                after: Some(&after),
+            },
+        );
+        let json = event.to_json().unwrap();
+        assert_eq!(json["unmapped"]["setting_key"], "providers_v2_enabled");
+        assert!(json["unmapped"].get("before").is_none());
+        assert!(json["unmapped"].get("after").is_none());
+    }
+
+    #[test]
+    fn settings_audit_always_redacts_credential_pattern_keys() {
+        let before = StoredSettingValue::String("hunter2".to_string());
+        let event = build_update_config_settings_audit_event(
+            true,
+            &audit_test_principal(),
+            None,
+            &SettingsAuditEvent {
+                sandbox: None,
+                sandbox_name: None,
+                workspace: None,
+                key: "provider_api_key",
+                deleted: true,
+                changed: true,
+                success: true,
+                before: Some(&before),
+                after: None,
+            },
+        );
+        let json = event.to_json().unwrap();
+        assert_eq!(json["unmapped"]["before"], "[REDACTED]");
+        assert_eq!(json["state"], "setting_deleted");
+        assert!(
+            !json.to_string().contains("hunter2"),
+            "secret value must never appear anywhere in the event"
+        );
+    }
+
+    #[test]
+    fn sandbox_scoped_settings_audit_names_sandbox_and_workspace() {
+        let after = StoredSettingValue::Bool(true);
+        let event = build_update_config_settings_audit_event(
+            true,
+            &audit_test_principal(),
+            None,
+            &SettingsAuditEvent {
+                sandbox: Some(("sb-7f3a", "dev-box")),
+                sandbox_name: None,
+                workspace: Some("team-a"),
+                key: "agent_policy_proposals_enabled",
+                deleted: false,
+                changed: true,
+                success: true,
+                before: None,
+                after: Some(&after),
+            },
+        );
+        let json = event.to_json().unwrap();
+        assert_eq!(json["unmapped"]["scope"], "sandbox");
+        assert_eq!(json["unmapped"]["workspace"], "team-a");
+        assert_eq!(json["unmapped"]["sandbox"], "dev-box");
+        assert_eq!(json["metadata"]["uid"], "sb-7f3a");
+    }
+
+    #[test]
+    fn failed_settings_mutations_audit_with_failure_status() {
+        let event = build_update_config_settings_audit_event(
+            true,
+            &audit_test_principal(),
+            None,
+            &SettingsAuditEvent {
+                sandbox: None,
+                sandbox_name: Some("dev-box"),
+                workspace: Some("team-a"),
+                key: "providers_v2_enabled",
+                deleted: false,
+                changed: false,
+                success: false,
+                before: None,
+                after: None,
+            },
+        );
+        let json = event.to_json().unwrap();
+        assert_eq!(json["status"], "Failure");
+        assert_eq!(json["unmapped"]["sandbox"], "dev-box");
+        let line = event.format_shorthand();
+        assert!(
+            line.contains("update failed"),
+            "unexpected shorthand: {line}"
+        );
+    }
+
+    /// The `update_config` settings paths must audit through the gateway
+    /// lane: a global set emits a 5019 record with before/after values, a
+    /// failed mutation attempt emits with `Failure`, and an authorization
+    /// denial emits nothing (that is the authentication boundary's event).
+    #[tokio::test]
+    async fn update_config_settings_mutations_emit_audit_events() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let exporter = opentelemetry_sdk::logs::InMemoryLogExporter::default();
+        let (handle, worker) = crate::log_export::spawn(
+            exporter.clone(),
+            opentelemetry_sdk::Resource::builder_empty().build(),
+            true,
+        );
+        let bus = crate::tracing_bus::TracingLogBus::new();
+        bus.set_export(handle);
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".to_string();
+
+        {
+            let subscriber = tracing_subscriber::registry().with(bus.layer());
+            let _guard = crate::otel_tracing::test_exporter::install_scoped(subscriber);
+
+            // Denied first: `with_user` lacks the admin role, so this must
+            // not produce an audit record.
+            let error = handle_update_config(
+                &state,
+                with_user(Request::new(UpdateConfigRequest {
+                    global: true,
+                    setting_key: settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
+                    setting_value: Some(SettingValue {
+                        value: Some(setting_value::Value::BoolValue(true)),
+                    }),
+                    ..UpdateConfigRequest::default()
+                })),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code(), Code::PermissionDenied);
+
+            handle_update_config(
+                &state,
+                authed_request(UpdateConfigRequest {
+                    global: true,
+                    setting_key: settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
+                    setting_value: Some(SettingValue {
+                        value: Some(setting_value::Value::BoolValue(true)),
+                    }),
+                    ..UpdateConfigRequest::default()
+                }),
+            )
+            .await
+            .unwrap();
+
+            let error = handle_update_config(
+                &state,
+                authed_request(UpdateConfigRequest {
+                    global: true,
+                    setting_key: "no_such_setting".to_string(),
+                    setting_value: Some(SettingValue {
+                        value: Some(setting_value::Value::BoolValue(true)),
+                    }),
+                    ..UpdateConfigRequest::default()
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code(), Code::InvalidArgument);
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while exporter.get_emitted_logs().unwrap().len() < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "audit records never arrived"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let emitted = exporter.get_emitted_logs().unwrap();
+        let raw_json = |record: &opentelemetry_sdk::logs::SdkLogRecord| {
+            let raw = record
+                .attributes_iter()
+                .find(|(k, _)| k.as_str() == "ocsf.raw")
+                .map(|(_, v)| v.clone())
+                .expect("ocsf.raw attribute");
+            let opentelemetry::logs::AnyValue::String(raw) = raw else {
+                panic!("ocsf.raw should be a string");
+            };
+            serde_json::from_str::<serde_json::Value>(raw.as_str()).unwrap()
+        };
+
+        // Record 0 is the successful set — the earlier denial emitted nothing.
+        let set = raw_json(&emitted[0].record);
+        assert_eq!(set["class_uid"], 5019);
+        assert_eq!(set["state"], "setting_updated");
+        assert_eq!(set["status"], "Success");
+        assert_eq!(set["actor"]["user"]["uid"], "dev-user");
+        assert_eq!(set["unmapped"]["scope"], "global");
+        assert_eq!(
+            set["unmapped"]["setting_key"],
+            settings::PROVIDERS_V2_ENABLED_KEY
+        );
+        assert_eq!(set["unmapped"]["changed"], true);
+        assert!(set["unmapped"].get("before").is_none());
+        assert_eq!(set["unmapped"]["after"], true);
+
+        let failed = raw_json(&emitted[1].record);
+        assert_eq!(failed["status"], "Failure");
+        assert_eq!(failed["unmapped"]["setting_key"], "no_such_setting");
+
+        worker.shutdown().await;
     }
 
     // ---- Settings persistence ----

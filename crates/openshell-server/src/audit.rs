@@ -22,15 +22,12 @@
 //! known, carrying the authenticated principal via [`actor_user`]. Never
 //! include tokens, credentials, or secret material.
 
-// The emission helpers land ahead of their callers: handler instrumentation
-// (taxonomy waves 3+) consumes every item here. Remove with the first wave.
-#![allow(dead_code)]
-
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::LazyLock;
 
-use openshell_ocsf::objects::{User, UserTypeId};
-use openshell_ocsf::{OcsfEvent, SandboxContext};
+use openshell_ocsf::enums::EntityActivityId;
+use openshell_ocsf::objects::{ManagedEntity, User, UserTypeId};
+use openshell_ocsf::{EntityManagementBuilder, OcsfEvent, SandboxContext, StatusId};
 
 use crate::auth::principal::Principal;
 
@@ -52,6 +49,17 @@ static GATEWAY_CTX: LazyLock<SandboxContext> = LazyLock::new(|| SandboxContext {
 /// The gateway's OCSF context, for constructing audit event builders.
 pub fn ctx() -> &'static SandboxContext {
     &GATEWAY_CTX
+}
+
+/// A per-sandbox variant of the gateway context, for gateway-authored audit
+/// events about a specific sandbox (paired with [`emit_for_sandbox`] so the
+/// event lands in that sandbox's stream with matching metadata).
+pub fn ctx_for_sandbox(sandbox_id: &str, sandbox_name: &str) -> SandboxContext {
+    SandboxContext {
+        sandbox_id: sandbox_id.to_string(),
+        sandbox_name: sandbox_name.to_string(),
+        ..GATEWAY_CTX.clone()
+    }
 }
 
 /// Map the authenticated principal to the OCSF actor user.
@@ -95,6 +103,145 @@ pub fn emit(event: OcsfEvent) {
 /// `sandbox.id`, alongside the supervisor's own events.
 pub fn emit_for_sandbox(sandbox_id: &str, event: OcsfEvent) {
     openshell_ocsf::emit_ocsf_event_for_sandbox(sandbox_id, event);
+}
+
+/// The authenticated principal, for audit attribution.
+///
+/// Unlike [`crate::grpc::extract_principal`], a missing principal maps to
+/// [`Principal::Anonymous`] instead of failing: the audit trail records the
+/// mutation honestly either way and must never change handler behavior.
+pub fn principal<T>(request: &tonic::Request<T>) -> Principal {
+    request
+        .extensions()
+        .get::<Principal>()
+        .cloned()
+        .unwrap_or(Principal::Anonymous)
+}
+
+/// The request's correlation id — the `x-request-id` header the gateway's
+/// request-id middleware stamps (or the client supplied). Carried in
+/// `unmapped.request_id` to tie each audit event to its request trace.
+pub fn request_id<T>(request: &tonic::Request<T>) -> Option<String> {
+    request
+        .metadata()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string)
+}
+
+/// Whether a setting key looks like it names credential material.
+///
+/// Values under matching keys are always redacted from audit events,
+/// regardless of the `settings_values` toggle — the "never log secrets"
+/// rule outranks audit completeness. Conservative by design: a false
+/// positive redacts a harmless value, a false negative ships a secret.
+pub fn is_credential_like_key(key: &str) -> bool {
+    const PATTERNS: &[&str] = &[
+        "secret",
+        "token",
+        "password",
+        "passwd",
+        "credential",
+        "api_key",
+        "apikey",
+        "private_key",
+        "auth",
+    ];
+    let key = key.to_ascii_lowercase();
+    PATTERNS.iter().any(|p| key.contains(p)) || key.ends_with("_key") || key == "key"
+}
+
+/// Whether a failed mutation outcome belongs in the entity audit trail.
+///
+/// Authentication and authorization rejections are excluded: those are the
+/// authentication boundary's events (Authentication \[3002\] + findings),
+/// not per-handler mutation attempts by an authorized principal.
+pub fn audited_failure(status: &tonic::Status) -> bool {
+    !matches!(
+        status.code(),
+        tonic::Code::PermissionDenied | tonic::Code::Unauthenticated
+    )
+}
+
+/// Emit an Entity Management \[3004\] audit event on the gateway lane.
+///
+/// One call per mutation, after the outcome is known. `unmapped` carries the
+/// operation-specific context the taxonomy assigns (e.g. `workspace` on
+/// membership events, `operation` on non-CRUD verbs); `request_id` is added
+/// to it when present.
+pub fn emit_entity_event(
+    activity: EntityActivityId,
+    entity: ManagedEntity,
+    principal: &Principal,
+    request_id: Option<&str>,
+    success: bool,
+    message: String,
+    unmapped: Vec<(&'static str, serde_json::Value)>,
+) {
+    let mut builder = EntityManagementBuilder::new(ctx())
+        .activity(activity)
+        .entity(entity)
+        .actor_user(actor_user(principal))
+        .status(if success {
+            StatusId::Success
+        } else {
+            StatusId::Failure
+        })
+        .message(message);
+    for (key, value) in unmapped {
+        builder = builder.unmapped(key, value);
+    }
+    if let Some(request_id) = request_id {
+        builder = builder.unmapped("request_id", request_id);
+    }
+    emit(builder.build());
+}
+
+/// One mutation's audit facts, gathered by a handler wrapper before/after
+/// running its inner logic. Consumed by [`emit_entity_outcome`].
+pub struct EntityOutcome<'a> {
+    pub activity: EntityActivityId,
+    pub entity: ManagedEntity,
+    pub principal: &'a Principal,
+    pub request_id: Option<&'a str>,
+    pub success_message: String,
+    pub failure_message: String,
+    pub unmapped: Vec<(&'static str, serde_json::Value)>,
+}
+
+/// Emit the Entity Management \[3004\] audit event for a finished handler.
+///
+/// Success emits with `Success`; a failure emits with `Failure` unless the
+/// rejection was an authentication/authorization denial (see
+/// [`audited_failure`]), which is the authentication boundary's event, not a
+/// mutation attempt.
+pub fn emit_entity_outcome<T>(
+    result: &Result<tonic::Response<T>, tonic::Status>,
+    outcome: EntityOutcome<'_>,
+) {
+    let success = match result {
+        Ok(_) => true,
+        Err(status) => {
+            if !audited_failure(status) {
+                return;
+            }
+            false
+        }
+    };
+    let message = if success {
+        outcome.success_message
+    } else {
+        outcome.failure_message
+    };
+    emit_entity_event(
+        outcome.activity,
+        outcome.entity,
+        outcome.principal,
+        outcome.request_id,
+        success,
+        message,
+        outcome.unmapped,
+    );
 }
 
 #[cfg(test)]
@@ -154,5 +301,53 @@ mod tests {
         let user = actor_user(&Principal::Anonymous);
         assert_eq!(user.name, "anonymous");
         assert!(user.uid.is_none());
+    }
+
+    #[test]
+    fn requests_without_a_principal_audit_as_anonymous() {
+        let request = tonic::Request::new(());
+        assert!(matches!(principal(&request), Principal::Anonymous));
+    }
+
+    #[test]
+    fn request_id_reads_the_x_request_id_header() {
+        let mut request = tonic::Request::new(());
+        assert_eq!(request_id(&request), None);
+        request
+            .metadata_mut()
+            .insert("x-request-id", "req-42".parse().unwrap());
+        assert_eq!(request_id(&request).as_deref(), Some("req-42"));
+    }
+
+    #[test]
+    fn authz_denials_are_not_audited_as_mutation_failures() {
+        assert!(!audited_failure(&tonic::Status::permission_denied("no")));
+        assert!(!audited_failure(&tonic::Status::unauthenticated("who")));
+        assert!(audited_failure(&tonic::Status::not_found("missing")));
+        assert!(audited_failure(&tonic::Status::invalid_argument("bad")));
+        assert!(audited_failure(&tonic::Status::internal("broken")));
+    }
+
+    #[test]
+    fn credential_like_keys_are_detected_conservatively() {
+        for key in [
+            "api_key",
+            "provider_apikey",
+            "oauth_client_secret",
+            "refresh_token",
+            "db_password",
+            "signing_key",
+            "key",
+            "AUTH_HEADER",
+        ] {
+            assert!(is_credential_like_key(key), "{key} should be redacted");
+        }
+        for key in [
+            "providers_v2_enabled",
+            "proposal_approval_mode",
+            "keyboard_layout",
+        ] {
+            assert!(!is_credential_like_key(key), "{key} should pass through");
+        }
     }
 }

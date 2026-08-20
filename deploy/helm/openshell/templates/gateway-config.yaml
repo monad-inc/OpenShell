@@ -141,6 +141,20 @@ data:
     {{- end }}
     {{- end }}
 
+    {{- if or .Values.server.audit.authSuccessEvents (not .Values.server.audit.execArgs) (not .Values.server.audit.settingsValues) }}
+
+    [openshell.gateway.audit]
+    {{- if .Values.server.audit.authSuccessEvents }}
+    auth_success_events = true
+    {{- end }}
+    {{- if not .Values.server.audit.execArgs }}
+    exec_args           = false
+    {{- end }}
+    {{- if not .Values.server.audit.settingsValues }}
+    settings_values     = false
+    {{- end }}
+    {{- end }}
+
     [openshell.drivers.kubernetes]
     grpc_endpoint                = {{ include "openshell.grpcEndpoint" . | quote }}
     service_account_name         = {{ include "openshell.sandboxServiceAccountName" . | quote }}

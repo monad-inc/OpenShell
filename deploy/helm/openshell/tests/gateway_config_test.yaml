@@ -140,6 +140,29 @@ tests:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.gateway\.otlp\].*?export_logs\s*=\s*true'
 
+  - it: omits the audit table when all toggles keep their defaults
+    template: templates/gateway-config.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '\[openshell\.gateway\.audit\]'
+
+  - it: renders the audit table with only the non-default toggles
+    template: templates/gateway-config.yaml
+    set:
+      server.audit.authSuccessEvents: true
+      server.audit.settingsValues: false
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\.audit\].*?auth_success_events\s*=\s*true'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\.audit\].*?settings_values\s*=\s*false'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'exec_args\s*='
+
   - it: renders a supervisor tag override with the official repository
     template: templates/gateway-config.yaml
     set:

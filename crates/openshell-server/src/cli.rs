@@ -313,6 +313,12 @@ fn prepare_server_config(args: &mut RunArgs, matches: &ArgMatches) -> Result<Ser
     if let Some(auth) = file.as_ref().and_then(|f| f.openshell.gateway.auth.clone()) {
         config.auth = auth;
     }
+    if let Some(audit) = file
+        .as_ref()
+        .and_then(|f| f.openshell.gateway.audit.clone())
+    {
+        config.audit = audit;
+    }
     config.mtls_auth.enabled = mtls_auth_enabled;
 
     // Listener addresses for the health and metrics endpoints. The file may

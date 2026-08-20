@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use openshell_core::config::ComputeDriverKind;
 use openshell_core::proto::SupervisorMiddlewareService;
 use openshell_core::{
-    GatewayAuthConfig, GatewayInterceptorConfig, GatewayJwtConfig,
+    GatewayAuditConfig, GatewayAuthConfig, GatewayInterceptorConfig, GatewayJwtConfig,
     GatewayProviderProfileSourceConfig, MtlsAuthConfig, OidcConfig, TlsConfig,
 };
 use serde::{Deserialize, Serialize};
@@ -167,6 +167,8 @@ pub struct GatewayFileSection {
     pub oidc: Option<OidcConfig>,
     #[serde(default)]
     pub auth: Option<GatewayAuthConfig>,
+    #[serde(default)]
+    pub audit: Option<GatewayAuditConfig>,
     #[serde(default)]
     pub interceptors: Vec<GatewayInterceptorConfig>,
     #[serde(default)]
@@ -641,6 +643,45 @@ allow_unauthenticated_users = true
         let file = load(tmp.path()).expect("valid auth config parses");
         let auth = file.openshell.gateway.auth.expect("auth config");
         assert!(auth.allow_unauthenticated_users);
+    }
+
+    #[test]
+    fn parses_gateway_audit_config_with_defaults() {
+        let toml = r"
+[openshell.gateway.audit]
+auth_success_events = true
+";
+        let tmp = write_tmp(toml);
+        let file = load(tmp.path()).expect("valid audit config parses");
+        let audit = file.openshell.gateway.audit.expect("audit config");
+        assert!(audit.auth_success_events);
+        assert!(audit.exec_args, "exec_args defaults to true");
+        assert!(audit.settings_values, "settings_values defaults to true");
+    }
+
+    #[test]
+    fn audit_config_defaults_match_the_absent_table() {
+        let tmp = write_tmp("[openshell.gateway]\n");
+        let file = load(tmp.path()).expect("empty gateway table parses");
+        assert!(file.openshell.gateway.audit.is_none());
+        let defaults = GatewayAuditConfig::default();
+        assert!(!defaults.auth_success_events);
+        assert!(defaults.exec_args);
+        assert!(defaults.settings_values);
+    }
+
+    #[test]
+    fn rejects_unknown_audit_config_keys() {
+        let tmp = write_tmp(
+            r"
+[openshell.gateway.audit]
+log_secrets = true
+",
+        );
+        assert!(
+            load(tmp.path()).is_err(),
+            "unknown audit keys must fail TOML validation"
+        );
     }
 
     #[test]
