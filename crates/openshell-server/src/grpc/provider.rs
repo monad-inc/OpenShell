@@ -2021,8 +2021,13 @@ use openshell_providers::{
 use std::sync::Arc;
 use tonic::{Request, Response};
 
+use crate::audit;
 use crate::auth::principal::Principal;
 use crate::auth::workspace_authz::{MinWorkspaceRole, authorize_workspace, require_platform_admin};
+use openshell_ocsf::enums::EntityActivityId;
+use openshell_ocsf::objects::ManagedEntity;
+
+use super::workspace::audit_workspace_name;
 
 async fn authorize_and_resolve_profile_workspace(
     state: &Arc<ServerState>,
@@ -2049,7 +2054,64 @@ async fn authorize_and_resolve_profile_workspace(
     }
 }
 
+/// The store id of the provider a `ProviderResponse` carries, for the audit
+/// event's entity uid. `None` on failures.
+fn provider_response_uid(result: &Result<Response<ProviderResponse>, Status>) -> Option<String> {
+    result.as_ref().ok().and_then(|response| {
+        response
+            .get_ref()
+            .provider
+            .as_ref()
+            .and_then(|p| p.metadata.as_ref())
+            .map(|m| m.id.clone())
+    })
+}
+
 pub(super) async fn handle_create_provider(
+    state: &Arc<ServerState>,
+    request: Request<CreateProviderRequest>,
+) -> Result<Response<ProviderResponse>, Status> {
+    let principal = audit::principal(&request);
+    let request_id = audit::request_id(&request);
+    let req = request.get_ref();
+    let workspace = audit_workspace_name(&req.workspace).to_string();
+    let name = req
+        .provider
+        .as_ref()
+        .and_then(|p| p.metadata.as_ref())
+        .map(|m| m.name.clone())
+        .unwrap_or_default();
+    let provider_type = req
+        .provider
+        .as_ref()
+        .map(|p| p.r#type.clone())
+        .unwrap_or_default();
+
+    let result = handle_create_provider_inner(state, request).await;
+
+    audit::emit_entity_outcome(
+        &result,
+        audit::EntityOutcome {
+            activity: EntityActivityId::Create,
+            entity: ManagedEntity {
+                entity_type: "provider".to_string(),
+                uid: provider_response_uid(&result),
+                name: Some(name.clone()),
+            },
+            principal: &principal,
+            request_id: request_id.as_deref(),
+            success_message: format!("provider {name} created in workspace {workspace}"),
+            failure_message: format!("provider {name} create in workspace {workspace} failed"),
+            unmapped: vec![
+                ("workspace", serde_json::Value::from(workspace)),
+                ("provider_type", serde_json::Value::from(provider_type)),
+            ],
+        },
+    );
+    result
+}
+
+async fn handle_create_provider_inner(
     state: &Arc<ServerState>,
     request: Request<CreateProviderRequest>,
 ) -> Result<Response<ProviderResponse>, Status> {
@@ -2240,7 +2302,62 @@ pub(super) async fn handle_get_provider_profile(
     }))
 }
 
+/// The `unmapped` bundle for a provider-profile audit event. Profiles may be
+/// platform-scoped (empty workspace) — the workspace entry is added only when
+/// one is named.
+fn profile_audit_unmapped(workspace: &str) -> Vec<(&'static str, serde_json::Value)> {
+    if workspace.is_empty() {
+        vec![("scope", serde_json::Value::from("platform"))]
+    } else {
+        vec![
+            ("scope", serde_json::Value::from("workspace")),
+            ("workspace", serde_json::Value::from(workspace)),
+        ]
+    }
+}
+
 pub(super) async fn handle_import_provider_profiles(
+    state: &Arc<ServerState>,
+    request: Request<ImportProviderProfilesRequest>,
+) -> Result<Response<ImportProviderProfilesResponse>, Status> {
+    let principal = audit::principal(&request);
+    let request_id = audit::request_id(&request);
+    let req = request.get_ref();
+    let workspace = req.workspace.clone();
+    let profile_ids: Vec<String> = req
+        .profiles
+        .iter()
+        .filter_map(|item| item.profile.as_ref())
+        .map(|profile| profile.id.clone())
+        .collect();
+    let count = profile_ids.len();
+
+    let result = handle_import_provider_profiles_inner(state, request).await;
+
+    let mut unmapped = profile_audit_unmapped(&workspace);
+    unmapped.push(("profile_count", serde_json::Value::from(count)));
+    unmapped.push(("profiles", serde_json::Value::from(profile_ids.clone())));
+    audit::emit_entity_outcome_judged(
+        &result,
+        |response| response.imported,
+        audit::EntityOutcome {
+            activity: EntityActivityId::Create,
+            entity: ManagedEntity {
+                entity_type: "provider_profile".to_string(),
+                uid: None,
+                name: (count == 1).then(|| profile_ids[0].clone()),
+            },
+            principal: &principal,
+            request_id: request_id.as_deref(),
+            success_message: format!("{count} provider profile(s) imported"),
+            failure_message: format!("{count} provider profile(s) import failed"),
+            unmapped,
+        },
+    );
+    result
+}
+
+async fn handle_import_provider_profiles_inner(
     state: &Arc<ServerState>,
     request: Request<ImportProviderProfilesRequest>,
 ) -> Result<Response<ImportProviderProfilesResponse>, Status> {
@@ -2329,6 +2446,34 @@ pub(super) async fn handle_import_provider_profiles(
 }
 
 pub(super) async fn handle_update_provider_profiles(
+    state: &Arc<ServerState>,
+    request: Request<UpdateProviderProfilesRequest>,
+) -> Result<Response<UpdateProviderProfilesResponse>, Status> {
+    let principal = audit::principal(&request);
+    let request_id = audit::request_id(&request);
+    let req = request.get_ref();
+    let workspace = req.workspace.clone();
+    let target_id = req.id.trim().to_string();
+
+    let result = handle_update_provider_profiles_inner(state, request).await;
+
+    audit::emit_entity_outcome_judged(
+        &result,
+        |response| response.updated,
+        audit::EntityOutcome {
+            activity: EntityActivityId::Update,
+            entity: ManagedEntity::new("provider_profile", target_id.clone()),
+            principal: &principal,
+            request_id: request_id.as_deref(),
+            success_message: format!("provider profile {target_id} updated"),
+            failure_message: format!("provider profile {target_id} update failed"),
+            unmapped: profile_audit_unmapped(&workspace),
+        },
+    );
+    result
+}
+
+async fn handle_update_provider_profiles_inner(
     state: &Arc<ServerState>,
     request: Request<UpdateProviderProfilesRequest>,
 ) -> Result<Response<UpdateProviderProfilesResponse>, Status> {
@@ -2490,6 +2635,33 @@ pub(super) async fn handle_lint_provider_profiles(
 }
 
 pub(super) async fn handle_delete_provider_profile(
+    state: &Arc<ServerState>,
+    request: Request<DeleteProviderProfileRequest>,
+) -> Result<Response<DeleteProviderProfileResponse>, Status> {
+    let principal = audit::principal(&request);
+    let request_id = audit::request_id(&request);
+    let req = request.get_ref();
+    let workspace = req.workspace.clone();
+    let id = req.id.trim().to_string();
+
+    let result = handle_delete_provider_profile_inner(state, request).await;
+
+    audit::emit_entity_outcome(
+        &result,
+        audit::EntityOutcome {
+            activity: EntityActivityId::Delete,
+            entity: ManagedEntity::new("provider_profile", id.clone()),
+            principal: &principal,
+            request_id: request_id.as_deref(),
+            success_message: format!("provider profile {id} deleted"),
+            failure_message: format!("provider profile {id} delete failed"),
+            unmapped: profile_audit_unmapped(&workspace),
+        },
+    );
+    result
+}
+
+async fn handle_delete_provider_profile_inner(
     state: &Arc<ServerState>,
     request: Request<DeleteProviderProfileRequest>,
 ) -> Result<Response<DeleteProviderProfileResponse>, Status> {
@@ -3208,6 +3380,50 @@ pub(super) async fn handle_update_provider(
     state: &Arc<ServerState>,
     request: Request<UpdateProviderRequest>,
 ) -> Result<Response<ProviderResponse>, Status> {
+    let principal = audit::principal(&request);
+    let request_id = audit::request_id(&request);
+    let req = request.get_ref();
+    let workspace = audit_workspace_name(&req.workspace).to_string();
+    let name = req
+        .provider
+        .as_ref()
+        .and_then(|p| p.metadata.as_ref())
+        .map(|m| m.name.clone())
+        .unwrap_or_default();
+    let provider_type = req
+        .provider
+        .as_ref()
+        .map(|p| p.r#type.clone())
+        .unwrap_or_default();
+
+    let result = handle_update_provider_inner(state, request).await;
+
+    audit::emit_entity_outcome(
+        &result,
+        audit::EntityOutcome {
+            activity: EntityActivityId::Update,
+            entity: ManagedEntity {
+                entity_type: "provider".to_string(),
+                uid: provider_response_uid(&result),
+                name: Some(name.clone()),
+            },
+            principal: &principal,
+            request_id: request_id.as_deref(),
+            success_message: format!("provider {name} updated in workspace {workspace}"),
+            failure_message: format!("provider {name} update in workspace {workspace} failed"),
+            unmapped: vec![
+                ("workspace", serde_json::Value::from(workspace)),
+                ("provider_type", serde_json::Value::from(provider_type)),
+            ],
+        },
+    );
+    result
+}
+
+async fn handle_update_provider_inner(
+    state: &Arc<ServerState>,
+    request: Request<UpdateProviderRequest>,
+) -> Result<Response<ProviderResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
     let authz = authorize_workspace(
@@ -3321,6 +3537,47 @@ pub(super) async fn handle_get_provider_refresh_status(
 }
 
 pub(super) async fn handle_configure_provider_refresh(
+    state: &Arc<ServerState>,
+    request: Request<ConfigureProviderRefreshRequest>,
+) -> Result<Response<ConfigureProviderRefreshResponse>, Status> {
+    let principal = audit::principal(&request);
+    let request_id = audit::request_id(&request);
+    let req = request.get_ref();
+    let workspace = audit_workspace_name(&req.workspace).to_string();
+    let provider = req.provider.trim().to_string();
+    let credential_key = req.credential_key.trim().to_string();
+    let strategy = crate::provider_refresh::refresh_strategy_name(req.strategy);
+
+    let result = handle_configure_provider_refresh_inner(state, request).await;
+
+    // Identity fields only — refresh material and secret key names never
+    // enter the audit record.
+    audit::emit_entity_outcome(
+        &result,
+        audit::EntityOutcome {
+            activity: EntityActivityId::Update,
+            entity: ManagedEntity::new("provider_refresh", format!("{provider}/{credential_key}")),
+            principal: &principal,
+            request_id: request_id.as_deref(),
+            success_message: format!("provider refresh configured for {provider}/{credential_key}"),
+            failure_message: format!(
+                "provider refresh configure for {provider}/{credential_key} failed"
+            ),
+            unmapped: vec![
+                ("workspace", serde_json::Value::from(workspace)),
+                ("provider", serde_json::Value::from(provider.clone())),
+                (
+                    "credential_key",
+                    serde_json::Value::from(credential_key.clone()),
+                ),
+                ("strategy", serde_json::Value::from(strategy)),
+            ],
+        },
+    );
+    result
+}
+
+async fn handle_configure_provider_refresh_inner(
     state: &Arc<ServerState>,
     request: Request<ConfigureProviderRefreshRequest>,
 ) -> Result<Response<ConfigureProviderRefreshResponse>, Status> {
@@ -3623,6 +3880,44 @@ pub(super) async fn handle_rotate_provider_credential(
     state: &Arc<ServerState>,
     request: Request<RotateProviderCredentialRequest>,
 ) -> Result<Response<RotateProviderCredentialResponse>, Status> {
+    let principal = audit::principal(&request);
+    let request_id = audit::request_id(&request);
+    let req = request.get_ref();
+    let workspace = audit_workspace_name(&req.workspace).to_string();
+    let provider = req.provider.trim().to_string();
+    let credential_key = req.credential_key.trim().to_string();
+
+    let result = handle_rotate_provider_credential_inner(state, request).await;
+
+    // Identity fields only — the minted credential never enters the audit
+    // record.
+    audit::emit_entity_outcome(
+        &result,
+        audit::EntityOutcome {
+            activity: EntityActivityId::Update,
+            entity: ManagedEntity::new("credential", format!("{provider}/{credential_key}")),
+            principal: &principal,
+            request_id: request_id.as_deref(),
+            success_message: format!("credential rotated for {provider}/{credential_key}"),
+            failure_message: format!("credential rotate for {provider}/{credential_key} failed"),
+            unmapped: vec![
+                ("operation", serde_json::Value::from("rotate")),
+                ("workspace", serde_json::Value::from(workspace)),
+                ("provider", serde_json::Value::from(provider.clone())),
+                (
+                    "credential_key",
+                    serde_json::Value::from(credential_key.clone()),
+                ),
+            ],
+        },
+    );
+    result
+}
+
+async fn handle_rotate_provider_credential_inner(
+    state: &Arc<ServerState>,
+    request: Request<RotateProviderCredentialRequest>,
+) -> Result<Response<RotateProviderCredentialResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let request = request.into_inner();
     let authz = authorize_workspace(
@@ -3689,6 +3984,43 @@ fn clear_refresh_owned_expiries(
 }
 
 pub(super) async fn handle_delete_provider_refresh(
+    state: &Arc<ServerState>,
+    request: Request<DeleteProviderRefreshRequest>,
+) -> Result<Response<DeleteProviderRefreshResponse>, Status> {
+    let principal = audit::principal(&request);
+    let request_id = audit::request_id(&request);
+    let req = request.get_ref();
+    let workspace = audit_workspace_name(&req.workspace).to_string();
+    let provider = req.provider.trim().to_string();
+    let credential_key = req.credential_key.trim().to_string();
+
+    let result = handle_delete_provider_refresh_inner(state, request).await;
+
+    audit::emit_entity_outcome(
+        &result,
+        audit::EntityOutcome {
+            activity: EntityActivityId::Delete,
+            entity: ManagedEntity::new("provider_refresh", format!("{provider}/{credential_key}")),
+            principal: &principal,
+            request_id: request_id.as_deref(),
+            success_message: format!("provider refresh deleted for {provider}/{credential_key}"),
+            failure_message: format!(
+                "provider refresh delete for {provider}/{credential_key} failed"
+            ),
+            unmapped: vec![
+                ("workspace", serde_json::Value::from(workspace)),
+                ("provider", serde_json::Value::from(provider.clone())),
+                (
+                    "credential_key",
+                    serde_json::Value::from(credential_key.clone()),
+                ),
+            ],
+        },
+    );
+    result
+}
+
+async fn handle_delete_provider_refresh_inner(
     state: &Arc<ServerState>,
     request: Request<DeleteProviderRefreshRequest>,
 ) -> Result<Response<DeleteProviderRefreshResponse>, Status> {
@@ -3766,6 +4098,37 @@ pub(super) async fn handle_delete_provider_refresh(
 }
 
 pub(super) async fn handle_delete_provider(
+    state: &Arc<ServerState>,
+    request: Request<DeleteProviderRequest>,
+) -> Result<Response<DeleteProviderResponse>, Status> {
+    let principal = audit::principal(&request);
+    let request_id = audit::request_id(&request);
+    let req = request.get_ref();
+    let workspace = audit_workspace_name(&req.workspace).to_string();
+    let name = req.name.clone();
+
+    let result = handle_delete_provider_inner(state, request).await;
+
+    audit::emit_entity_outcome(
+        &result,
+        audit::EntityOutcome {
+            activity: EntityActivityId::Delete,
+            entity: ManagedEntity {
+                entity_type: "provider".to_string(),
+                uid: None,
+                name: Some(name.clone()),
+            },
+            principal: &principal,
+            request_id: request_id.as_deref(),
+            success_message: format!("provider {name} deleted from workspace {workspace}"),
+            failure_message: format!("provider {name} delete from workspace {workspace} failed"),
+            unmapped: vec![("workspace", serde_json::Value::from(workspace))],
+        },
+    );
+    result
+}
+
+async fn handle_delete_provider_inner(
     state: &Arc<ServerState>,
     request: Request<DeleteProviderRequest>,
 ) -> Result<Response<DeleteProviderResponse>, Status> {
@@ -3885,6 +4248,169 @@ mod tests {
     };
     use openshell_core::{ObjectId, ObjectName};
     use tonic::{Code, Request};
+
+    /// Provider-family mutations must leave a 3004 audit trail on the
+    /// gateway lane, and credential material must never appear in it:
+    /// create carries identity fields only, a failed refresh configure drops
+    /// its material, rotation records `operation=rotate`, and a rejected
+    /// profile import (diagnostics inside an `Ok` response) audits as a
+    /// failed mutation.
+    #[tokio::test]
+    async fn provider_mutations_emit_entity_audit_events_without_key_material() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let exporter = opentelemetry_sdk::logs::InMemoryLogExporter::default();
+        let (handle, worker) = crate::log_export::spawn(
+            exporter.clone(),
+            opentelemetry_sdk::Resource::builder_empty().build(),
+            true,
+        );
+        let bus = crate::tracing_bus::TracingLogBus::new();
+        bus.set_export(handle);
+        let mut state = test_server_state().await;
+        let config = state
+            .config
+            .clone()
+            .with_credential_drivers(["test-static"]);
+        let credentials = crate::credentials::CredentialRuntime::from_config(&config).unwrap();
+        let state_mut = Arc::get_mut(&mut state).unwrap();
+        state_mut.config = config;
+        state_mut.credentials = credentials;
+
+        {
+            let subscriber = tracing_subscriber::registry().with(bus.layer());
+            let _guard = crate::otel_tracing::test_exporter::install_scoped(subscriber);
+
+            handle_create_provider(
+                &state,
+                authed_request(CreateProviderRequest {
+                    provider: Some(provider_with_credential_value(
+                        "openai-audit",
+                        "openai",
+                        "OPENAI_API_KEY",
+                        "sk-super-secret",
+                    )),
+                    workspace: "default".to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+
+            let error = handle_configure_provider_refresh(
+                &state,
+                authed_request(ConfigureProviderRefreshRequest {
+                    workspace: "default".to_string(),
+                    provider: "openai-audit".to_string(),
+                    credential_key: "OPENAI_API_KEY".to_string(),
+                    material: std::iter::once((
+                        "client_secret".to_string(),
+                        "hunter2-material".to_string(),
+                    ))
+                    .collect(),
+                    ..ConfigureProviderRefreshRequest::default()
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code(), Code::InvalidArgument);
+
+            handle_rotate_provider_credential(
+                &state,
+                authed_request(RotateProviderCredentialRequest {
+                    workspace: "default".to_string(),
+                    provider: "openai-audit".to_string(),
+                    credential_key: "OPENAI_API_KEY".to_string(),
+                }),
+            )
+            .await
+            .unwrap_err();
+
+            // Empty profile set: rejected via diagnostics inside Ok.
+            let response = handle_import_provider_profiles(
+                &state,
+                authed_request(ImportProviderProfilesRequest {
+                    profiles: Vec::new(),
+                    workspace: "default".to_string(),
+                }),
+            )
+            .await
+            .unwrap()
+            .into_inner();
+            assert!(!response.imported);
+        }
+
+        // The export stream interleaves plain tracing lines from the
+        // handlers; keep only the OCSF audit records.
+        let audit_records = || -> Vec<serde_json::Value> {
+            exporter
+                .get_emitted_logs()
+                .unwrap()
+                .iter()
+                .filter_map(|log| {
+                    log.record
+                        .attributes_iter()
+                        .find(|(k, _)| k.as_str() == "ocsf.raw")
+                        .map(|(_, v)| v.clone())
+                })
+                .map(|raw| {
+                    let opentelemetry::logs::AnyValue::String(raw) = raw else {
+                        panic!("ocsf.raw should be a string");
+                    };
+                    serde_json::from_str::<serde_json::Value>(raw.as_str()).unwrap()
+                })
+                .collect()
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while audit_records().len() < 4 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "audit records never arrived"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let emitted = audit_records();
+
+        let create = &emitted[0];
+        assert_eq!(create["class_uid"], 3004);
+        assert_eq!(create["activity_id"], 1);
+        assert_eq!(create["entity"]["type"], "provider");
+        assert_eq!(create["entity"]["name"], "openai-audit");
+        assert!(
+            create["entity"]["uid"]
+                .as_str()
+                .is_some_and(|uid| !uid.is_empty()),
+            "created entity carries its store id"
+        );
+        assert_eq!(create["unmapped"]["workspace"], "default");
+        assert_eq!(create["unmapped"]["provider_type"], "openai");
+        assert_eq!(create["actor"]["user"]["uid"], "dev-user");
+        assert!(
+            !create.to_string().contains("sk-super-secret"),
+            "credential values must never appear in audit events"
+        );
+
+        let refresh = &emitted[1];
+        assert_eq!(refresh["entity"]["type"], "provider_refresh");
+        assert_eq!(refresh["entity"]["uid"], "openai-audit/OPENAI_API_KEY");
+        assert_eq!(refresh["status"], "Failure");
+        assert!(
+            !refresh.to_string().contains("hunter2-material"),
+            "refresh material must never appear in audit events"
+        );
+
+        let rotate = &emitted[2];
+        assert_eq!(rotate["entity"]["type"], "credential");
+        assert_eq!(rotate["unmapped"]["operation"], "rotate");
+        assert_eq!(rotate["status"], "Failure");
+
+        let import = &emitted[3];
+        assert_eq!(import["entity"]["type"], "provider_profile");
+        assert_eq!(import["status"], "Failure");
+        assert_eq!(import["unmapped"]["profile_count"], 0);
+        assert_eq!(import["unmapped"]["scope"], "workspace");
+
+        worker.shutdown().await;
+    }
 
     #[test]
     fn env_key_validation_accepts_valid_keys() {

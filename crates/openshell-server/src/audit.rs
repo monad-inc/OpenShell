@@ -219,8 +219,20 @@ pub fn emit_entity_outcome<T>(
     result: &Result<tonic::Response<T>, tonic::Status>,
     outcome: EntityOutcome<'_>,
 ) {
+    emit_entity_outcome_judged(result, |_| true, outcome);
+}
+
+/// Like [`emit_entity_outcome`], but an `Ok` response's success is judged
+/// from its body — for RPCs that report a rejected mutation inside an `Ok`
+/// response (e.g. profile import returning diagnostics with
+/// `imported: false`).
+pub fn emit_entity_outcome_judged<T>(
+    result: &Result<tonic::Response<T>, tonic::Status>,
+    response_success: impl FnOnce(&T) -> bool,
+    outcome: EntityOutcome<'_>,
+) {
     let success = match result {
-        Ok(_) => true,
+        Ok(response) => response_success(response.get_ref()),
         Err(status) => {
             if !audited_failure(status) {
                 return;
