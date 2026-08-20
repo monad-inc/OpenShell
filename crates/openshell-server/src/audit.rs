@@ -163,13 +163,12 @@ pub fn audited_failure(status: &tonic::Status) -> bool {
     )
 }
 
-/// Emit an Entity Management \[3004\] audit event on the gateway lane.
+/// Build and emit an Entity Management \[3004\] event on the gateway lane.
 ///
-/// One call per mutation, after the outcome is known. `unmapped` carries the
-/// operation-specific context the taxonomy assigns (e.g. `workspace` on
-/// membership events, `operation` on non-CRUD verbs); `request_id` is added
-/// to it when present.
-pub fn emit_entity_event(
+/// Private on purpose: callers go through [`emit_entity_outcome`] /
+/// [`emit_entity_outcome_judged`], which apply the audit `enabled` toggle
+/// and the denial-exclusion rule before reaching here.
+fn emit_entity_event(
     activity: EntityActivityId,
     entity: ManagedEntity,
     principal: &Principal,
@@ -211,15 +210,17 @@ pub struct EntityOutcome<'a> {
 
 /// Emit the Entity Management \[3004\] audit event for a finished handler.
 ///
-/// Success emits with `Success`; a failure emits with `Failure` unless the
-/// rejection was an authentication/authorization denial (see
-/// [`audited_failure`]), which is the authentication boundary's event, not a
-/// mutation attempt.
+/// No-op when the master audit toggle (`[openshell.gateway.audit] enabled`,
+/// `OPENSHELL_AUDIT_EVENTS`) is off. Success emits with `Success`; a failure
+/// emits with `Failure` unless the rejection was an authentication/
+/// authorization denial (see [`audited_failure`]), which is the
+/// authentication boundary's event, not a mutation attempt.
 pub fn emit_entity_outcome<T>(
+    audit: &openshell_core::GatewayAuditConfig,
     result: &Result<tonic::Response<T>, tonic::Status>,
     outcome: EntityOutcome<'_>,
 ) {
-    emit_entity_outcome_judged(result, |_| true, outcome);
+    emit_entity_outcome_judged(audit, result, |_| true, outcome);
 }
 
 /// Like [`emit_entity_outcome`], but an `Ok` response's success is judged
@@ -227,10 +228,14 @@ pub fn emit_entity_outcome<T>(
 /// response (e.g. profile import returning diagnostics with
 /// `imported: false`).
 pub fn emit_entity_outcome_judged<T>(
+    audit: &openshell_core::GatewayAuditConfig,
     result: &Result<tonic::Response<T>, tonic::Status>,
     response_success: impl FnOnce(&T) -> bool,
     outcome: EntityOutcome<'_>,
 ) {
+    if !audit.enabled {
+        return;
+    }
     let success = match result {
         Ok(response) => response_success(response.get_ref()),
         Err(status) => {

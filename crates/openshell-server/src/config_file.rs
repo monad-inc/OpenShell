@@ -654,9 +654,22 @@ auth_success_events = true
         let tmp = write_tmp(toml);
         let file = load(tmp.path()).expect("valid audit config parses");
         let audit = file.openshell.gateway.audit.expect("audit config");
+        assert!(audit.enabled, "enabled defaults to true");
         assert!(audit.auth_success_events);
         assert!(audit.exec_args, "exec_args defaults to true");
         assert!(audit.settings_values, "settings_values defaults to true");
+    }
+
+    #[test]
+    fn audit_config_can_disable_audit_events() {
+        let tmp = write_tmp(
+            r"
+[openshell.gateway.audit]
+enabled = false
+",
+        );
+        let file = load(tmp.path()).expect("valid audit config parses");
+        assert!(!file.openshell.gateway.audit.expect("audit config").enabled);
     }
 
     #[test]
@@ -665,6 +678,7 @@ auth_success_events = true
         let file = load(tmp.path()).expect("empty gateway table parses");
         assert!(file.openshell.gateway.audit.is_none());
         let defaults = GatewayAuditConfig::default();
+        assert!(defaults.enabled);
         assert!(!defaults.auth_success_events);
         assert!(defaults.exec_args);
         assert!(defaults.settings_values);

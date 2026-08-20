@@ -141,9 +141,12 @@ data:
     {{- end }}
     {{- end }}
 
-    {{- if or .Values.server.audit.authSuccessEvents (not .Values.server.audit.execArgs) (not .Values.server.audit.settingsValues) }}
+    {{- if or (not .Values.server.audit.enabled) .Values.server.audit.authSuccessEvents (not .Values.server.audit.execArgs) (not .Values.server.audit.settingsValues) }}
 
     [openshell.gateway.audit]
+    {{- if not .Values.server.audit.enabled }}
+    enabled             = false
+    {{- end }}
     {{- if .Values.server.audit.authSuccessEvents }}
     auth_success_events = true
     {{- end }}

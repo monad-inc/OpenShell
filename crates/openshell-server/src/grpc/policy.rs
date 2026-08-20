@@ -275,13 +275,17 @@ fn build_update_config_settings_audit_event(
 
 /// Emit the settings-mutation audit event once the outcome is known:
 /// sandbox-scoped mutations land in that sandbox's stream, global ones ride
-/// the gateway lane.
+/// the gateway lane. No-op when the master audit toggle
+/// (`[openshell.gateway.audit] enabled`, `OPENSHELL_AUDIT_EVENTS`) is off.
 fn emit_update_config_settings_audit(
     state: &ServerState,
     principal: &Principal,
     request_id: Option<&str>,
     event: &SettingsAuditEvent<'_>,
 ) {
+    if !state.config.audit.enabled {
+        return;
+    }
     let built = build_update_config_settings_audit_event(
         state.config.audit.settings_values,
         principal,

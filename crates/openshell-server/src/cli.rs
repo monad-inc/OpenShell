@@ -146,6 +146,49 @@ struct RunArgs {
     )]
     enable_mtls_auth: bool,
 
+    /// Emit gateway audit events (OCSF records for state-changing RPCs,
+    /// carrying the authenticated principal). On by default; set to false
+    /// for deployments that do not want a governance paper trail.
+    #[arg(
+        long = "audit-events",
+        env = "OPENSHELL_AUDIT_EVENTS",
+        default_value_t = true,
+        action = ArgAction::Set
+    )]
+    audit_events: bool,
+
+    /// Also emit an audit event per successfully authenticated request
+    /// (a complete authentication ledger). Failures are always emitted.
+    #[arg(
+        long = "audit-auth-success-events",
+        env = "OPENSHELL_AUDIT_AUTH_SUCCESS_EVENTS",
+        default_value_t = false,
+        action = ArgAction::Set
+    )]
+    audit_auth_success_events: bool,
+
+    /// Record full command lines in sandbox exec audit events. Set to false
+    /// when command lines may carry secrets; records then carry only the
+    /// binary name.
+    #[arg(
+        long = "audit-exec-args",
+        env = "OPENSHELL_AUDIT_EXEC_ARGS",
+        default_value_t = true,
+        action = ArgAction::Set
+    )]
+    audit_exec_args: bool,
+
+    /// Record before/after values of changed settings in settings audit
+    /// events. Set to false to record key names only; credential-pattern
+    /// keys are always redacted regardless.
+    #[arg(
+        long = "audit-settings-values",
+        env = "OPENSHELL_AUDIT_SETTINGS_VALUES",
+        default_value_t = true,
+        action = ArgAction::Set
+    )]
+    audit_settings_values: bool,
+
     /// Expected OIDC audience claim (typically the client ID).
     #[arg(long, env = "OPENSHELL_OIDC_AUDIENCE", default_value = "openshell-cli")]
     oidc_audience: String,
@@ -313,11 +356,9 @@ fn prepare_server_config(args: &mut RunArgs, matches: &ArgMatches) -> Result<Ser
     if let Some(auth) = file.as_ref().and_then(|f| f.openshell.gateway.auth.clone()) {
         config.auth = auth;
     }
-    if let Some(audit) = file
-        .as_ref()
-        .and_then(|f| f.openshell.gateway.audit.clone())
-    {
-        config.audit = audit;
+    config.audit = resolve_audit_config(args, matches, file.as_ref());
+    if !config.audit.enabled {
+        info!("gateway audit events disabled by configuration");
     }
     config.mtls_auth.enabled = mtls_auth_enabled;
 
@@ -580,6 +621,33 @@ fn arg_defaulted(matches: &ArgMatches, id: &str) -> bool {
         matches.value_source(id),
         None | Some(ValueSource::DefaultValue)
     )
+}
+
+/// Resolve the gateway audit config: the `[openshell.gateway.audit]` file
+/// table applies first, then each CLI flag / `OPENSHELL_AUDIT_*` env var
+/// overrides its field per the standard precedence
+/// (CLI > env > TOML > default).
+fn resolve_audit_config(
+    args: &RunArgs,
+    matches: &ArgMatches,
+    file: Option<&ConfigFile>,
+) -> openshell_core::GatewayAuditConfig {
+    let mut audit = file
+        .and_then(|f| f.openshell.gateway.audit.clone())
+        .unwrap_or_default();
+    if !arg_defaulted(matches, "audit_events") {
+        audit.enabled = args.audit_events;
+    }
+    if !arg_defaulted(matches, "audit_auth_success_events") {
+        audit.auth_success_events = args.audit_auth_success_events;
+    }
+    if !arg_defaulted(matches, "audit_exec_args") {
+        audit.exec_args = args.audit_exec_args;
+    }
+    if !arg_defaulted(matches, "audit_settings_values") {
+        audit.settings_values = args.audit_settings_values;
+    }
+    audit
 }
 
 /// Resolve the bind address for an auxiliary listener (health / metrics).
@@ -1773,6 +1841,79 @@ enable_loopback_service_http = false
             args.enable_loopback_service_http,
             "env var must win over file"
         );
+    }
+
+    #[test]
+    fn audit_config_defaults_on_without_file_or_env() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g1 = EnvVarGuard::remove("OPENSHELL_AUDIT_EVENTS");
+        let _g2 = EnvVarGuard::remove("OPENSHELL_AUDIT_AUTH_SUCCESS_EVENTS");
+        let _g3 = EnvVarGuard::remove("OPENSHELL_AUDIT_EXEC_ARGS");
+        let _g4 = EnvVarGuard::remove("OPENSHELL_AUDIT_SETTINGS_VALUES");
+
+        let (args, matches) =
+            parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
+        let audit = super::resolve_audit_config(&args, &matches, None);
+        assert!(audit.enabled, "audit events default on");
+        assert!(!audit.auth_success_events);
+        assert!(audit.exec_args);
+        assert!(audit.settings_values);
+    }
+
+    #[test]
+    fn audit_env_vars_override_the_file_table_in_both_directions() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g1 = EnvVarGuard::set("OPENSHELL_AUDIT_EVENTS", "false");
+        let _g2 = EnvVarGuard::set("OPENSHELL_AUDIT_AUTH_SUCCESS_EVENTS", "true");
+        let _g3 = EnvVarGuard::remove("OPENSHELL_AUDIT_EXEC_ARGS");
+        let _g4 = EnvVarGuard::remove("OPENSHELL_AUDIT_SETTINGS_VALUES");
+
+        let (args, matches) =
+            parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
+        let file = config_file_from_toml(
+            r"
+[openshell.gateway.audit]
+enabled             = true
+auth_success_events = false
+exec_args           = false
+",
+        );
+        let audit = super::resolve_audit_config(&args, &matches, Some(&file));
+        assert!(!audit.enabled, "env false must beat file true");
+        assert!(
+            audit.auth_success_events,
+            "env true must beat the file default false"
+        );
+        assert!(!audit.exec_args, "file value survives when no env is set");
+        assert!(audit.settings_values, "untouched fields keep their default");
+    }
+
+    #[test]
+    fn audit_cli_flag_overrides_env_and_file() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g1 = EnvVarGuard::set("OPENSHELL_AUDIT_EVENTS", "false");
+
+        let (args, matches) = parse_with_args(&[
+            "openshell-gateway",
+            "--db-url",
+            "sqlite::memory:",
+            "--audit-events",
+            "true",
+        ]);
+        let file = config_file_from_toml(
+            r"
+[openshell.gateway.audit]
+enabled = false
+",
+        );
+        let audit = super::resolve_audit_config(&args, &matches, Some(&file));
+        assert!(audit.enabled, "CLI flag must beat both env var and file");
     }
 
     #[test]

@@ -2090,6 +2090,7 @@ pub(super) async fn handle_create_provider(
     let result = handle_create_provider_inner(state, request).await;
 
     audit::emit_entity_outcome(
+        &state.config.audit,
         &result,
         audit::EntityOutcome {
             activity: EntityActivityId::Create,
@@ -2338,6 +2339,7 @@ pub(super) async fn handle_import_provider_profiles(
     unmapped.push(("profile_count", serde_json::Value::from(count)));
     unmapped.push(("profiles", serde_json::Value::from(profile_ids.clone())));
     audit::emit_entity_outcome_judged(
+        &state.config.audit,
         &result,
         |response| response.imported,
         audit::EntityOutcome {
@@ -2458,6 +2460,7 @@ pub(super) async fn handle_update_provider_profiles(
     let result = handle_update_provider_profiles_inner(state, request).await;
 
     audit::emit_entity_outcome_judged(
+        &state.config.audit,
         &result,
         |response| response.updated,
         audit::EntityOutcome {
@@ -2647,6 +2650,7 @@ pub(super) async fn handle_delete_provider_profile(
     let result = handle_delete_provider_profile_inner(state, request).await;
 
     audit::emit_entity_outcome(
+        &state.config.audit,
         &result,
         audit::EntityOutcome {
             activity: EntityActivityId::Delete,
@@ -3399,6 +3403,7 @@ pub(super) async fn handle_update_provider(
     let result = handle_update_provider_inner(state, request).await;
 
     audit::emit_entity_outcome(
+        &state.config.audit,
         &result,
         audit::EntityOutcome {
             activity: EntityActivityId::Update,
@@ -3553,6 +3558,7 @@ pub(super) async fn handle_configure_provider_refresh(
     // Identity fields only — refresh material and secret key names never
     // enter the audit record.
     audit::emit_entity_outcome(
+        &state.config.audit,
         &result,
         audit::EntityOutcome {
             activity: EntityActivityId::Update,
@@ -3892,6 +3898,7 @@ pub(super) async fn handle_rotate_provider_credential(
     // Identity fields only — the minted credential never enters the audit
     // record.
     audit::emit_entity_outcome(
+        &state.config.audit,
         &result,
         audit::EntityOutcome {
             activity: EntityActivityId::Update,
@@ -3997,6 +4004,7 @@ pub(super) async fn handle_delete_provider_refresh(
     let result = handle_delete_provider_refresh_inner(state, request).await;
 
     audit::emit_entity_outcome(
+        &state.config.audit,
         &result,
         audit::EntityOutcome {
             activity: EntityActivityId::Delete,
@@ -4110,6 +4118,7 @@ pub(super) async fn handle_delete_provider(
     let result = handle_delete_provider_inner(state, request).await;
 
     audit::emit_entity_outcome(
+        &state.config.audit,
         &result,
         audit::EntityOutcome {
             activity: EntityActivityId::Delete,

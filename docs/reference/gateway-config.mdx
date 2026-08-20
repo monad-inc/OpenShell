@@ -155,8 +155,9 @@ allow_unauthenticated_users = false
 [openshell.gateway.mtls_auth]
 enabled = false
 
-# Audit event depth toggles. Omit the table to keep the defaults shown here.
+# Audit event toggles. Omit the table to keep the defaults shown here.
 [openshell.gateway.audit]
+enabled             = true
 auth_success_events = false
 exec_args           = true
 settings_values     = true
@@ -316,16 +317,28 @@ The gateway flushes buffered spans during shutdown, so spans from in-flight requ
 
 ## Audit Events
 
-The gateway emits an OCSF audit event for every state-changing operation — workspace, member, provider, sandbox, credential, policy, and settings mutations — carrying the authenticated principal as the actor. Audit events are always on and ride the same export pipeline as other gateway events. `[openshell.gateway.audit]` controls their depth, not their existence; omit the table to keep the defaults.
+The gateway emits an OCSF audit event for every state-changing operation — workspace, member, provider, sandbox, credential, policy, and settings mutations — carrying the authenticated principal as the actor. Audit events are on by default and ride the same export pipeline as other gateway events. `[openshell.gateway.audit]` controls the master switch and the record depth; omit the table to keep the defaults.
 
 ```toml
 [openshell.gateway.audit]
+enabled             = true   # master switch for gateway audit events
 auth_success_events = false  # emit an event per authenticated request too
 exec_args           = true   # record full command lines in exec audit events
 settings_values     = true   # record before/after values in settings audit events
 ```
 
-`auth_success_events` adds a success event for every authenticated request, producing a complete authentication ledger for deployments that accept the volume. Authentication failures are always emitted.
+Every field is also settable with an environment variable or CLI flag, which override the file per the standard precedence (CLI flag > environment variable > TOML > default):
+
+| TOML field | Environment variable | CLI flag | Default |
+|---|---|---|---|
+| `enabled` | `OPENSHELL_AUDIT_EVENTS` | `--audit-events` | `true` |
+| `auth_success_events` | `OPENSHELL_AUDIT_AUTH_SUCCESS_EVENTS` | `--audit-auth-success-events` | `false` |
+| `exec_args` | `OPENSHELL_AUDIT_EXEC_ARGS` | `--audit-exec-args` | `true` |
+| `settings_values` | `OPENSHELL_AUDIT_SETTINGS_VALUES` | `--audit-settings-values` | `true` |
+
+`enabled = false` (or `OPENSHELL_AUDIT_EVENTS=false`) turns gateway audit events off entirely, for deployments that do not want a governance paper trail. The mutations themselves are unaffected.
+
+`auth_success_events` adds a success event for every authenticated request, producing a complete authentication ledger for deployments that accept the volume. Authentication failures are always emitted while audit events are enabled.
 
 `exec_args = false` reduces sandbox exec audit records to the binary name. Use it when command lines may carry secrets.
 

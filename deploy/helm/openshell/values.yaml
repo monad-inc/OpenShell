@@ -386,10 +386,13 @@ server:
     # the human-readable summary. No effect unless exportLogs is true.
     ocsfFullPayload: false
 
-  # Gateway audit event depth toggles. Renders the [openshell.gateway.audit]
+  # Gateway audit event toggles. Renders the [openshell.gateway.audit]
   # table only when a value differs from the gateway's built-in default.
-  # Audit events themselves are always on.
   audit:
+    # -- Emit gateway audit events (OCSF records for state-changing RPCs,
+    # carrying the authenticated principal). On by default; set false for
+    # deployments that do not want a governance paper trail.
+    enabled: true
     # -- Also emit an Authentication event for every successfully
     # authenticated request, producing a complete authentication ledger.
     # Failures are always emitted; successes multiply volume by request rate.

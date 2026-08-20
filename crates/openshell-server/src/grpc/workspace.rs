@@ -160,6 +160,7 @@ pub(super) async fn handle_create_workspace(
             .map(|m| m.id.clone())
     });
     audit::emit_entity_outcome(
+        &state.config.audit,
         &result,
         audit::EntityOutcome {
             activity: EntityActivityId::Create,
@@ -334,6 +335,7 @@ pub(super) async fn handle_delete_workspace(
     let result = handle_delete_workspace_inner(state, request).await;
 
     audit::emit_entity_outcome(
+        &state.config.audit,
         &result,
         audit::EntityOutcome {
             activity: EntityActivityId::Delete,
@@ -540,6 +542,7 @@ pub(super) async fn handle_add_workspace_member(
         unmapped.push(("role", serde_json::Value::from(role)));
     }
     audit::emit_entity_outcome(
+        &state.config.audit,
         &result,
         audit::EntityOutcome {
             activity: EntityActivityId::Create,
@@ -673,6 +676,7 @@ pub(super) async fn handle_remove_workspace_member(
     let result = handle_remove_workspace_member_inner(state, request).await;
 
     audit::emit_entity_outcome(
+        &state.config.audit,
         &result,
         audit::EntityOutcome {
             activity: EntityActivityId::Delete,
@@ -868,6 +872,105 @@ mod tests {
         assert_eq!(delete_json["activity_id"], 4);
         assert_eq!(delete_json["entity"]["name"], "default");
         assert_eq!(delete_json["status"], "Failure");
+
+        worker.shutdown().await;
+    }
+
+    /// `[openshell.gateway.audit] enabled = false` (or
+    /// `OPENSHELL_AUDIT_EVENTS=false`) must silence every audit emission
+    /// path — entity events and settings events alike — without touching
+    /// the mutations themselves. A control event emitted below the toggle
+    /// proves the export pipeline itself stayed healthy.
+    #[tokio::test]
+    async fn disabled_audit_config_suppresses_all_audit_events() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let exporter = opentelemetry_sdk::logs::InMemoryLogExporter::default();
+        let (handle, worker) = crate::log_export::spawn(
+            exporter.clone(),
+            opentelemetry_sdk::Resource::builder_empty().build(),
+            true,
+        );
+        let bus = crate::tracing_bus::TracingLogBus::new();
+        bus.set_export(handle);
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state).unwrap().config.audit.enabled = false;
+
+        {
+            let subscriber = tracing_subscriber::registry().with(bus.layer());
+            let _guard = crate::otel_tracing::test_exporter::install_scoped(subscriber);
+
+            // Entity path: the mutation must succeed, silently.
+            let resp = handle_create_workspace(
+                &state,
+                authed_request(CreateWorkspaceRequest {
+                    name: "quiet-ws".to_string(),
+                    labels: HashMap::new(),
+                }),
+            )
+            .await
+            .unwrap();
+            assert!(resp.get_ref().workspace.is_some());
+
+            // Settings path.
+            crate::grpc::policy::handle_update_config(
+                &state,
+                authed_request(openshell_core::proto::UpdateConfigRequest {
+                    global: true,
+                    setting_key: openshell_core::settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
+                    setting_value: Some(openshell_core::proto::SettingValue {
+                        value: Some(openshell_core::proto::setting_value::Value::BoolValue(true)),
+                    }),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+
+            // Control: raw emission below the toggle, so the queue ordering
+            // proves the suppressed events are absent rather than late.
+            audit::emit(
+                openshell_ocsf::EntityManagementBuilder::new(audit::ctx())
+                    .activity(EntityActivityId::Create)
+                    .entity(ManagedEntity::new("audit_test_control", "control-1"))
+                    .build(),
+            );
+        }
+
+        let ocsf_records = || -> Vec<serde_json::Value> {
+            exporter
+                .get_emitted_logs()
+                .unwrap()
+                .iter()
+                .filter_map(|log| {
+                    log.record
+                        .attributes_iter()
+                        .find(|(k, _)| k.as_str() == "ocsf.raw")
+                        .map(|(_, v)| v.clone())
+                })
+                .map(|raw| {
+                    let opentelemetry::logs::AnyValue::String(raw) = raw else {
+                        panic!("ocsf.raw should be a string");
+                    };
+                    serde_json::from_str::<serde_json::Value>(raw.as_str()).unwrap()
+                })
+                .collect()
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while ocsf_records().is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "control record never arrived"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let records = ocsf_records();
+        assert_eq!(
+            records.len(),
+            1,
+            "disabled audit config must suppress all audit events: {records:?}"
+        );
+        assert_eq!(records[0]["entity"]["type"], "audit_test_control");
 
         worker.shutdown().await;
     }
