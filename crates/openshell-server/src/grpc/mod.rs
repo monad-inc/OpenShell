@@ -804,7 +804,9 @@ pub mod test_support {
                 .await
                 .unwrap(),
         );
-        crate::ensure_default_workspace(&store).await.unwrap();
+        crate::ensure_default_workspace(&store, &openshell_core::GatewayAuditConfig::default())
+            .await
+            .unwrap();
         let compute = if driver_name == "test" {
             new_test_runtime(store.clone()).await
         } else {
@@ -834,7 +836,9 @@ pub mod test_support {
                 .await
                 .unwrap(),
         );
-        crate::ensure_default_workspace(&store).await.unwrap();
+        crate::ensure_default_workspace(&store, &openshell_core::GatewayAuditConfig::default())
+            .await
+            .unwrap();
         let driver = Arc::new(NoopTestDriver::failing_workspace_deletes(failures));
         let compute = new_test_runtime_with_driver(store.clone(), "test", driver).await;
         Arc::new(ServerState::new(

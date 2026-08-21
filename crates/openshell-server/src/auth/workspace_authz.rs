@@ -150,15 +150,31 @@ pub async fn authorize_sandbox_workspace(
 /// Require Platform Admin status. Used for cross-workspace operations like
 /// `list_*` with `all_workspaces: true`.
 #[allow(clippy::result_large_err)]
-pub fn require_platform_admin(admin_role: &str, principal: &Principal) -> Result<(), Status> {
+pub fn require_platform_admin(
+    admin_role: &str,
+    principal: &Principal,
+    audit: &openshell_core::GatewayAuditConfig,
+) -> Result<(), Status> {
     match principal {
         Principal::User(user) if is_platform_admin(&user.identity.roles, admin_role) => Ok(()),
+        // Routine user RBAC denials stay plain status/log records — a
+        // governance noise floor, not findings.
         Principal::User(_) => Err(Status::permission_denied(
             "platform admin role required for cross-workspace operations",
         )),
-        Principal::Sandbox(_) => Err(Status::permission_denied(
-            "sandbox principals cannot perform cross-workspace operations",
-        )),
+        Principal::Sandbox(sandbox) => {
+            // A sandbox principal reaching for a platform-admin operation is
+            // a suspicious pattern; dual-emit the finding for security
+            // monitoring alongside the denial.
+            crate::audit::emit_sandbox_admin_attempt_finding(
+                audit,
+                &sandbox.sandbox_id,
+                "platform_admin",
+            );
+            Err(Status::permission_denied(
+                "sandbox principals cannot perform cross-workspace operations",
+            ))
+        }
         Principal::Anonymous => Err(Status::unauthenticated("authentication required")),
     }
 }

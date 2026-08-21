@@ -568,6 +568,10 @@ pub struct ComputeRuntime {
     lifecycle_gates: Arc<LifecycleGateRegistry>,
     gateway_listener_requirements: Vec<GatewayListenerRequirement>,
     replica_id: String,
+    /// Audit toggles for reconciliation events (system-actor emissions).
+    /// Defaults on; the server overrides with its resolved config at startup
+    /// via [`ComputeRuntime::set_audit_config`].
+    audit: openshell_core::GatewayAuditConfig,
 }
 
 impl fmt::Debug for ComputeRuntime {
@@ -686,6 +690,7 @@ impl ComputeRuntime {
             lifecycle_gates: Arc::new(LifecycleGateRegistry::default()),
             gateway_listener_requirements,
             replica_id: lease::replica_id(),
+            audit: openshell_core::GatewayAuditConfig::default(),
         })
     }
 
@@ -1753,6 +1758,16 @@ impl ComputeRuntime {
             .await
         {
             Ok(true) => {
+                self.emit_reconcile_audit(
+                    openshell_ocsf::enums::EntityActivityId::Delete,
+                    sandbox_id,
+                    sandbox.object_name(),
+                    format!(
+                        "sandbox {} removed: backend resource missing",
+                        sandbox.object_name()
+                    ),
+                    vec![("operation", serde_json::Value::from("reconcile_delete"))],
+                );
                 self.cleanup_removed_sandbox_state(sandbox_id);
                 Ok(true)
             }
@@ -2361,6 +2376,40 @@ impl ComputeRuntime {
         Ok(())
     }
 
+    /// Set the resolved audit toggles for reconciliation audit events.
+    /// Called once by the server at startup; tests keep the on-by-default.
+    pub fn set_audit_config(&mut self, audit: openshell_core::GatewayAuditConfig) {
+        self.audit = audit;
+    }
+
+    /// Audit a reconciliation-driven sandbox mutation (backend divergence,
+    /// startup recovery) under the `system:compute-reconcile` actor — an
+    /// out-of-band deletion or error-phase must be as visible as a
+    /// request-driven one.
+    fn emit_reconcile_audit(
+        &self,
+        activity: openshell_ocsf::enums::EntityActivityId,
+        sandbox_id: &str,
+        sandbox_name: &str,
+        message: String,
+        unmapped: Vec<(&'static str, serde_json::Value)>,
+    ) {
+        crate::audit::emit_system_entity(
+            &self.audit,
+            true,
+            crate::audit::SystemEntityOutcome {
+                activity,
+                entity: openshell_ocsf::objects::ManagedEntity::new("sandbox", sandbox_id)
+                    .with_name(sandbox_name),
+                sandbox: Some((sandbox_id, sandbox_name)),
+                component: "compute-reconcile",
+                success_message: message,
+                failure_message: String::new(),
+                unmapped,
+            },
+        );
+    }
+
     async fn list_persisted_sandbox_ids(&self, operation: &str) -> Result<Vec<String>, String> {
         let mut sandbox_ids = Vec::new();
         let mut offset = 0u32;
@@ -2408,6 +2457,19 @@ impl ComputeRuntime {
             .await
         {
             Ok(updated) => {
+                self.emit_reconcile_audit(
+                    openshell_ocsf::enums::EntityActivityId::Update,
+                    &sandbox_id,
+                    updated.object_name(),
+                    format!(
+                        "sandbox {} marked Error during startup recovery: {reason}",
+                        updated.object_name()
+                    ),
+                    vec![
+                        ("operation", serde_json::Value::from("mark_error")),
+                        ("reason", serde_json::Value::from(reason.clone())),
+                    ],
+                );
                 self.sandbox_index.update_from_sandbox(&updated);
                 self.sandbox_watch_bus.notify(&sandbox_id);
             }
@@ -2976,11 +3038,24 @@ impl ComputeRuntime {
             self.cleanup_sandbox_owned_records(sandbox).await?;
         }
 
-        let _ = self
+        let deleted = self
             .store
             .delete(Sandbox::object_type(), sandbox_id)
             .await
             .map_err(|e| e.to_string())?;
+        if deleted {
+            let sandbox_name = sandbox
+                .as_ref()
+                .map(|s| s.object_name().to_string())
+                .unwrap_or_default();
+            self.emit_reconcile_audit(
+                openshell_ocsf::enums::EntityActivityId::Delete,
+                sandbox_id,
+                &sandbox_name,
+                format!("sandbox {sandbox_name} removed after backend deletion"),
+                vec![("operation", serde_json::Value::from("reconcile_delete"))],
+            );
+        }
         self.cleanup_removed_sandbox_state(sandbox_id);
         Ok(())
     }
@@ -3261,6 +3336,16 @@ impl ComputeRuntime {
                 sandbox_name = %sandbox_name,
                 phase = ?phase,
                 "Retained sandbox resource disappeared from the compute driver"
+            );
+            self.emit_reconcile_audit(
+                openshell_ocsf::enums::EntityActivityId::Update,
+                &sandbox_id,
+                &sandbox_name,
+                format!("sandbox {sandbox_name} marked Error: backend resource missing"),
+                vec![
+                    ("operation", serde_json::Value::from("mark_error")),
+                    ("reason", serde_json::Value::from("ComputeResourceMissing")),
+                ],
             );
             self.sandbox_index.update_from_sandbox(&updated);
             self.sandbox_watch_bus.notify(&sandbox_id);
@@ -4245,6 +4330,7 @@ pub async fn new_test_runtime_with_driver(
         lifecycle_gates: Arc::new(LifecycleGateRegistry::default()),
         gateway_listener_requirements: Vec::new(),
         replica_id: "test-replica".to_string(),
+        audit: openshell_core::GatewayAuditConfig::default(),
     }
 }
 
@@ -4929,6 +5015,7 @@ mod tests {
             lifecycle_gates: Arc::new(LifecycleGateRegistry::default()),
             gateway_listener_requirements: Vec::new(),
             replica_id: "test-replica".to_string(),
+            audit: openshell_core::GatewayAuditConfig::default(),
         }
     }
 

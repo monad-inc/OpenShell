@@ -27,7 +27,11 @@ use tracing::info;
 /// on. Name-keyed handlers must resolve the name to a UUID via the
 /// store before calling this guard.
 #[allow(clippy::result_large_err)]
-pub fn ensure_sandbox_scope(principal: &Principal, claimed_sandbox_id: &str) -> Result<(), Status> {
+pub fn ensure_sandbox_scope(
+    principal: &Principal,
+    claimed_sandbox_id: &str,
+    audit: &openshell_core::GatewayAuditConfig,
+) -> Result<(), Status> {
     match principal {
         Principal::User(_) => Ok(()),
         Principal::Sandbox(p) => {
@@ -39,6 +43,9 @@ pub fn ensure_sandbox_scope(principal: &Principal, claimed_sandbox_id: &str) -> 
                     requested_sandbox_id = %claimed_sandbox_id,
                     "cross-sandbox access denied"
                 );
+                // Dual-emit: the denial log above stays the domain record;
+                // the finding escalates the pattern for security monitoring.
+                crate::audit::emit_cross_sandbox_finding(audit, &p.sandbox_id, claimed_sandbox_id);
                 Err(Status::permission_denied(
                     "cross-sandbox access denied: principal does not own this sandbox",
                 ))
@@ -57,13 +64,14 @@ pub fn ensure_sandbox_scope(principal: &Principal, claimed_sandbox_id: &str) -> 
 pub fn enforce_sandbox_scope<T>(
     request: &tonic::Request<T>,
     claimed_sandbox_id: &str,
+    audit: &openshell_core::GatewayAuditConfig,
 ) -> Result<Principal, Status> {
     let principal = request
         .extensions()
         .get::<Principal>()
         .cloned()
         .ok_or_else(|| Status::unauthenticated("missing principal"))?;
-    ensure_sandbox_scope(&principal, claimed_sandbox_id)?;
+    ensure_sandbox_scope(&principal, claimed_sandbox_id, audit)?;
     Ok(principal)
 }
 
@@ -78,10 +86,11 @@ pub fn enforce_sandbox_scope<T>(
 pub fn ensure_sandbox_principal_scope(
     principal: &Principal,
     claimed_sandbox_id: &str,
+    audit: &openshell_core::GatewayAuditConfig,
 ) -> Result<SandboxPrincipal, Status> {
     match principal {
         Principal::Sandbox(p) => {
-            ensure_sandbox_scope(principal, claimed_sandbox_id)?;
+            ensure_sandbox_scope(principal, claimed_sandbox_id, audit)?;
             Ok(p.clone())
         }
         Principal::User(_) => Err(Status::permission_denied(
@@ -124,39 +133,70 @@ mod tests {
     #[test]
     fn user_principal_bypasses_equality_check() {
         // RBAC was the user's gate at the router layer.
-        assert!(ensure_sandbox_scope(&user("alice"), "any-sandbox").is_ok());
+        assert!(
+            ensure_sandbox_scope(
+                &user("alice"),
+                "any-sandbox",
+                &openshell_core::GatewayAuditConfig::default()
+            )
+            .is_ok()
+        );
     }
 
     #[test]
     fn sandbox_principal_matching_id_is_allowed() {
-        assert!(ensure_sandbox_scope(&sandbox("sbx-1"), "sbx-1").is_ok());
+        assert!(
+            ensure_sandbox_scope(
+                &sandbox("sbx-1"),
+                "sbx-1",
+                &openshell_core::GatewayAuditConfig::default()
+            )
+            .is_ok()
+        );
     }
 
     #[test]
     fn sandbox_principal_mismatched_id_is_denied() {
-        let err =
-            ensure_sandbox_scope(&sandbox("sbx-1"), "sbx-2").expect_err("must deny cross-sandbox");
+        let err = ensure_sandbox_scope(
+            &sandbox("sbx-1"),
+            "sbx-2",
+            &openshell_core::GatewayAuditConfig::default(),
+        )
+        .expect_err("must deny cross-sandbox");
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
     }
 
     #[test]
     fn anonymous_principal_is_rejected() {
-        let err =
-            ensure_sandbox_scope(&Principal::Anonymous, "sbx-1").expect_err("must reject anon");
+        let err = ensure_sandbox_scope(
+            &Principal::Anonymous,
+            "sbx-1",
+            &openshell_core::GatewayAuditConfig::default(),
+        )
+        .expect_err("must reject anon");
         assert_eq!(err.code(), tonic::Code::Unauthenticated);
     }
 
     #[test]
     fn sandbox_principal_scope_returns_matching_sandbox() {
         let principal = sandbox("sbx-1");
-        let scoped = ensure_sandbox_principal_scope(&principal, "sbx-1").expect("scope OK");
+        let scoped = ensure_sandbox_principal_scope(
+            &principal,
+            "sbx-1",
+            &openshell_core::GatewayAuditConfig::default(),
+        )
+        .expect("scope OK");
         assert_eq!(scoped.sandbox_id, "sbx-1");
     }
 
     #[test]
     fn sandbox_principal_scope_rejects_users() {
-        let err = ensure_sandbox_principal_scope(&user("alice"), "sbx-1")
-            .expect_err("users are not supervisor identities");
+        let err = ensure_sandbox_principal_scope(
+            &user("alice"),
+            "sbx-1",
+            &openshell_core::GatewayAuditConfig::default(),
+        )
+        .expect_err("users are not supervisor identities");
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
     }
 
@@ -164,14 +204,24 @@ mod tests {
     fn enforce_reads_from_request_extensions() {
         let mut req = tonic::Request::new(());
         req.extensions_mut().insert(sandbox("sbx-1"));
-        let result = enforce_sandbox_scope(&req, "sbx-1").expect("scope OK");
+        let result = enforce_sandbox_scope(
+            &req,
+            "sbx-1",
+            &openshell_core::GatewayAuditConfig::default(),
+        )
+        .expect("scope OK");
         assert!(matches!(result, Principal::Sandbox(_)));
     }
 
     #[test]
     fn enforce_rejects_request_without_principal() {
         let req = tonic::Request::new(());
-        let err = enforce_sandbox_scope(&req, "sbx-1").expect_err("must require principal");
+        let err = enforce_sandbox_scope(
+            &req,
+            "sbx-1",
+            &openshell_core::GatewayAuditConfig::default(),
+        )
+        .expect_err("must require principal");
         assert_eq!(err.code(), tonic::Code::Unauthenticated);
     }
 }

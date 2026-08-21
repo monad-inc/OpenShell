@@ -580,14 +580,41 @@ fn is_gateway_auth_cookie(name: &str) -> bool {
     name.eq_ignore_ascii_case("CF_Authorization") || name.eq_ignore_ascii_case("cf-authorization")
 }
 
-pub fn emit_service_endpoint_config_event(endpoint: &ServiceEndpoint, url: &str, created: bool) {
-    let event = build_service_endpoint_config_event(endpoint, url, created);
-    emit_gateway_ocsf_event(&endpoint.sandbox_id, event);
+/// Emit the service-endpoint create/update audit event (5019) carrying the
+/// authenticated principal. Structured emission through the audit module:
+/// full `ocsf.raw` payload, sandbox-stream routing, master-toggle gated.
+pub fn emit_service_endpoint_config_event(
+    state: &ServerState,
+    principal: &crate::auth::principal::Principal,
+    endpoint: &ServiceEndpoint,
+    url: &str,
+    created: bool,
+) {
+    if !state.config.audit.enabled {
+        return;
+    }
+    let event = build_service_endpoint_config_event(
+        endpoint,
+        url,
+        created,
+        Some(crate::audit::actor_user(principal)),
+    );
+    crate::audit::emit_for_sandbox(&endpoint.sandbox_id, event);
 }
 
-pub fn emit_service_endpoint_delete_event(endpoint: &ServiceEndpoint) {
-    let event = build_service_endpoint_delete_event(endpoint);
-    emit_gateway_ocsf_event(&endpoint.sandbox_id, event);
+/// Emit the service-endpoint delete audit event (5019) carrying the
+/// authenticated principal.
+pub fn emit_service_endpoint_delete_event(
+    state: &ServerState,
+    principal: &crate::auth::principal::Principal,
+    endpoint: &ServiceEndpoint,
+) {
+    if !state.config.audit.enabled {
+        return;
+    }
+    let event =
+        build_service_endpoint_delete_event(endpoint, Some(crate::audit::actor_user(principal)));
+    crate::audit::emit_for_sandbox(&endpoint.sandbox_id, event);
 }
 
 pub fn emit_cross_origin_service_http_rejection(state: &ServerState, req: &Request<Body>) {
@@ -636,6 +663,7 @@ fn build_service_endpoint_config_event(
     endpoint: &ServiceEndpoint,
     url: &str,
     created: bool,
+    actor: Option<openshell_ocsf::objects::User>,
 ) -> OcsfEvent {
     let service_label = service_display_name(&endpoint.sandbox_name, &endpoint.service_name);
     let state_label = if created {
@@ -659,24 +687,31 @@ fn build_service_endpoint_config_event(
     if !url.is_empty() {
         builder = builder.unmapped("url", url.to_string());
     }
+    if let Some(actor) = actor {
+        builder = builder.actor_user(actor);
+    }
 
     builder.build()
 }
 
-fn build_service_endpoint_delete_event(endpoint: &ServiceEndpoint) -> OcsfEvent {
+fn build_service_endpoint_delete_event(
+    endpoint: &ServiceEndpoint,
+    actor: Option<openshell_ocsf::objects::User>,
+) -> OcsfEvent {
     let service_label = service_display_name(&endpoint.sandbox_name, &endpoint.service_name);
-    ConfigStateChangeBuilder::new(&gateway_ocsf_ctx(
-        &endpoint.sandbox_id,
-        &endpoint.sandbox_name,
-    ))
-    .state(StateId::Disabled, "service_endpoint_deleted")
-    .severity(SeverityId::Informational)
-    .status(StatusId::Success)
-    .message(format!("Service endpoint deleted {service_label}"))
-    .unmapped("endpoint_name", endpoint_name(endpoint))
-    .unmapped("service_name", endpoint.service_name.clone())
-    .unmapped("target_port", u64::from(endpoint.target_port))
-    .build()
+    let ctx = gateway_ocsf_ctx(&endpoint.sandbox_id, &endpoint.sandbox_name);
+    let mut builder = ConfigStateChangeBuilder::new(&ctx)
+        .state(StateId::Disabled, "service_endpoint_deleted")
+        .severity(SeverityId::Informational)
+        .status(StatusId::Success)
+        .message(format!("Service endpoint deleted {service_label}"))
+        .unmapped("endpoint_name", endpoint_name(endpoint))
+        .unmapped("service_name", endpoint.service_name.clone())
+        .unmapped("target_port", u64::from(endpoint.target_port));
+    if let Some(actor) = actor {
+        builder = builder.actor_user(actor);
+    }
+    builder.build()
 }
 
 fn build_service_http_failure_event(
@@ -1072,8 +1107,12 @@ mod tests {
 
     #[test]
     fn service_endpoint_config_event_includes_endpoint_metadata() {
-        let event =
-            build_service_endpoint_config_event(&endpoint(), "http://my-sandbox--web.local/", true);
+        let event = build_service_endpoint_config_event(
+            &endpoint(),
+            "http://my-sandbox--web.local/",
+            true,
+            None,
+        );
         let json = event.to_json().unwrap();
 
         assert_eq!(json["class_uid"], 5019);
@@ -1088,8 +1127,30 @@ mod tests {
     }
 
     #[test]
+    fn service_endpoint_events_carry_the_acting_principal() {
+        let actor = openshell_ocsf::objects::User::new(
+            "alice",
+            "oidc|alice-123",
+            openshell_ocsf::objects::UserTypeId::User,
+        );
+        let event = build_service_endpoint_config_event(
+            &endpoint(),
+            "http://my-sandbox--web.local/",
+            true,
+            Some(actor.clone()),
+        );
+        let json = event.to_json().unwrap();
+        assert_eq!(json["actor"]["user"]["name"], "alice");
+        assert_eq!(json["actor"]["user"]["uid"], "oidc|alice-123");
+
+        let event = build_service_endpoint_delete_event(&endpoint(), Some(actor));
+        let json = event.to_json().unwrap();
+        assert_eq!(json["actor"]["user"]["name"], "alice");
+    }
+
+    #[test]
     fn service_endpoint_delete_event_includes_endpoint_metadata() {
-        let event = build_service_endpoint_delete_event(&endpoint());
+        let event = build_service_endpoint_delete_event(&endpoint(), None);
         let json = event.to_json().unwrap();
 
         assert_eq!(json["class_uid"], 5019);

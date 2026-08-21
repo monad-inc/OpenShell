@@ -133,7 +133,9 @@ pub(super) async fn handle_expose_service(
 
     let url = service_routing::endpoint_url(&state.config, &workspace, &req.sandbox, &req.service)
         .unwrap_or_default();
-    service_routing::emit_service_endpoint_config_event(&endpoint, &url, created);
+    service_routing::emit_service_endpoint_config_event(
+        state, &principal, &endpoint, &url, created,
+    );
 
     Ok(Response::new(ServiceEndpointResponse {
         endpoint: Some(endpoint),
@@ -185,7 +187,7 @@ pub(super) async fn handle_list_services(
 
     let limit = super::clamp_limit(req.limit, 100, super::MAX_PAGE_SIZE);
     let endpoints: Vec<ServiceEndpoint> = if req.all_workspaces {
-        require_platform_admin(&state.admin_role, &principal)?;
+        require_platform_admin(&state.admin_role, &principal, &state.config.audit)?;
         if !req.sandbox.is_empty() {
             return Err(Status::invalid_argument(
                 "sandbox filter is not supported with all_workspaces",
@@ -264,7 +266,7 @@ pub(super) async fn handle_delete_service(
         .map_err(|e| Status::internal(format!("delete endpoint failed: {e}")))?;
 
     if deleted {
-        service_routing::emit_service_endpoint_delete_event(&endpoint);
+        service_routing::emit_service_endpoint_delete_event(state, &principal, &endpoint);
     }
 
     Ok(Response::new(DeleteServiceResponse { deleted }))
