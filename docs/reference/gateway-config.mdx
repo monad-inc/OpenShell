@@ -161,6 +161,13 @@ allow_unauthenticated_users = false
 [openshell.gateway.mtls_auth]
 enabled = false
 
+# Audit event toggles. Omit the table to keep the defaults shown here.
+[openshell.gateway.audit]
+enabled             = true
+auth_success_events = false
+exec_args           = true
+settings_values     = true
+
 # OTLP export. Omit this table entirely to disable it.
 [openshell.gateway.otlp]
 endpoint     = "http://otel-collector.observability.svc:4317"
@@ -212,27 +219,86 @@ Local Docker, Podman, and VM gateways can also set `[openshell.gateway.mtls_auth
 
 ## OTLP Export
 
-`[openshell.gateway.otlp]` enables OpenTelemetry export over OTLP/gRPC. Omit the table to disable export; there is no separate `enabled` flag.
+`[openshell.gateway.otlp]` enables OpenTelemetry export over OTLP/gRPC. Omit the table to disable export; there is no separate `enabled` flag. The table's presence enables **trace** export. **Log** export is opt-in on the same endpoint through `export_logs`.
 
-The gateway already uses the Rust `tracing` framework for structured logs sent to stdout and the sandbox log stream. Enabling this section adds an OpenTelemetry layer to the same tracing subscriber. It exports span trees to an OTLP collector without exporting, replacing, or redirecting the existing log events.
+The gateway already uses the Rust `tracing` framework for structured logs sent to stdout and the sandbox log stream. Enabling this section adds OpenTelemetry layers to the same tracing subscriber. It exports span trees to an OTLP collector without replacing or redirecting the existing log events. Set `export_logs` to additionally ship those logs — the gateway's own events and the log lines pushed from every sandbox, including OCSF security events — as OTLP log records to the same collector.
 
 ```toml
 [openshell.gateway.otlp]
-endpoint     = "http://otel-collector.observability.svc:4317"
-service_name = "openshell-gateway"
+endpoint          = "http://otel-collector.observability.svc:4317"
+service_name      = "openshell-gateway"
+export_logs       = true    # also export logs/OCSF as OTLP log records (default false)
+ocsf_full_payload = false   # carry structured OCSF fields on exported records
 ```
 
 `endpoint` is required and must be a valid URI. If it is malformed, the gateway logs the configuration error and continues with export disabled. It does not connect at startup: an unreachable collector produces export failures, never a failure to serve.
 
 The transport is **OTLP over gRPC only**. HTTP/protobuf and HTTP/JSON are not supported, and `OTEL_EXPORTER_OTLP_PROTOCOL` has no effect. Point `endpoint` at a collector's gRPC receiver, conventionally port `4317`, not the HTTP receiver on `4318`. A URI alone cannot distinguish the two, so an HTTP endpoint is accepted at startup and then fails on export.
 
+An `https://` endpoint exports over TLS, so a hosted collector can be named directly without a local relay. The gateway verifies the collector against public roots compiled into the binary rather than the host trust store, so it behaves the same on a minimal image as on a full distribution. A collector fronted by a private CA is not reachable over `https://`; put a local collector in front of it instead. Use `http://` for plaintext collectors.
+
+Send per-collector credentials as gRPC metadata through `OTEL_EXPORTER_OTLP_HEADERS`, which applies to both the trace and log streams:
+
+```shell
+OTEL_EXPORTER_OTLP_HEADERS="authorization=Bearer <token>"
+```
+
 The OpenTelemetry SDK logs export failures after startup. Spans in a failed batch are dropped rather than retried.
 
 `service_name` sets the gateway's `service.name` resource attribute and defaults to `openshell-gateway`. The gateway also reports `service.version`.
 
-Only OpenTelemetry traces are exported. Inbound gRPC and HTTP requests produce server spans named for the RPC or HTTP method. Store and compute-driver operations appear as child spans. Internal reconciliation, credential-refresh, and driver-watch loops create operation roots for their store work because no inbound request supplies a parent. The gateway continues valid W3C `traceparent` context and starts a new trace when none is supplied. Request spans carry `method`, `path`, and the `request_id` that also appears in gateway logs. Health endpoint spans use DEBUG level and are not exported by the default INFO filter.
+By default only OpenTelemetry traces are exported. Inbound gRPC and HTTP requests produce server spans named for the RPC or HTTP method. Store and compute-driver operations appear as child spans. Internal reconciliation, credential-refresh, and driver-watch loops create operation roots for their store work because no inbound request supplies a parent. The gateway continues valid W3C `traceparent` context and starts a new trace when none is supplied. Request spans carry `method`, `path`, and the `request_id` that also appears in gateway logs. Health endpoint spans use DEBUG level and are not exported by the default INFO filter.
 
 The gateway forwards the OTLP configuration to managed external drivers. Each driver exports under its own service name.
+
+### Log export
+
+`export_logs` ships the gateway's aggregated log stream — its own `tracing` events and the log lines pushed from every sandbox — to the collector as OTLP log records, one record per line, on the same endpoint and resource identity as traces. It is off by default. Each record carries `sandbox.id`, `log.source`, `log.target`, `log.level`, and `log.ocsf` attributes; OCSF security events appear with `log.ocsf` set to `true`. Gateway events with no sandbox in play — auth denials, credential refresh, TLS reloads — export without a `sandbox.id` attribute, with their structured fields carried as attributes; events from the export machinery itself are excluded so a failing collector cannot amplify its own failure into queue traffic. Export is diagnostic like traces: records queue in a bounded in-memory buffer and drain to the collector in batches, and export failures never stop the gateway. Buffered records flush on `SIGTERM`.
+
+`ocsf_full_payload` carries the structured OCSF fields on exported records rather than only the human-readable summary. It has no effect unless `export_logs` is set, and it increases per-record size, so leave it off unless the collector or SIEM consumes the OCSF schema directly.
+
+### Export capacity
+
+The gateway owns the log export pipeline end to end and never drops a record silently. Lines queue in a bounded buffer of 65,536 records and export in batches of up to 512; a failed batch retries with exponential backoff for up to five attempts before it is abandoned, so one batch the collector persistently rejects cannot dam the stream behind it.
+
+Loss is still possible — a collector outage eventually fills the queue, and an abandoned batch is gone — but it is always accounted: every dropped record is counted, and the next successful export carries a synthetic `telemetry_gap` record at WARN severity with `log.target = telemetry_gap`, the dropped count in `dropped`, and the window start in `dropped.since_ms`. Sandboxes apply the same accounting on their push path to the gateway. Alert on `telemetry_gap` records: one anywhere in the stream means telemetry was lost between production and the collector, and says exactly how much.
+
+The export ceiling depends on the shape OCSF events arrive in, because per-record cost at every stage is dominated by attribute count rather than bytes. As reference points, on commodity dev hardware (`cargo bench --bench log_fanin --bench log_export`), a production denial pushed as raw JSON (the default) publishes through the fan-in bus in ~0.4 µs and the export worker drains roughly 290 thousand lines per second; the same event flattened into 46 fields (`OPENSHELL_OCSF_PUSH_FORMAT=flat`, below) costs about 4.5 µs to publish and drains at roughly 70 thousand lines per second. Plain log lines without OCSF fields drain at over a million lines per second.
+
+Size gateways against those ceilings: estimate the aggregate OCSF lines per second across every sandbox a gateway serves, and when it approaches the drain rate for your payload shape, switch to the raw shape or add gateways. In production the arriving `telemetry_gap` records are the direct signal — a sustained stream of them means the export stage, not any sandbox, is the limiting stage.
+
+### OCSF payload format
+
+Sandboxes push OCSF events in one of two shapes, selected per sandbox with the `OPENSHELL_OCSF_PUSH_FORMAT` environment variable on the sandbox supervisor. Both carry the same information; they trade where the parsing work happens.
+
+**`raw`** (the default) pushes the complete OCSF document as a single `ocsf.raw` attribute — the same JSON the OCSF JSONL file carries, byte for byte, with nothing flattened, joined, or truncated — plus `ocsf.severity_id` beside it. This is the high-throughput, full-fidelity shape: per-record cost across the sandbox, the gateway, and the exporter is dominated by attribute count, not bytes, so one attribute instead of ~46 raises the gateway's export ceiling several-fold (see Export capacity). The document travels as a JSON string rather than a nested OTLP map deliberately: a string moves through every hop as one memcpy while a structured value would be re-materialized at each stage, and a JSON string is the most portable representation for collectors and SIEMs — restore field-level structure downstream with a transform such as:
+
+```yaml
+processors:
+  transform/ocsf:
+    log_statements:
+      - context: log
+        conditions:
+          - attributes["ocsf.raw"] != nil
+        statements:
+          - merge_maps(cache, ParseJSON(attributes["ocsf.raw"]), "upsert")
+          - set(attributes["ocsf"], cache)
+```
+
+**`flat`** flattens the event schema into dotted `ocsf.*` attributes alongside the rendered summary, so a SIEM can match a field with no parse step anywhere in the pipeline:
+
+```text
+ocsf.class_uid          4001
+ocsf.severity_id        3
+ocsf.dst_endpoint.port  443
+ocsf.actor.process.name curl
+```
+
+Nested objects join with `.`, arrays of scalars join with `,` on one key, arrays of objects are indexed (`ocsf.affected.0.name`), absent fields are omitted rather than exported empty, and a single value is truncated at 256 characters. The trades against `raw`: every stage pays per attribute (roughly a quarter of the export ceiling), values are stringified, and truncation makes it lossy.
+
+Keep the default unless your pipeline has nowhere to parse JSON — no collector transform and no SIEM-side parsing — in which case `flat` delivers query-ready records at the cost above.
+
+In both shapes `ocsf.severity_id` sets the record's OTLP severity, so denials and findings outrank routine events regardless of `ocsf_full_payload`, and unrecognized values of `OPENSHELL_OCSF_PUSH_FORMAT` fall back to the `raw` default.
 
 ### Tuning
 
@@ -242,6 +308,7 @@ This table decides whether and where to export. How the SDK exports is controlle
 |---|---|
 | `OTEL_TRACES_SAMPLER`, `OTEL_TRACES_SAMPLER_ARG` | Sampling strategy and ratio. Defaults to `parentbased_always_on`. |
 | `OTEL_BSP_SCHEDULE_DELAY`, `OTEL_BSP_MAX_QUEUE_SIZE`, `OTEL_BSP_MAX_EXPORT_BATCH_SIZE`, `OTEL_BSP_EXPORT_TIMEOUT` | Batch span processor tuning. |
+| `OTEL_BLRP_SCHEDULE_DELAY`, `OTEL_BLRP_MAX_QUEUE_SIZE`, `OTEL_BLRP_MAX_EXPORT_BATCH_SIZE`, `OTEL_BLRP_EXPORT_TIMEOUT` | No effect. The gateway batches and drives the log exporter itself (see Export capacity) rather than using the SDK's batch log record processor, so log loss is accounted instead of silent. `OTEL_BSP_*` likewise has no effect on log export. |
 | `OTEL_RESOURCE_ATTRIBUTES` | Additional resource attributes, such as `deployment.environment=prod`. |
 | `OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT`, `OTEL_SPAN_EVENT_COUNT_LIMIT`, `OTEL_SPAN_LINK_COUNT_LIMIT` | Per-span limits. |
 | `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_EXPORTER_OTLP_COMPRESSION`, `OTEL_EXPORTER_OTLP_TIMEOUT` | Exporter transport tuning. |
@@ -256,6 +323,35 @@ OTEL_TRACES_SAMPLER=parentbased_traceidratio OTEL_TRACES_SAMPLER_ARG=0.1
 `OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` are deliberately ignored. Enablement has one source, so an environment variable cannot silently turn export on or redirect it. `OTEL_RESOURCE_ATTRIBUTES` does apply and adds attributes, but a `service_name` set here wins over `OTEL_SERVICE_NAME`.
 
 The gateway flushes buffered spans during shutdown, so spans from in-flight requests survive a `SIGTERM`.
+
+## Audit Events
+
+The gateway emits an OCSF audit event for every state-changing operation — workspace, member, provider, sandbox, credential, policy, and settings mutations — carrying the authenticated principal as the actor. Audit events are on by default and ride the same export pipeline as other gateway events. `[openshell.gateway.audit]` controls the master switch and the record depth; omit the table to keep the defaults. For a guided walkthrough, the full event catalog, and what each record is useful for, see [Gateway Audit Events](/observability/gateway-audit).
+
+```toml
+[openshell.gateway.audit]
+enabled             = true   # master switch for gateway audit events
+auth_success_events = false  # emit an event per authenticated request too
+exec_args           = true   # record full command lines in exec audit events
+settings_values     = true   # record before/after values in settings audit events
+```
+
+Every field is also settable with an environment variable or CLI flag, which override the file per the standard precedence (CLI flag > environment variable > TOML > default):
+
+| TOML field | Environment variable | CLI flag | Default |
+|---|---|---|---|
+| `enabled` | `OPENSHELL_AUDIT_EVENTS` | `--audit-events` | `true` |
+| `auth_success_events` | `OPENSHELL_AUDIT_AUTH_SUCCESS_EVENTS` | `--audit-auth-success-events` | `false` |
+| `exec_args` | `OPENSHELL_AUDIT_EXEC_ARGS` | `--audit-exec-args` | `true` |
+| `settings_values` | `OPENSHELL_AUDIT_SETTINGS_VALUES` | `--audit-settings-values` | `true` |
+
+`enabled = false` (or `OPENSHELL_AUDIT_EVENTS=false`) turns gateway audit events off entirely, for deployments that do not want a governance paper trail. The mutations themselves are unaffected.
+
+`auth_success_events` adds a success event for every authenticated request, producing a complete authentication ledger for deployments that accept the volume. Authentication failures are always emitted while audit events are enabled.
+
+`exec_args = false` reduces sandbox exec audit records to the binary name. Use it when command lines may carry secrets.
+
+`settings_values = false` reduces settings audit records to the changed key names. Regardless of this toggle, values under keys matching credential patterns are always redacted.
 
 ## Supervisor Middleware Services
 

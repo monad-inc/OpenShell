@@ -134,6 +134,38 @@ data:
     {{- end }}
     {{- end }}
 
+    {{- if .Values.server.otlp.endpoint }}
+
+    [openshell.gateway.otlp]
+    endpoint          = {{ .Values.server.otlp.endpoint | quote }}
+    {{- if .Values.server.otlp.serviceName }}
+    service_name      = {{ .Values.server.otlp.serviceName | quote }}
+    {{- end }}
+    {{- if .Values.server.otlp.exportLogs }}
+    export_logs       = true
+    {{- end }}
+    {{- if .Values.server.otlp.ocsfFullPayload }}
+    ocsf_full_payload = true
+    {{- end }}
+    {{- end }}
+
+    {{- if or (not .Values.server.audit.enabled) .Values.server.audit.authSuccessEvents (not .Values.server.audit.execArgs) (not .Values.server.audit.settingsValues) }}
+
+    [openshell.gateway.audit]
+    {{- if not .Values.server.audit.enabled }}
+    enabled             = false
+    {{- end }}
+    {{- if .Values.server.audit.authSuccessEvents }}
+    auth_success_events = true
+    {{- end }}
+    {{- if not .Values.server.audit.execArgs }}
+    exec_args           = false
+    {{- end }}
+    {{- if not .Values.server.audit.settingsValues }}
+    settings_values     = false
+    {{- end }}
+    {{- end }}
+
     [openshell.drivers.kubernetes]
     workspace_mode               = {{ .Values.server.drivers.kubernetes.workspaceMode | default "shared" | quote }}
     gateway_id                   = {{ .Values.server.sandboxJwt.gatewayId | default (include "openshell.fullname" .) | quote }}

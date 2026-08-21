@@ -137,6 +137,35 @@ Inspect sandbox OCSF configuration and finding events for the validation
 rationale, configured and effective modes, active generation, and the explicit
 `previous_policy_active` state.
 
+OpenTelemetry export is diagnostic and never blocks startup or serving. The
+`[openshell.gateway.otlp]` table (Helm `server.otlp.*`) decides whether and
+where to export; `endpoint` is required, `export_logs = true` additionally ships
+logs and OCSF events as OTLP log records, and `ocsf_full_payload` carries
+structured OCSF fields. A malformed endpoint or unreachable collector only logs
+an error and disables export — check gateway logs for OTLP export failures
+rather than expecting a startup crash.
+
+```shell
+rg -n 'otlp|endpoint|export_logs' /etc/openshell/gateway.toml
+```
+
+Gateway audit events (OCSF Entity Management / Config State Change records
+for every state-changing RPC, with the authenticated principal as actor) are
+on by default. The `[openshell.gateway.audit]` table (Helm `server.audit.*`)
+controls them: `enabled = false` (env `OPENSHELL_AUDIT_EVENTS=false`, flag
+`--audit-events=false`) turns them off entirely; `auth_success_events` adds
+per-request authentication success events, `exec_args = false` strips exec
+command lines, and `settings_values = false` strips before/after setting
+values. Each field also has an `OPENSHELL_AUDIT_*` env var and `--audit-*`
+flag that override the file. Helm renders the table only when a toggle
+differs from its default, so its absence from `gateway.toml` means defaults.
+If expected ENTITY/CONFIG audit records are missing from the SIEM, check the
+toggle chain first — CLI flag > env var > TOML > default.
+
+```shell
+rg -n 'audit|auth_success_events|exec_args|settings_values' /etc/openshell/gateway.toml
+```
+
 ### Step 4: Check Docker-Backed Gateways
 
 ```bash
