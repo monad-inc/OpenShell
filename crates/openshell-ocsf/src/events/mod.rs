@@ -1,8 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! OCSF v1.7.0 event class definitions.
+//! OCSF v1.8.0 event class definitions.
 
+mod api_activity;
 mod app_lifecycle;
 mod authentication;
 pub(crate) mod base_event;
@@ -15,6 +16,7 @@ mod process_activity;
 pub(crate) mod serde_helpers;
 mod ssh_activity;
 
+pub use api_activity::ApiActivityEvent;
 pub use app_lifecycle::ApplicationLifecycleEvent;
 pub use authentication::AuthenticationEvent;
 pub use base_event::{BaseEvent, BaseEventData};
@@ -53,6 +55,8 @@ pub enum OcsfEvent {
     EntityManagement(EntityManagementEvent),
     /// Authentication [3002]
     Authentication(AuthenticationEvent),
+    /// API Activity [6003]
+    ApiActivity(ApiActivityEvent),
     /// Base Event [0]
     Base(BaseEvent),
 }
@@ -69,6 +73,7 @@ impl Serialize for OcsfEvent {
             Self::DeviceConfigStateChange(e) => e.serialize(serializer),
             Self::EntityManagement(e) => e.serialize(serializer),
             Self::Authentication(e) => e.serialize(serializer),
+            Self::ApiActivity(e) => e.serialize(serializer),
             Self::Base(e) => e.serialize(serializer),
         }
     }
@@ -112,6 +117,9 @@ impl<'de> Deserialize<'de> for OcsfEvent {
             3002 => serde_json::from_value::<AuthenticationEvent>(value)
                 .map(Self::Authentication)
                 .map_err(serde::de::Error::custom),
+            6003 => serde_json::from_value::<ApiActivityEvent>(value)
+                .map(Self::ApiActivity)
+                .map_err(serde::de::Error::custom),
             0 => serde_json::from_value::<BaseEvent>(value)
                 .map(Self::Base)
                 .map_err(serde::de::Error::custom),
@@ -136,6 +144,7 @@ impl OcsfEvent {
             Self::DeviceConfigStateChange(_) => 5019,
             Self::EntityManagement(_) => 3004,
             Self::Authentication(_) => 3002,
+            Self::ApiActivity(_) => 6003,
             Self::Base(_) => 0,
         }
     }
@@ -153,6 +162,7 @@ impl OcsfEvent {
             Self::DeviceConfigStateChange(e) => &e.base,
             Self::EntityManagement(e) => &e.base,
             Self::Authentication(e) => &e.base,
+            Self::ApiActivity(e) => &e.base,
             Self::Base(e) => &e.base,
         }
     }
@@ -162,9 +172,9 @@ impl OcsfEvent {
 mod tests {
     use super::*;
     use crate::builders::{
-        AppLifecycleBuilder, BaseEventBuilder, ConfigStateChangeBuilder, DetectionFindingBuilder,
-        HttpActivityBuilder, NetworkActivityBuilder, ProcessActivityBuilder, SshActivityBuilder,
-        test_sandbox_context,
+        ApiActivityBuilder, AppLifecycleBuilder, BaseEventBuilder, ConfigStateChangeBuilder,
+        DetectionFindingBuilder, HttpActivityBuilder, NetworkActivityBuilder,
+        ProcessActivityBuilder, SshActivityBuilder, test_sandbox_context,
     };
     use crate::enums::*;
     use crate::objects::*;
@@ -295,6 +305,37 @@ mod tests {
         let deserialized: OcsfEvent = serde_json::from_value(json).unwrap();
         assert!(matches!(deserialized, OcsfEvent::Base(_)));
         assert_eq!(deserialized.class_uid(), 0);
+    }
+
+    #[test]
+    fn test_roundtrip_api_activity_with_ai_model() {
+        let ctx = test_sandbox_context();
+        let event = ApiActivityBuilder::new(&ctx, "POST /v1/messages")
+            .severity(SeverityId::Informational)
+            .ai_model(AiModel::new("claude-3-haiku", "anthropic"))
+            .build();
+
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["class_uid"], 6003);
+        assert_eq!(json["activity_id"], 99);
+        assert_eq!(json["ai_model"]["name"], "claude-3-haiku");
+        assert_eq!(json["ai_model"]["ai_provider"], "anthropic");
+        assert_eq!(json["api"]["operation"], "POST /v1/messages");
+        assert!(json.get("api_operation").is_none());
+        assert!(json.get("actor").is_some());
+        assert!(json.get("src_endpoint").is_some());
+        assert!(
+            json["metadata"]["profiles"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p == "ai_operation")
+        );
+
+        let deserialized: OcsfEvent = serde_json::from_value(json).unwrap();
+        assert!(matches!(deserialized, OcsfEvent::ApiActivity(_)));
+        assert_eq!(deserialized.class_uid(), 6003);
+        assert!(deserialized.base().ai_model.is_some());
     }
 
     #[test]

@@ -148,6 +148,7 @@ macro_rules! impl_firewall_rule_setter {
     };
 }
 
+mod api_activity;
 mod authentication;
 mod base;
 mod config;
@@ -159,6 +160,7 @@ mod network;
 mod process;
 mod ssh;
 
+pub use api_activity::ApiActivityBuilder;
 pub use authentication::AuthenticationBuilder;
 pub use base::BaseEventBuilder;
 pub use config::ConfigStateChangeBuilder;
@@ -276,7 +278,7 @@ mod tests {
     fn test_sandbox_context_metadata() {
         let ctx = test_sandbox_context();
         let meta = ctx.metadata(&["security_control", "container"]);
-        assert_eq!(meta.version, "1.7.0");
+        assert_eq!(meta.version, "1.8.0");
         assert_eq!(meta.product.name, "OpenShell Sandbox Supervisor");
         assert_eq!(meta.profiles.len(), 2);
         assert_eq!(meta.uid.as_deref(), Some("sandbox-abc123"));
