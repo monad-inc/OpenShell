@@ -18,11 +18,12 @@ use crate::tracing_bus::TracingLogBus;
 
 pub struct TracingHandle {
     tracer_provider: Option<SdkTracerProvider>,
+    log_export: Option<crate::log_export::LogExportWorker>,
     podman_tracer_provider: Option<SdkTracerProvider>,
 }
 
 impl TracingHandle {
-    pub fn shutdown(&self) {
+    pub async fn shutdown(self) {
         if let Some(provider) = &self.tracer_provider
             && let Err(err) = provider.shutdown()
         {
@@ -32,6 +33,11 @@ impl TracingHandle {
             && let Err(err) = provider.shutdown()
         {
             tracing::warn!(error = %err, "Podman OTLP tracer provider shutdown failed");
+        }
+        // Flush and stop the log export worker last so records enqueued during
+        // shutdown of other subsystems still leave the box.
+        if let Some(worker) = self.log_export {
+            worker.shutdown().await;
         }
     }
 }
@@ -51,6 +57,17 @@ pub fn install(
     enable_podman_export: bool,
 ) -> (TracingHandle, Option<SetupError>) {
     let (tracer_provider, setup_error) = crate::otel_tracing::provider_for(otlp_config);
+    let (log_exporter, log_error) = crate::otel_tracing::log_exporter_for(otlp_config);
+
+    // When a log exporter was built (export_logs enabled + usable endpoint),
+    // spawn the export worker and point the log bus at its queue so every log
+    // line the gateway observes is exported off-box.
+    let log_export = log_exporter.map(|(exporter, resource)| {
+        let ocsf_full_payload = otlp_config.is_some_and(|c| c.ocsf_full_payload);
+        let (handle, worker) = crate::log_export::spawn(exporter, resource, ocsf_full_payload);
+        tracing_log_bus.set_export(handle);
+        worker
+    });
     #[cfg(feature = "in-tree-compute-drivers")]
     let podman_endpoint = enable_podman_export
         .then_some(otlp_config)
@@ -79,9 +96,12 @@ pub fn install(
     (
         TracingHandle {
             tracer_provider,
+            log_export,
             podman_tracer_provider,
         },
-        setup_error.or(podman_setup_error),
+        // Surface whichever setup failed across the trace, log-export, and
+        // podman signals.
+        setup_error.or(log_error).or(podman_setup_error),
     )
 }
 

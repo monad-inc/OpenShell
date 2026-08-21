@@ -99,7 +99,7 @@ macro_rules! impl_actor_process_setter {
             /// Set the acting process.
             #[must_use]
             pub fn actor_process(mut self, process: $crate::objects::Process) -> Self {
-                self.actor = Some($crate::objects::Actor { process });
+                self.actor = Some($crate::objects::Actor::from_process(process));
                 self
             }
         }
@@ -149,8 +149,10 @@ macro_rules! impl_firewall_rule_setter {
 }
 
 mod api_activity;
+mod authentication;
 mod base;
 mod config;
+mod entity;
 mod finding;
 mod http;
 mod lifecycle;
@@ -159,8 +161,10 @@ mod process;
 mod ssh;
 
 pub use api_activity::ApiActivityBuilder;
+pub use authentication::AuthenticationBuilder;
 pub use base::BaseEventBuilder;
 pub use config::ConfigStateChangeBuilder;
+pub use entity::EntityManagementBuilder;
 pub use finding::DetectionFindingBuilder;
 pub use http::HttpActivityBuilder;
 pub use lifecycle::AppLifecycleBuilder;

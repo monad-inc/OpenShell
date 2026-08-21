@@ -1,0 +1,42 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Telemetry performance benchmarks.
+#
+# These cover the log export path, where observability cost is charged to the
+# workload being observed: a sandbox renders every security event inline before
+# the line is queued, and every sandbox's lines then converge on one gateway.
+# Run them before changing anything on that path.
+
+[bench]
+description = "Run all telemetry benchmarks (sandbox event rendering + gateway log fan-in)"
+depends = ["bench:ocsf", "bench:gateway"]
+
+["bench:ocsf"]
+description = "Sandbox hot path: cost of rendering an OCSF event per emission"
+run = "cargo bench -p openshell-ocsf --bench event_rendering"
+
+["bench:gateway"]
+description = "Gateway log fan-in: per-line publish cost and scaling across concurrent sandboxes"
+run = "cargo bench -p openshell-server --bench log_fanin"
+
+["bench:quick"]
+description = "Same benchmarks with short sampling, for a fast signal while iterating"
+run = """
+cargo bench -p openshell-ocsf --bench event_rendering -- --warm-up-time 1 --measurement-time 3
+cargo bench -p openshell-server --bench log_fanin -- --warm-up-time 1 --measurement-time 3
+"""
+
+["bench:baseline"]
+description = "Record the current numbers as the comparison baseline for later runs"
+run = """
+cargo bench -p openshell-ocsf --bench event_rendering -- --save-baseline main
+cargo bench -p openshell-server --bench log_fanin -- --save-baseline main
+"""
+
+["bench:compare"]
+description = "Compare working-tree performance against the saved baseline"
+run = """
+cargo bench -p openshell-ocsf --bench event_rendering -- --baseline main
+cargo bench -p openshell-server --bench log_fanin -- --baseline main
+"""

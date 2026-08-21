@@ -23,8 +23,10 @@ tonic = { workspace = true }
 tower-http = { workspace = true }
 
 [dev-dependencies]
-opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tokio = { workspace = true }
+# `testing` exposes the in-memory span/log exporters the unit tests build
+# against, so the crate is self-testable without workspace feature unification.
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 
 [lints]
 workspace = true

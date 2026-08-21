@@ -577,12 +577,15 @@ fn main() -> Result<()> {
         let log_push_state = if let (Some(sandbox_id), Some(endpoint)) =
             (&args.sandbox_id, &args.openshell_endpoint)
         {
-            let (tx, handle) = openshell_supervisor_process::log_push::spawn_log_push_task(
+            let (tx, dropped, handle) = openshell_supervisor_process::log_push::spawn_log_push_task(
                 endpoint.clone(),
                 sandbox_id.clone(),
             );
-            let layer =
-                openshell_supervisor_process::log_push::LogPushLayer::new(sandbox_id.clone(), tx);
+            let layer = openshell_supervisor_process::log_push::LogPushLayer::new(
+                sandbox_id.clone(),
+                tx,
+                dropped,
+            );
             Some((layer, handle))
         } else {
             None

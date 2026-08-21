@@ -4,7 +4,7 @@
 //! Capture openshell-server tracing logs for streaming over gRPC.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use openshell_core::proto::{SandboxLogLine, SandboxStreamEvent};
 use openshell_ocsf::OCSF_TARGET;
@@ -18,6 +18,9 @@ use tracing_subscriber::layer::Context;
 pub struct TracingLogBus {
     inner: Arc<Mutex<Inner>>,
     pub(crate) platform_event_bus: PlatformEventBus,
+    /// Off-box OTLP log export sink. Installed once at startup when
+    /// `[openshell.gateway.otlp] export_logs` is set; `None` disables export.
+    export: Arc<OnceLock<crate::log_export::LogExportHandle>>,
 }
 
 #[derive(Debug)]
@@ -41,6 +44,28 @@ impl TracingLogBus {
                 tails: HashMap::new(),
             })),
             platform_event_bus: PlatformEventBus::new(),
+            export: Arc::new(OnceLock::new()),
+        }
+    }
+
+    /// Install the off-box log-export sink.
+    ///
+    /// Every log line published after this call is forwarded for OTLP export in
+    /// addition to the in-memory tail/broadcast used by the CLI/TUI. Idempotent:
+    /// the first handle installed wins.
+    pub(crate) fn set_export(&self, handle: crate::log_export::LogExportHandle) {
+        let _ = self.export.set(handle);
+    }
+
+    /// Forward a gateway-scoped line to off-box export only.
+    ///
+    /// Gateway events without a sandbox — governance, auth, credential
+    /// refresh, TLS — have no per-sandbox tail or watcher to serve, so they
+    /// skip the visibility plane (the gateway's own stdout already shows
+    /// them) and go straight to the export queue.
+    fn export_only(&self, log: SandboxLogLine) {
+        if let Some(export) = self.export.get() {
+            export.enqueue(log);
         }
     }
 
@@ -95,23 +120,48 @@ impl TracingLogBus {
     /// used by the tracing layer, so it appears in `WatchSandbox` and
     /// `GetSandboxLogs` transparently.
     pub fn publish_external(&self, log: SandboxLogLine) {
-        let evt = SandboxStreamEvent {
-            payload: Some(openshell_core::proto::sandbox_stream_event::Payload::Log(
-                log.clone(),
-            )),
-        };
-        self.publish(&log.sandbox_id, evt, Self::DEFAULT_TAIL);
+        self.publish_log(log, Self::DEFAULT_TAIL);
     }
 
     /// Default tail buffer capacity (lines per sandbox).
     const DEFAULT_TAIL: usize = 2000;
 
-    fn publish(&self, sandbox_id: &str, event: SandboxStreamEvent, tail_cap: usize) {
-        let tx = self.sender_for(sandbox_id);
-        let _ = tx.send(event.clone());
+    fn publish_log(&self, log: SandboxLogLine, tail_cap: usize) {
+        // Tap for off-box export: forward log lines (gateway-origin and
+        // sandbox-pushed alike, since both reach the bus through here) into the
+        // accounted export queue before they enter the bounded in-memory tail.
+        // The queue takes the one clone this path pays; the stream event below
+        // takes the original. An OCSF line's field map is the expensive part of
+        // that clone, so this stays a single copy however many fields it has.
+        if let Some(export) = self.export.get() {
+            export.enqueue(log.clone());
+        }
 
+        let sandbox_id = log.sandbox_id.clone();
+        let event = SandboxStreamEvent {
+            payload: Some(openshell_core::proto::sandbox_stream_event::Payload::Log(
+                log,
+            )),
+        };
+
+        // One lock acquisition covers both the broadcast lookup and the tail.
+        // Every sandbox's lines converge here, so taking it twice per line
+        // doubled the contention this point creates.
         let mut inner = self.inner.lock().expect("tracing bus lock poisoned");
-        let deque = inner.tails.entry(sandbox_id.to_string()).or_default();
+
+        // Broadcast only when something is actually watching. A live watcher —
+        // `openshell logs -f`, the TUI — is the exception rather than the rule,
+        // and this clone copies the line's whole flattened field map, which is
+        // the most expensive part of publishing an OCSF event. Skipping it when
+        // there are no receivers changes nothing observable: the send was
+        // already a discarded error in that case.
+        if let Some(tx) = inner.per_id.get(&sandbox_id)
+            && tx.receiver_count() > 0
+        {
+            let _ = tx.send(event.clone());
+        }
+
+        let deque = inner.tails.entry(sandbox_id).or_default();
         deque.push_back(event);
         while deque.len() > tail_cap {
             deque.pop_front();
@@ -131,39 +181,92 @@ where
 {
     fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
         let meta = event.metadata();
+
+        // A sandbox-less event only matters here when export is installed, and
+        // events from the export path itself must never re-enter the queue
+        // they are trying to drain.
+        let gateway_scoped_exportable =
+            self.bus.export.get().is_some() && !is_export_feedback_target(meta.target());
+
         let mut visitor = LogVisitor::default();
         event.record(&mut visitor);
 
-        let Some(sandbox_id) = visitor.sandbox_id else {
+        let sandbox_id = visitor.sandbox_id.filter(|id| !id.is_empty());
+        if sandbox_id.is_none() && !gateway_scoped_exportable {
             return;
-        };
+        }
 
-        let msg = visitor.message.unwrap_or_else(|| meta.name().to_string());
+        // Gateway-emitted OCSF events (`ocsf_emit!` on the gateway) carry
+        // their payload in the thread-local, exactly like the sandbox push
+        // layer reads it: shorthand as the message, the full document as raw
+        // fields. Gateway emission is raw-only. Pre-rendered OCSF lines
+        // (legacy emitters that pass `message` directly) fall through to the
+        // visitor path unchanged.
+        let (msg, fields) = if meta.target() == OCSF_TARGET
+            && let Some(ocsf_event) = openshell_ocsf::clone_current_event()
+        {
+            (
+                // The bridge already rendered the shorthand into the tracing
+                // message; re-render only if a producer bypassed it.
+                visitor
+                    .message
+                    .unwrap_or_else(|| ocsf_event.format_shorthand()),
+                openshell_ocsf::format::attributes::raw_event_fields(&ocsf_event),
+            )
+        } else {
+            (
+                visitor.message.unwrap_or_else(|| meta.name().to_string()),
+                visitor.fields,
+            )
+        };
         let level = display_level(meta.target(), &meta.level().to_string());
 
         let ts = openshell_core::time::now_ms();
         let log = SandboxLogLine {
-            sandbox_id: sandbox_id.clone(),
+            sandbox_id: sandbox_id.clone().unwrap_or_default(),
             timestamp_ms: ts,
             level,
             target: meta.target().to_string(),
             message: msg,
             source: "gateway".to_string(),
-            fields: HashMap::new(),
+            fields,
         };
-        let evt = SandboxStreamEvent {
-            payload: Some(openshell_core::proto::sandbox_stream_event::Payload::Log(
-                log,
-            )),
-        };
-        self.bus.publish(&sandbox_id, evt, self.default_tail);
+        match sandbox_id {
+            // Sandbox-scoped: visibility plane (tail/broadcast) + export tap.
+            Some(_) => self.bus.publish_log(log, self.default_tail),
+            // Gateway-scoped: export only.
+            None => self.bus.export_only(log),
+        }
     }
+}
+
+/// Whether events from `target` could be produced by the export path itself.
+///
+/// The export worker logs its own failures, and the OTLP/tonic stack beneath
+/// it logs transport errors. Forwarding those into the export queue would turn
+/// every export failure into fresh queue traffic — a feedback loop that is
+/// loudest exactly when the collector is down. They stay on gateway stdout.
+fn is_export_feedback_target(target: &str) -> bool {
+    target.starts_with("openshell_server::log_export")
+        || target.starts_with("opentelemetry")
+        || target.starts_with("tonic")
+        // `tower::buffer` drives the tonic export channel; `tower_http`
+        // (server middleware) is deliberately not matched.
+        || target == "tower"
+        || target.starts_with("tower::")
+        || target.starts_with("h2")
+        || target.starts_with("hyper")
+        || target.starts_with("rustls")
 }
 
 #[derive(Debug, Default)]
 struct LogVisitor {
     sandbox_id: Option<String>,
     message: Option<String>,
+    /// Every other structured field on the event, preserved so exported
+    /// records keep the data operators can only otherwise find on stdout
+    /// (e.g. an auth denial's principal and requested sandbox).
+    fields: HashMap<String, String>,
 }
 
 impl tracing::field::Visit for LogVisitor {
@@ -171,7 +274,9 @@ impl tracing::field::Visit for LogVisitor {
         match field.name() {
             "sandbox_id" => self.sandbox_id = Some(value.to_string()),
             "message" => self.message = Some(value.to_string()),
-            _ => {}
+            name => {
+                self.fields.insert(name.to_string(), value.to_string());
+            }
         }
     }
 
@@ -179,7 +284,9 @@ impl tracing::field::Visit for LogVisitor {
         match field.name() {
             "sandbox_id" => self.sandbox_id = Some(format!("{value:?}")),
             "message" => self.message = Some(format!("{value:?}")),
-            _ => {}
+            name => {
+                self.fields.insert(name.to_string(), format!("{value:?}"));
+            }
         }
     }
 }
@@ -268,6 +375,200 @@ mod tests {
         let bus = TracingLogBus::new();
         // Should not panic
         bus.remove("nonexistent");
+    }
+
+    #[test]
+    fn export_feedback_targets_are_excluded() {
+        assert!(is_export_feedback_target("openshell_server::log_export"));
+        assert!(is_export_feedback_target("opentelemetry_otlp::exporter"));
+        assert!(is_export_feedback_target("tonic::transport"));
+        assert!(is_export_feedback_target("h2::codec"));
+        // The rest of the gateway must not be swept up by the guard.
+        assert!(!is_export_feedback_target("openshell_server::auth::guard"));
+        assert!(!is_export_feedback_target("openshell_server::grpc::policy"));
+    }
+
+    /// The full lane: a gateway event with no `sandbox_id` must reach the OTLP
+    /// exporter (with its structured fields and without a sandbox.id
+    /// attribute), export-path events must not, and sandbox-scoped events must
+    /// keep serving the visibility plane.
+    #[tokio::test]
+    async fn gateway_scoped_events_export_without_a_sandbox_id() {
+        use opentelemetry::logs::AnyValue;
+
+        let exporter = opentelemetry_sdk::logs::InMemoryLogExporter::default();
+        let (handle, worker) = crate::log_export::spawn(
+            exporter.clone(),
+            opentelemetry_sdk::Resource::builder_empty().build(),
+            false,
+        );
+        let bus = TracingLogBus::new();
+        bus.set_export(handle);
+
+        {
+            use tracing_subscriber::layer::SubscriberExt as _;
+            let subscriber = tracing_subscriber::registry().with(bus.layer());
+            let _guard = crate::otel_tracing::test_exporter::install_scoped(subscriber);
+            tracing::info!(principal = "user:alice", "workspace created");
+            tracing::warn!(target: "openshell_server::log_export", "OTLP log export failed");
+            tracing::info!(sandbox_id = "sb-1", "sandbox event");
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while exporter.get_emitted_logs().unwrap().len() < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "expected 2 exported records, got {:?}",
+                exporter.get_emitted_logs().unwrap().len()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let emitted = exporter.get_emitted_logs().unwrap();
+        assert_eq!(emitted.len(), 2, "the export-path warning must not export");
+
+        let attr = |record: &opentelemetry_sdk::logs::SdkLogRecord, key: &str| {
+            record
+                .attributes_iter()
+                .find(|(k, _)| k.as_str() == key)
+                .map(|(_, v)| v.clone())
+        };
+        let gateway = &emitted[0].record;
+        assert!(
+            attr(gateway, "sandbox.id").is_none(),
+            "gateway-scoped records carry no sandbox.id"
+        );
+        assert_eq!(
+            attr(gateway, "principal"),
+            Some(AnyValue::String("user:alice".into())),
+            "structured fields survive export"
+        );
+        assert_eq!(
+            attr(gateway, "log.source"),
+            Some(AnyValue::String("gateway".into()))
+        );
+        assert_eq!(
+            attr(&emitted[1].record, "sandbox.id"),
+            Some(AnyValue::String("sb-1".into()))
+        );
+
+        // Visibility plane unchanged: only the sandbox-scoped line has a tail.
+        assert_eq!(bus.tail("sb-1", 10).len(), 1);
+        assert!(bus.tail("", 10).is_empty());
+
+        worker.shutdown().await;
+    }
+
+    /// A gateway `ocsf_emit!` audit event must export with the full raw
+    /// payload and correct severity, and a sandbox-scoped emission must land
+    /// in that sandbox's stream as well.
+    #[tokio::test]
+    async fn gateway_ocsf_events_export_with_raw_payloads() {
+        use opentelemetry::logs::{AnyValue, Severity};
+
+        let exporter = opentelemetry_sdk::logs::InMemoryLogExporter::default();
+        let (handle, worker) = crate::log_export::spawn(
+            exporter.clone(),
+            opentelemetry_sdk::Resource::builder_empty().build(),
+            true,
+        );
+        let bus = TracingLogBus::new();
+        bus.set_export(handle);
+
+        {
+            use tracing_subscriber::layer::SubscriberExt as _;
+            let subscriber = tracing_subscriber::registry().with(bus.layer());
+            let _guard = crate::otel_tracing::test_exporter::install_scoped(subscriber);
+
+            // Gateway-scoped governance event.
+            crate::audit::emit(
+                openshell_ocsf::EntityManagementBuilder::new(crate::audit::ctx())
+                    .activity(openshell_ocsf::enums::EntityActivityId::Create)
+                    .entity(
+                        openshell_ocsf::objects::ManagedEntity::new("workspace", "ws-1")
+                            .with_name("team-a"),
+                    )
+                    .actor_user(openshell_ocsf::objects::User::new(
+                        "alice",
+                        "oidc|alice-123",
+                        openshell_ocsf::objects::UserTypeId::User,
+                    ))
+                    .status(openshell_ocsf::enums::StatusId::Success)
+                    .build(),
+            );
+
+            // Sandbox-scoped audit event.
+            crate::audit::emit_for_sandbox(
+                "sb-7f3a",
+                openshell_ocsf::AuthenticationBuilder::new(crate::audit::ctx())
+                    .status(openshell_ocsf::enums::StatusId::Failure)
+                    .status_detail("token expired")
+                    .build(),
+            );
+
+            // Legacy pre-rendered OCSF line (tls.rs style): no thread-local.
+            tracing::info!(target: "ocsf", message = "CONFIG:LOADED [INFO] TLS reloaded");
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while exporter.get_emitted_logs().unwrap().len() < 3 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "records never arrived"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let emitted = exporter.get_emitted_logs().unwrap();
+        let attr = |record: &opentelemetry_sdk::logs::SdkLogRecord, key: &str| {
+            record
+                .attributes_iter()
+                .find(|(k, _)| k.as_str() == key)
+                .map(|(_, v)| v.clone())
+        };
+
+        let entity = &emitted[0].record;
+        let body = format!("{:?}", entity.body());
+        assert!(body.contains("ENTITY:CREATE"), "unexpected body: {body}");
+        assert!(attr(entity, "sandbox.id").is_none());
+        assert_eq!(
+            attr(entity, "log.level"),
+            Some(AnyValue::String("OCSF".into()))
+        );
+        let Some(AnyValue::String(raw)) = attr(entity, "ocsf.raw") else {
+            panic!("ocsf.raw missing");
+        };
+        let parsed: serde_json::Value = serde_json::from_str(raw.as_str()).unwrap();
+        assert_eq!(parsed["class_uid"], 3004);
+        assert_eq!(parsed["actor"]["user"]["name"], "alice");
+
+        let auth = &emitted[1].record;
+        assert_eq!(
+            attr(auth, "sandbox.id"),
+            Some(AnyValue::String("sb-7f3a".into()))
+        );
+        // Medium severity ranks as Warn2, from the pushed ocsf.severity_id.
+        assert_eq!(auth.severity_number(), Some(Severity::Warn2));
+        assert_eq!(bus.tail("sb-7f3a", 10).len(), 1, "sandbox stream has it");
+
+        let legacy = &emitted[2].record;
+        assert!(
+            attr(legacy, "ocsf.raw").is_none(),
+            "pre-rendered lines carry no raw payload"
+        );
+        assert!(format!("{:?}", legacy.body()).contains("CONFIG:LOADED"));
+
+        worker.shutdown().await;
+    }
+
+    /// Without an export sink, sandbox-less events cost nothing and go
+    /// nowhere — local development keeps its Phase-0 behavior.
+    #[test]
+    fn gateway_scoped_events_are_ignored_when_export_is_off() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let bus = TracingLogBus::new();
+        let subscriber = tracing_subscriber::registry().with(bus.layer());
+        let _guard = crate::otel_tracing::test_exporter::install_scoped(subscriber);
+        tracing::info!(principal = "user:alice", "workspace created");
+        assert!(bus.tail("", 10).is_empty());
     }
 
     #[test]

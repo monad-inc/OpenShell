@@ -107,9 +107,7 @@ mod tests {
         ApiActivityEvent {
             base,
             api: Api::new("POST /v1/messages"),
-            actor: Actor {
-                process: Process::new("supervisor", 1),
-            },
+            actor: Actor::from_process(Process::new("supervisor", 1)),
             src_endpoint: Endpoint::from_domain("inference.local", 443),
             http_request: None,
             http_response: None,

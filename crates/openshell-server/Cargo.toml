@@ -135,7 +135,16 @@ telemetry = ["openshell-core/telemetry"]
 bundled-z3 = ["openshell-prover/bundled-z3"]
 test-support = []
 
+[[bench]]
+name = "log_fanin"
+harness = false
+
+[[bench]]
+name = "log_export"
+harness = false
+
 [dev-dependencies]
+criterion = { workspace = true }
 hyper-rustls = { version = "0.27", default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "ring"] }
 rcgen = { version = "0.13", features = ["crypto", "pem"] }
 rsa = { version = "0.9", features = ["pem"] }
@@ -146,5 +155,8 @@ wiremock = "0.6"
 # `testing` provides InMemorySpanExporter, so span assertions do not need a
 # collector, a network hop, or a flush barrier.
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
+# `test-util` provides paused time, so export retry/backoff tests do not
+# sleep through their real backoff schedule.
+tokio = { workspace = true, features = ["test-util"] }
 [lints]
 workspace = true

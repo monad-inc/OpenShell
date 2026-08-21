@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::enums::{SecurityLevelId, StateId};
 use crate::events::base_event::BaseEventData;
+use crate::objects::Actor;
 
 /// OCSF Device Config State Change Event [5019].
 ///
@@ -37,6 +38,11 @@ pub struct DeviceConfigStateChangeEvent {
         skip_serializing_if = "Option::is_none"
     )]
     pub prev_security_level: Option<SecurityLevelId>,
+
+    /// Who performed the change (gateway audit events carry the
+    /// authenticated user; sandbox-authored config events omit it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<Actor>,
 }
 
 impl Serialize for DeviceConfigStateChangeEvent {
@@ -51,6 +57,11 @@ impl Serialize for DeviceConfigStateChangeEvent {
         insert_enum_pair_custom!(obj, "state", self.state, self.state_custom_label);
         insert_enum_pair!(obj, "security_level", self.security_level);
         insert_enum_pair!(obj, "prev_security_level", self.prev_security_level);
+
+        if let Some(actor) = &self.actor {
+            let actor_val = serde_json::to_value(actor).map_err(serde::ser::Error::custom)?;
+            obj.insert("actor".to_string(), actor_val);
+        }
 
         base_val.serialize(serializer)
     }
@@ -90,6 +101,7 @@ mod tests {
             state_custom_label: None,
             security_level: Some(SecurityLevelId::Secure),
             prev_security_level: Some(SecurityLevelId::Unknown),
+            actor: None,
         };
 
         let json = serde_json::to_value(&event).unwrap();
