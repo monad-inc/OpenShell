@@ -1,0 +1,112 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Gateway Audit Events"
+sidebar-title: "Gateway Audit"
+description: "The OCSF audit trail the OpenShell gateway emits for every control-plane change, authentication decision, and agent action, and how to export it."
+keywords: "Generative AI, Cybersecurity, Audit, OCSF, Observability, Gateway, SIEM"
+position: 4
+---
+
+The OpenShell gateway emits a structured audit event for every state-changing operation it performs. Creating a workspace, rotating a credential, replacing a policy, opening an exec session, rejecting a token: each produces one record that names the authenticated principal who caused it, the outcome, and a correlation id that ties it back to the request. The records use the [Open Cybersecurity Schema Framework (OCSF) v1.7.0](https://ocsf.io) format, so any OCSF-aware collector or SIEM reads them without a custom parser.
+
+These are gateway events, distinct from the per-sandbox events covered in [Sandbox Logging](/observability/logging). Sandbox logs describe what happens inside one runtime: network connections, process lifecycle, filesystem decisions. Gateway audit events describe what happens to the control plane that governs every runtime.
+
+Audit events are on by default. This page explains what they cover, how to read them, and how to get them off the box. The [Audit Toggles](/observability/audit-configuration) page documents every switch, and the [Audit Event Reference](/observability/audit-event-reference) catalogs every event with a full example.
+
+## What Gets Audited
+
+Four OCSF event classes cover the surface.
+
+| Class | Covers | Example events |
+|---|---|---|
+| Entity Management (3004) | Resource create, update, and delete | Workspace, member, provider, credential, sandbox, ssh session, exec, tcp forward, sandbox token |
+| Config State Change (5019) | Configuration and policy transitions | Settings updates, policy replace and merge, draft-policy decisions, inference routes, interceptor-modified requests |
+| Authentication (3002) | Outcomes at the authenticator boundary | Rejected credentials, failed mTLS, and, behind a toggle, every successful authentication |
+| Detection Finding (2004) | Suspicious patterns, escalated | Cross-sandbox access attempts, a sandbox principal reaching for an admin API |
+
+State also changes when no request drives it. Timer-driven credential rotation, reconciliation that removes a sandbox after its backend disappears, and first-boot workspace creation each emit an Entity Management event attributed to a system actor named `system:<component>`.
+
+## How to Get the Audit Log
+
+Records surface in three places: on the gateway's own output, in the gateway's log store, and off-box over OTLP. The first two need no configuration.
+
+### On the box
+
+The gateway writes each audit event to its standard output as a single shorthand line, and stores it alongside other gateway logs. See [Accessing Logs](/observability/accessing-logs) for the CLI, TUI, and filesystem paths. This is enough for local inspection and debugging, but the records live and die with the process.
+
+### Off the box
+
+To retain and analyze the trail, export it to a collector. Audit events ride the same OTLP export pipeline as every other gateway log, so one setting turns them on. Add an OTLP table to the gateway configuration and set `export_logs`:
+
+```toml
+[openshell.gateway.otlp]
+endpoint          = "http://otel-collector.observability.svc:4317"
+service_name      = "openshell-gateway"
+export_logs       = true
+ocsf_full_payload = true
+```
+
+`export_logs` ships the gateway's aggregated log stream, including audit events, to the collector as OTLP log records over gRPC. `ocsf_full_payload` carries the complete OCSF document on each record rather than only the shorthand summary; enable it when the collector or SIEM consumes the OCSF schema directly. The endpoint is any OTLP/gRPC receiver, conventionally on port 4317. Send per-collector credentials as gRPC metadata:
+
+```shell
+OTEL_EXPORTER_OTLP_HEADERS="authorization=Bearer <token>"
+```
+
+For the full export configuration, including TLS, transport constraints, and capacity, see the [OTLP Export reference](/reference/gateway-config#otlp-export).
+
+## Where Records Appear
+
+Each audit event renders in up to three forms. They carry the same information; they differ in where the parsing work happens.
+
+| Form | Where | Shape |
+|---|---|---|
+| Shorthand | Gateway stdout and log store | One human-readable, greppable line per event |
+| OCSF JSONL | The OCSF export file, for sandbox-scoped events | One full JSON object per line |
+| OTLP log record | The configured collector | Attributes plus, with `ocsf_full_payload`, the full document in `ocsf.raw` |
+
+Exported records carry `sandbox.id`, `log.source`, `log.target`, `log.level`, and `log.ocsf` attributes. Audit events set `log.ocsf` to `true` and appear with `log.level` set to `OCSF`. Events about a specific sandbox carry its `sandbox.id`; gateway-scoped events such as authentication and credential refresh export without one, on the gateway lane.
+
+The shorthand form reads as `CLASS:ACTIVITY [SEVERITY] outcome subject by actor`:
+
+```text
+ENTITY:CREATE [INFO] workspace "team-a" by alice(oidc|alice-123)
+CONFIG:INFERENCE_ROUTE_SET [INFO] inference route inference.local set to bedrock/claude by alice(oidc|alice-123)
+ENTITY:UPDATE [LOW] FAILED credential "acme/API_KEY" by system:provider-refresh
+AUTHN:LOGON [MED] FAILED bearer from 10.0.0.9 [reason:rejected_credential]
+FINDING:BLOCKED [HIGH] "Cross-sandbox access attempt" [is_alert]
+```
+
+The actor renders as `name(uid)`. The display name can be a self-asserted claim, so the stable identity travels alongside it. When only the shorthand is exported, this keeps the actor unambiguous downstream.
+
+## Anatomy of an Audit Event
+
+Every audit event carries a common set of fields, whatever its class.
+
+| Field | Meaning |
+|---|---|
+| `actor.user` | The authenticated principal, derived from the session. An OIDC subject or certificate identity for users, `sandbox:<id>` for sandbox principals, or `system:<component>` for background operations. Never taken from the request body. |
+| `time` | When the outcome was known, in epoch milliseconds. |
+| `status` / `status_id` | `Success` or `Failure`. A mutation that changed nothing, such as deleting a resource that was already gone, records as `Failure`. |
+| `severity` / `severity_id` | `Informational` for successes, `Low` for failed mutations, `Medium` for authentication failures, `High` for findings. Sets the exported record's OTLP severity so alerting can filter on it. |
+| `message` | A concise, greppable summary. Details live in typed fields, never only in prose. |
+| `unmapped.request_id` | The request's correlation id, so an audit event joins the request trace and the authentication event for the same call. |
+
+Secrets never enter a record. Credential values, minted tokens, ssh bearer tokens, and exec environment and stdin are absent by construction, and setting keys matching credential patterns are redacted regardless of configuration.
+
+## Turn It Off
+
+A single switch silences every emission, for deployments that do not want a governance trail. The mutations themselves are unaffected.
+
+```toml
+[openshell.gateway.audit]
+enabled = false
+```
+
+The [Audit Toggles](/observability/audit-configuration) page covers this and the finer controls that tune volume and sensitivity without turning the whole trail off.
+
+## Next Steps
+
+- [Configure audit toggles](/observability/audit-configuration) to tune what each record carries and how much volume it produces.
+- [Browse the event reference](/observability/audit-event-reference) for every event, a full example, and what it is useful for.
+- [Enable OTLP export](/reference/gateway-config#otlp-export) with TLS and collector credentials.

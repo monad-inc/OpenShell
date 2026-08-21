@@ -317,7 +317,7 @@ The gateway flushes buffered spans during shutdown, so spans from in-flight requ
 
 ## Audit Events
 
-The gateway emits an OCSF audit event for every state-changing operation — workspace, member, provider, sandbox, credential, policy, and settings mutations — carrying the authenticated principal as the actor. Audit events are on by default and ride the same export pipeline as other gateway events. `[openshell.gateway.audit]` controls the master switch and the record depth; omit the table to keep the defaults.
+The gateway emits an OCSF audit event for every state-changing operation — workspace, member, provider, sandbox, credential, policy, and settings mutations — carrying the authenticated principal as the actor. Audit events are on by default and ride the same export pipeline as other gateway events. `[openshell.gateway.audit]` controls the master switch and the record depth; omit the table to keep the defaults. For a guided walkthrough, the full event catalog, and what each record is useful for, see [Gateway Audit Events](/observability/gateway-audit).
 
 ```toml
 [openshell.gateway.audit]
