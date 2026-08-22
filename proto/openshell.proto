@@ -455,6 +455,13 @@ service OpenShell {
     };
   }
 
+  // Persist the canonical main process result before the supervisor exits.
+  rpc ReportMainProcessExit(ReportMainProcessExitRequest) returns (ReportMainProcessExitResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "sandbox"
+    };
+  }
+
   // Raw byte relay between supervisor and gateway.
   //
   // The supervisor initiates this call after receiving a RelayOpen message
@@ -682,10 +689,16 @@ message IssueSandboxTokenResponse {
   int64 expires_at_ms = 2;
 }
 
-// RefreshSandboxToken request. Empty body; the calling principal must
-// already be a sandbox principal (i.e. the request carries a still-valid
-// gateway-minted JWT in its Authorization header).
-message RefreshSandboxTokenRequest {}
+// RefreshSandboxToken request. The calling principal must already be a
+// sandbox principal (i.e. the request carries a still-valid gateway-minted
+// JWT in its Authorization header). Extension service names are resolved
+// against server-owned registrations and the sandbox's effective policy;
+// callers never choose token audiences directly.
+message RefreshSandboxTokenRequest {
+  // Operator registration names for extension services selected by the
+  // sandbox's effective policy.
+  repeated string extension_service_names = 1;
+}
 
 // RefreshSandboxToken response. The new token replaces the supervisor's
 // in-memory bearer credential.
@@ -695,7 +708,11 @@ message RefreshSandboxTokenResponse {
   // Absolute expiry of the new token, milliseconds since the epoch. 0 means
   // the token is non-expiring.
   int64 expires_at_ms = 2;
+  // Fresh credentials for the requested, policy-authorized extension
+  // services. These remain in supervisor memory and are never persisted.
+  repeated ExtensionServiceCredential extension_credentials = 3;
 }
+
 
 // Health check request.
 message HealthRequest {}
@@ -762,6 +779,7 @@ message ComputeDriverCapabilities {
 
   // Driver-reported implementation version from the startup capability snapshot.
   string driver_version = 2;
+
 }
 
 // Public sandbox resource exposed by the OpenShell API.
@@ -807,6 +825,12 @@ message SandboxSpec {
   // managed fleet-wide.
   reserved 11;
   reserved "proposal_approval_mode";
+  // Canonical command launched once by the sandbox supervisor. No shell
+  // parsing is performed. The gateway normalizes an omitted command to the
+  // portable scratch login shell before persistence.
+  repeated string command = 12;
+  // Allocate a retained pseudo-terminal for the main process.
+  bool tty = 13;
 }
 
 message ResourceRequirements {
@@ -870,6 +894,12 @@ message SandboxStatus {
   SandboxPhase phase = 6;
   // Currently active policy version (updated when sandbox reports loaded).
   uint32 current_policy_version = 7;
+  // Supervisor instance currently associated with the canonical main process.
+  // The gateway uses this to reject stale exit reports after a restart.
+  string main_process_instance_id = 8;
+  // Normalized main process result. Signal exits use 128 + signal number.
+  // Presence indicates that the main process exited and the sandbox is in Error.
+  optional int32 exit_code = 9;
 }
 
 // User-facing sandbox condition derived from driver-native conditions.
@@ -1569,6 +1599,9 @@ message StoredProviderCredentialRefreshState {
   string credential_key = 4;
   ProviderCredentialRefreshStrategy strategy = 5;
   map<string, string> material = 6 [(openshell.options.v1.secret) = true];
+  // Material names classified as secret. Newly configured values live in the
+  // active credential driver and are absent from material. Legacy inline values
+  // are not automatically migrated before OpenShell 0.1.0.
   repeated string secret_material_keys = 7;
   int64 expires_at_ms = 8;
   int64 next_refresh_at_ms = 9;
@@ -1584,6 +1617,28 @@ message StoredProviderCredentialRefreshState {
   // collision reservation, and env-key surfacing so later profile edits cannot
   // silently redirect writes.
   map<string, string> additional_output_keys = 17;
+  // Opaque gateway-owned authorization epoch for the configured refresh
+  // grant. Explicit refresh configuration creates a new epoch; automatic and
+  // manual token rotation preserve it. It is never derived from or exposed
+  // with refresh material.
+  string authorization_epoch = 18;
+  // Secret refresh material is stored through the gateway's active credential
+  // driver. The persisted refresh state keeps only opaque handles; resolved
+  // values exist in gateway memory for the duration of one mint operation.
+  map<string, openshell.datamodel.v1.CredentialHandle> secret_material_handles = 19;
+  // Handles replaced by reconfiguration or issuer-driven refresh-token
+  // rotation. This is a repeated entry rather than a material-keyed map so
+  // multiple superseded generations of the same material remain recoverable.
+  // Cleanup is retried by the refresh worker so a gateway crash or temporary
+  // credential-backend outage does not lose the deletion reference.
+  repeated StoredRefreshMaterialDeletion pending_secret_deletions = 20;
+}
+
+message StoredRefreshMaterialDeletion {
+  // Original material name used to derive the credential driver's storage key.
+  string material_key = 1;
+  // Opaque handle for the superseded secret object.
+  openshell.datamodel.v1.CredentialHandle handle = 2;
 }
 
 message GetProviderRefreshStatusRequest {
@@ -1602,6 +1657,9 @@ message ConfigureProviderRefreshRequest {
   string credential_key = 2;
   ProviderCredentialRefreshStrategy strategy = 3;
   map<string, string> material = 4 [(openshell.options.v1.secret) = true];
+  // Additional material names the caller requests be stored as secrets. Every
+  // name must be present in material. The server also classifies secrets from
+  // the authoritative provider profile and refresh strategy.
   repeated string secret_material_keys = 5;
   optional int64 expires_at_ms = 6;
   // Workspace scope. Empty defaults to "default".
@@ -1780,6 +1838,12 @@ message StaticCredentialBinding {
   // Supervisors use it to retain old revision placeholders only across
   // rotations of the same provider credential.
   string credential_identity = 2;
+  // Opaque gateway-issued handle for a refresh-managed credential identity
+  // epoch. When non-empty, supervisors keep the workload placeholder stable
+  // across access-token rotations and replace only the resolver value. The
+  // handle changes when the sandbox, provider, credential key, refresh
+  // authorization epoch, or endpoint authorization boundary changes.
+  string workload_credential_handle = 3;
 }
 
 // Get sandbox provider environment response.
@@ -2084,6 +2148,17 @@ message SupervisorHeartbeat {}
 // Gateway heartbeat.
 message GatewayHeartbeat {}
 
+// Terminal result reported before the supervisor shuts down. A successful RPC
+// response confirms that the result was durably handled by the gateway.
+message ReportMainProcessExitRequest {
+  string sandbox_id = 1;
+  string instance_id = 2;
+  // Normalized process result. Signal exits use 128 + signal number.
+  int32 exit_code = 3;
+}
+
+message ReportMainProcessExitResponse {}
+
 // Gateway requests the supervisor to open a relay channel.
 //
 // On receiving this, the supervisor should initiate a RelayStream RPC to
@@ -2277,6 +2352,20 @@ message PolicyChunk {
   // back to the in-sandbox agent so it can revise the proposal.
   // Empty for non-rejected chunks.
   string rejection_reason = 18;
+  // Gateway-side merge/application preflight failure. Kept separate from
+  // prover output and operator rejection so clients can explain why a
+  // prover-clean proposal is not currently applicable.
+  string application_error = 19;
+  // Opaque digest binding review to the exact live inputs and complete
+  // effective candidate evaluated by the gateway.
+  string review_token = 20;
+  // Deterministic hashes for compact candidate display and diagnostics.
+  string current_effective_policy_hash = 21;
+  string candidate_effective_policy_hash = 22;
+  // Complete effective policies used for review. These contain policy
+  // configuration only; credential secret values are never materialized.
+  openshell.sandbox.v1.SandboxPolicy current_effective_policy = 23;
+  openshell.sandbox.v1.SandboxPolicy candidate_effective_policy = 24;
 }
 
 // Notification that the draft policy was updated.
@@ -2355,6 +2444,9 @@ message ApproveDraftChunkRequest {
   string chunk_id = 2;
   // Workspace scope. Empty defaults to "default".
   string workspace = 3;
+  // Token returned with the reviewed PolicyChunk. Approval fails with
+  // FAILED_PRECONDITION if live decision inputs no longer match it.
+  string review_token = 4;
 }
 
 message ApproveDraftChunkResponse {
@@ -2379,6 +2471,11 @@ message RejectDraftChunkRequest {
 message RejectDraftChunkResponse {}
 
 // Approve all pending chunks.
+message DraftChunkApproval {
+  string chunk_id = 1;
+  string review_token = 2;
+}
+
 message ApproveAllDraftChunksRequest {
   // Sandbox name.
   string name = 1;
@@ -2386,6 +2483,9 @@ message ApproveAllDraftChunksRequest {
   bool include_security_flagged = 2;
   // Workspace scope. Empty defaults to "default".
   string workspace = 3;
+  // Exact reviewed chunks and tokens. The server validates them against one
+  // live snapshot, stages compatible operations in order, and writes once.
+  repeated DraftChunkApproval approvals = 4;
 }
 
 message ApproveAllDraftChunksResponse {
@@ -2395,7 +2495,8 @@ message ApproveAllDraftChunksResponse {
   string policy_hash = 2;
   // Number of chunks approved.
   uint32 chunks_approved = 3;
-  // Number of chunks skipped (security-flagged).
+  // Number of chunks skipped for any reason, including security flags,
+  // stale or invalid candidates, and conflicts within the staged batch.
   uint32 chunks_skipped = 4;
 }
 
@@ -2510,6 +2611,12 @@ message DraftChunkPayload {
   // Operator-supplied free-form rejection text; empty for non-rejected
   // chunks. Mirrors PolicyChunk.rejection_reason.
   string rejection_reason = 12;
+  string application_error = 13;
+  string review_token = 14;
+  string current_effective_policy_hash = 15;
+  string candidate_effective_policy_hash = 16;
+  openshell.sandbox.v1.SandboxPolicy current_effective_policy = 17;
+  openshell.sandbox.v1.SandboxPolicy candidate_effective_policy = 18;
 }
 
 // Internal stored policy revision row materialized from the generic objects table.
@@ -2549,6 +2656,12 @@ message StoredDraftChunk {
   string validation_result = 18;
   // Operator-supplied free-form rejection text. See PolicyChunk.
   string rejection_reason = 19;
+  string application_error = 20;
+  string review_token = 21;
+  string current_effective_policy_hash = 22;
+  string candidate_effective_policy_hash = 23;
+  openshell.sandbox.v1.SandboxPolicy current_effective_policy = 24;
+  openshell.sandbox.v1.SandboxPolicy candidate_effective_policy = 25;
 }
 
 // ---------------------------------------------------------------------------
@@ -2662,4 +2775,17 @@ message ListWorkspaceMembersRequest {
 // List workspace members response.
 message ListWorkspaceMembersResponse {
   repeated WorkspaceMember members = 1;
+}
+
+// Short-lived credential for one policy-authorized extension service.
+// Kept at the end of the file so adding it does not renumber existing
+// generated message descriptors.
+message ExtensionServiceCredential {
+  // Operator registration name used to correlate the credential with the
+  // stable service registration delivered by GetSandboxConfig.
+  string service_name = 1;
+  // Gateway-minted JWT with an audience derived from the registration.
+  string token = 2 [(openshell.options.v1.secret) = true];
+  // Absolute expiry of the token, milliseconds since the epoch.
+  int64 expires_at_ms = 3;
 }

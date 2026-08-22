@@ -26,6 +26,11 @@ policy. Start starts that same container, so files in the resolved OCI
 workspace remain available. A durably stopped sandbox is excluded from
 gateway startup recovery and stays stopped across gateway restarts. Delete
 continues to force-remove the container and clean up driver-owned material.
+Graceful gateway shutdown sends `StopSandbox` for each sandbox whose persisted
+phase requires running compute without changing that persisted intent. On
+startup, the gateway sends an idempotent `StartSandbox` request for the same
+sandboxes, restarting their retained containers. Explicitly stopped sandboxes
+remain excluded.
 
 Before creating the container, the driver inspects the final sandbox image and
 captures its immutable image ID, raw OCI `Config.User`, and OCI
@@ -67,8 +72,10 @@ Docker containers join an OpenShell-managed bridge network. The driver injects
 `host.openshell.internal` and `host.docker.internal` so supervisors have stable
 names for reaching the gateway host. On Docker Desktop, Colima, Rancher
 Desktop, OrbStack, and macOS-hosted gateways, those names use Docker's
-`host-gateway` alias. On native Linux Docker, the gateway also binds the bridge
-gateway IP so containers can call back to the host process.
+`host-gateway` alias. The driver requests a separate IPv4 loopback callback
+listener when the primary listener does not already cover it. On native Linux
+Docker, the gateway also binds the bridge gateway IP so containers can call
+back to the host process.
 
 ## Container Contract
 
@@ -81,9 +88,10 @@ contract:
 | `network_mode = openshell` | Places the supervisor on the managed Docker bridge network. |
 | `cap_add` | Grants supervisor-only capabilities required for namespace setup and process inspection. |
 | `apparmor=unconfined` | Avoids Docker's default profile blocking required mount operations. |
-| `restart_policy = unless-stopped` | Keeps managed sandboxes resumable across daemon or gateway restarts. |
+| `restart_policy = no` | A canonical main-process exit remains terminal and is not silently restarted by Docker. |
 | `PidsLimit` | Enforces the sandbox PID budget at the Docker cgroup layer. Set `[openshell.drivers.docker].sandbox_pids_limit = 0` to inherit the Docker/runtime default. |
 | CDI GPU request | Uses opaque `driver_config.cdi_devices` values when set; otherwise selects the requested count of NVIDIA CDI GPUs in round-robin order when daemon CDI support is detected. Docker daemon `/info` can permit `nvidia.com/gpu=all` as a WSL2 all-only compatibility fallback, where it counts as one selectable device. Exact CDI device lists must not contain duplicates and must match the effective GPU count. |
+| `policy-dns-transparent-tcp` capability | Declares that the combined Docker supervisor can own namespace-local DNS/TCP capture and coupled workload restart. The shared supervisor still owns DNS eligibility, mappings, authorization, pinned dialing, relaying, and OCSF decisions. The marker is stripped from the workload environment. |
 
 The agent child process does not retain these supervisor privileges.
 
@@ -173,7 +181,7 @@ overwrites security-critical keys:
 - `OPENSHELL_SANDBOX_ID`
 - `OPENSHELL_SANDBOX`
 - `OPENSHELL_SSH_SOCKET_PATH`
-- `OPENSHELL_SANDBOX_COMMAND`
+- `OPENSHELL_MAIN_PROCESS_SPEC`
 - TLS path variables when HTTPS is enabled
 
 Do not allow sandbox images or templates to override these values.

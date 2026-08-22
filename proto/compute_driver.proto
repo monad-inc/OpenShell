@@ -8,14 +8,17 @@ package openshell.compute.v1;
 import "google/protobuf/struct.proto";
 import "options.proto";
 
-// Internal compute-driver contract used by the gateway.
+// Gateway/compute-driver extension contract.
 //
 // Conventions:
 // - This file owns driver-native request, response, and observation types.
 // - Compute drivers must not import or return the public `openshell.v1.Sandbox`
 //   resource model.
-// - The gateway translates between these internal driver-native messages and
+// - The gateway translates between these driver-native messages and
 //   the public OpenShell API resource model.
+// - Capability fields are additive. Drivers and gateways must ignore unknown
+//   fields so independently versioned external drivers remain
+//   forward-compatible.
 service ComputeDriver {
   // Report driver capabilities and defaults.
   rpc GetCapabilities(GetCapabilitiesRequest) returns (GetCapabilitiesResponse);
@@ -51,6 +54,13 @@ service ComputeDriver {
 
   // Stream sandbox observations from the platform.
   rpc WatchSandboxes(WatchSandboxesRequest) returns (stream WatchSandboxesEvent);
+
+  // Ensure platform resources for a workspace exist (e.g. namespace).
+  // Idempotent: succeeds if resources already exist.
+  rpc EnsureWorkspace(EnsureWorkspaceRequest) returns (EnsureWorkspaceResponse);
+
+  // Tear down platform resources for a workspace.
+  rpc DeleteWorkspace(DeleteWorkspaceRequest) returns (DeleteWorkspaceResponse);
 }
 
 message GetCapabilitiesRequest {}
@@ -65,6 +75,9 @@ message GetCapabilitiesResponse {
   string driver_version = 2;
   // Default sandbox image recommended by the driver.
   string default_image = 3;
+  // Whether the gateway should stop running sandbox compute during graceful
+  // shutdown and restart the retained running intent on startup.
+  bool gateway_manages_lifecycle = 6;
 }
 
 message GetGatewayListenerRequirementsRequest {}
@@ -135,6 +148,10 @@ message DriverSandboxSpec {
   // ServiceAccount token bootstrap instead). Never echoed to the public
   // Sandbox proto.
   string sandbox_token = 11 [(openshell.options.v1.secret) = true];
+  // Exact canonical command forwarded to the supervisor without shell parsing.
+  repeated string command = 12;
+  // Allocate a retained pseudo-terminal for the canonical process.
+  bool tty = 13;
 }
 
 message ResourceRequirements {
@@ -339,3 +356,17 @@ message WatchSandboxesEvent {
     WatchSandboxesPlatformEvent platform_event = 3;
   }
 }
+
+message EnsureWorkspaceRequest {
+  // Workspace identifier used by the gateway.
+  string workspace = 1;
+}
+
+message EnsureWorkspaceResponse {}
+
+message DeleteWorkspaceRequest {
+  // Workspace identifier used by the gateway.
+  string workspace = 1;
+}
+
+message DeleteWorkspaceResponse {}

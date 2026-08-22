@@ -17,6 +17,13 @@ The Kubernetes Agent Sandbox CRDs and controller must be installed on the cluste
 kubectl apply -f https://github.com/kubernetes-sigs/agent-sandbox/releases/latest/download/manifest.yaml
 ```
 
+The chart does not install this cluster-scoped dependency. By default, it
+fails before creating gateway resources when the cluster serves neither
+supported Sandbox API (`agents.x-k8s.io/v1beta1` or
+`agents.x-k8s.io/v1alpha1`). Disable the check with
+`agentSandbox.preflight.enabled=false` for offline `helm template` rendering,
+where Helm cannot discover cluster APIs.
+
 ## Install on Kubernetes
 
 ```shell
@@ -153,6 +160,7 @@ add `ci/values-spire.yaml` to the OpenShell release values files.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | affinity | object | `{}` | Affinity rules for the gateway pod. |
+| agentSandbox.preflight.enabled | bool | `true` | Check the live cluster for a supported Agent Sandbox API before rendering gateway resources. Disable only for offline rendering and linting. |
 | certManager.caSecretName | string | `"openshell-ca-tls"` | Secret created for the intermediate CA (Certificate with isCA: true). |
 | certManager.certificateDuration | string | `"8760h"` | Duration for cert-manager-issued certificates. |
 | certManager.certificateRenewBefore | string | `"720h"` | Renewal window for cert-manager-issued certificates. |
@@ -177,7 +185,7 @@ add `ci/values-spire.yaml` to the OpenShell release values files.
 | image.tag | string | `""` | Gateway image tag. Defaults to the chart appVersion when empty. |
 | imagePullSecrets | list | `[]` | Image pull secrets attached to gateway and helper pods. |
 | nameOverride | string | `"openshell"` | Override the chart name used in generated resource names. |
-| networkPolicy.enabled | bool | `true` | Create a NetworkPolicy restricting SSH ingress on sandbox pods to the gateway. |
+| networkPolicy.enabled | bool | `true` | Restrict SSH ingress on sandbox pods to the gateway. In managed mode, the driver applies the equivalent policy to each workspace namespace. |
 | nodeSelector | object | `{}` | Node selector for the gateway pod. |
 | openshiftRoute.annotations | object | `{}` | Extra annotations on the Route (e.g. haproxy.router.openshift.io/*). |
 | openshiftRoute.enabled | bool | `false` | Create an OpenShift Route with TLS passthrough. |
@@ -229,6 +237,9 @@ add `ci/values-spire.yaml` to the OpenShell release values files.
 | server.dbUrl | string | `"sqlite:/var/openshell/openshell.db"` | Gateway database URL (used for the default SQLite backend). |
 | server.defaultRuntimeClassName | string | `""` | Default Kubernetes runtimeClassName for sandbox pods. Applied when a CreateSandbox request does not specify one. Empty (default) = omit the field, using the cluster's default RuntimeClass. Set to a RuntimeClass name (e.g. "kata-containers", "nvidia") to apply it to all sandboxes that don't explicitly override it. |
 | server.disableTls | bool | `false` | Disable TLS entirely - the server listens on plaintext HTTP. Set to true when a reverse proxy / tunnel terminates TLS at the edge. |
+| server.drivers.kubernetes.operatorNamespaceFile | string | `""` | Path to a JSON file containing an array of namespace names allowed in operator mode. Hot-reloaded on change. |
+| server.drivers.kubernetes.operatorNamespaceLabel | string | `""` | K8s label selector for namespace discovery in operator mode. The driver watches namespaces matching this label. |
+| server.drivers.kubernetes.workspaceMode | string | `"shared"` | How workspaces map to Kubernetes namespaces. "shared" (default): all sandboxes in a single namespace. "managed": auto-creates per-workspace namespaces. "operator": uses pre-provisioned namespaces. |
 | server.enableLoopbackServiceHttp | bool | `true` | Enable plaintext HTTP routing for loopback sandbox service URLs on TLS-enabled gateways. |
 | server.enableUserNamespaces | bool | `false` | Enable Kubernetes user namespace isolation (hostUsers: false) for sandbox pods. Requires Kubernetes 1.33+ with user namespace support available (beta through 1.35, GA in 1.36+), plus a supporting container runtime and Linux 5.12+. When enabled, container UID 0 maps to an unprivileged host UID and capabilities become namespaced. |
 | server.externalDbSecret | string | `""` | Name of a pre-existing Opaque Secret containing a PostgreSQL connection URI (key: uri). When set, the gateway reads OPENSHELL_DB_URL from this Secret instead of using dbUrl. The Secret must contain a `uri` key, e.g. postgresql://user:pass@host:5432/dbname. |
@@ -278,6 +289,13 @@ add `ci/values-spire.yaml` to the OpenShell release values files.
 | supervisor.sideloadMethod | string | `""` | How the supervisor binary is delivered into sandbox pods. Empty (default) = auto-detect from cluster version:   K8s >= v1.35 -> "image-volume" (ImageVolume enabled by default; GA in v1.36)   K8s < v1.35 -> "init-container" (copies via init container + emptyDir) On K8s v1.33-v1.34 with the ImageVolume feature gate manually enabled, set this to "image-volume" explicitly. |
 | supervisor.topology | string | `"combined"` | Supervisor pod topology for Kubernetes sandboxes. "combined" runs the current single supervisor container in the agent pod. "sidecar" runs network enforcement in a dedicated sidecar and the process supervisor as a low-capability wrapper in the agent container. |
 | tolerations | list | `[]` | Tolerations for the gateway pod. |
+| upstreamProxy | object | `{"authAllowInsecure":false,"authSecret":{"key":"","name":""},"connectByHostname":false,"noProxy":"","url":""}` | Operator-owned corporate forward proxy for policy-approved TLS egress from Kubernetes sandboxes. The workload cannot select or override it. |
+| upstreamProxy.authAllowInsecure | bool | `false` | Required when authSecret is configured because Basic auth to an HTTP proxy is cleartext. |
+| upstreamProxy.authSecret.key | string | `""` | Secret key containing the proxy credential. |
+| upstreamProxy.authSecret.name | string | `""` | Existing Secret in the sandbox namespace containing a user:pass value. |
+| upstreamProxy.connectByHostname | bool | `false` | Last-resort option for hostname-filtering proxy ACLs. It lets the proxy resolve CONNECT targets. |
+| upstreamProxy.noProxy | string | `""` | Comma-separated destinations that bypass only the corporate proxy. |
+| upstreamProxy.url | string | `""` | HTTP proxy URL in http://host:port form. HTTPS-to-proxy is not supported. |
 | workload.allowMultiReplicaStatefulSet | bool | `false` | Allow replicaCount > 1 while rendering a StatefulSet. Prefer workload.kind=deployment for external database-backed multi-replica gateways; this override exists for operators who explicitly require StatefulSet identity or storage semantics. |
 | workload.kind | string | `"statefulset"` | Gateway workload controller kind. Use `statefulset` for the default SQLite database, or `deployment` when server.externalDbSecret points at an external database. |
 

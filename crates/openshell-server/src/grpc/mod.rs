@@ -43,14 +43,15 @@ use openshell_core::proto::{
     ProviderProfileResponse, ProviderResponse, PushSandboxLogsRequest, PushSandboxLogsResponse,
     RefreshSandboxTokenRequest, RefreshSandboxTokenResponse, RejectDraftChunkRequest,
     RejectDraftChunkResponse, RelayFrame, RemoveWorkspaceMemberRequest,
-    RemoveWorkspaceMemberResponse, ReportPolicyStatusRequest, ReportPolicyStatusResponse,
-    RevokeSshSessionRequest, RevokeSshSessionResponse, RotateProviderCredentialRequest,
-    RotateProviderCredentialResponse, SandboxResponse, ServiceEndpointResponse, ServiceStatus,
-    StartSandboxRequest, StopSandboxRequest, SubmitPolicyAnalysisRequest,
-    SubmitPolicyAnalysisResponse, SupervisorMessage, TcpForwardFrame, UndoDraftChunkRequest,
-    UndoDraftChunkResponse, UpdateConfigRequest, UpdateConfigResponse,
-    UpdateProviderProfilesRequest, UpdateProviderProfilesResponse, UpdateProviderRequest,
-    WatchSandboxRequest, open_shell_server::OpenShell,
+    RemoveWorkspaceMemberResponse, ReportMainProcessExitRequest, ReportMainProcessExitResponse,
+    ReportPolicyStatusRequest, ReportPolicyStatusResponse, RevokeSshSessionRequest,
+    RevokeSshSessionResponse, RotateProviderCredentialRequest, RotateProviderCredentialResponse,
+    SandboxResponse, ServiceEndpointResponse, ServiceStatus, StartSandboxRequest,
+    StopSandboxRequest, SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse,
+    SupervisorMessage, TcpForwardFrame, UndoDraftChunkRequest, UndoDraftChunkResponse,
+    UpdateConfigRequest, UpdateConfigResponse, UpdateProviderProfilesRequest,
+    UpdateProviderProfilesResponse, UpdateProviderRequest, WatchSandboxRequest,
+    open_shell_server::OpenShell,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -679,6 +680,13 @@ impl OpenShell for OpenShellService {
         crate::supervisor_session::handle_connect_supervisor(&self.state, request).await
     }
 
+    async fn report_main_process_exit(
+        &self,
+        request: Request<ReportMainProcessExitRequest>,
+    ) -> Result<Response<ReportMainProcessExitResponse>, Status> {
+        crate::supervisor_session::handle_report_main_process_exit(&self.state, request).await
+    }
+
     type RelayStreamStream =
         Pin<Box<dyn tokio_stream::Stream<Item = Result<RelayFrame, Status>> + Send + 'static>>;
 
@@ -753,7 +761,9 @@ pub mod test_support {
     use crate::ServerState;
     use crate::auth::identity::{Identity, IdentityProvider};
     use crate::auth::principal::{Principal, UserPrincipal};
-    use crate::compute::{new_test_runtime, new_test_runtime_for_driver};
+    use crate::compute::{
+        NoopTestDriver, new_test_runtime, new_test_runtime_for_driver, new_test_runtime_with_driver,
+    };
     use crate::persistence::Store;
     use crate::sandbox_index::SandboxIndex;
     use crate::sandbox_watch::SandboxWatchBus;
@@ -800,6 +810,33 @@ pub mod test_support {
         } else {
             new_test_runtime_for_driver(store.clone(), driver_name).await
         };
+        Arc::new(ServerState::new(
+            Config::new(None)
+                .with_database_url("sqlite::memory:?cache=shared")
+                .with_credential_drivers(["test-static"]),
+            store,
+            compute,
+            SandboxIndex::new(),
+            SandboxWatchBus::new(),
+            TracingLogBus::new(),
+            Arc::new(SupervisorSessionRegistry::new()),
+            None,
+        ))
+    }
+
+    /// Build a test state whose compute driver fails the requested number of
+    /// workspace cleanup calls before succeeding.
+    pub async fn test_server_state_with_workspace_cleanup_failures(
+        failures: usize,
+    ) -> Arc<ServerState> {
+        let store = Arc::new(
+            Store::connect("sqlite::memory:?cache=shared")
+                .await
+                .unwrap(),
+        );
+        crate::ensure_default_workspace(&store).await.unwrap();
+        let driver = Arc::new(NoopTestDriver::failing_workspace_deletes(failures));
+        let compute = new_test_runtime_with_driver(store.clone(), "test", driver).await;
         Arc::new(ServerState::new(
             Config::new(None)
                 .with_database_url("sqlite::memory:?cache=shared")

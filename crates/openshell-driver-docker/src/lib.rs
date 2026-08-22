@@ -11,7 +11,7 @@ use bollard::models::{
     ContainerCreateBody, ContainerState, ContainerStateStatusEnum, ContainerSummary,
     ContainerSummaryStateEnum, CreateImageInfo, DeviceRequest, EndpointSettings, HostConfig, Mount,
     MountTmpfsOptions, MountTypeEnum, MountVolumeOptions, NetworkCreateRequest, NetworkingConfig,
-    ProgressDetail, RestartPolicy, RestartPolicyNameEnum, SystemInfo,
+    ProgressDetail, SystemInfo,
 };
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, CreateImageOptions, DownloadFromContainerOptionsBuilder,
@@ -26,7 +26,8 @@ use openshell_core::driver_mounts;
 use openshell_core::driver_utils::{
     LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME,
     LABEL_SANDBOX_NAMESPACE, LABEL_SANDBOX_WORKSPACE, SUPERVISOR_IMAGE_BINARY_PATH,
-    supervisor_image_should_refresh,
+    extract_first_tar_entry, supervisor_image_should_refresh, temp_extract_container_name,
+    validate_linux_elf_binary, write_cache_binary_atomic,
 };
 use openshell_core::gpu::{
     CdiGpuDefaultSelector, CdiGpuInventory, CdiGpuSelectionError, driver_gpu_requirements,
@@ -38,8 +39,9 @@ use openshell_core::progress::{
 };
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    DriverCondition, DriverPlatformEvent, DriverSandbox, DriverSandboxStatus,
-    DriverSandboxTemplate, GatewayListenerRequirement, GetCapabilitiesRequest,
+    DeleteWorkspaceRequest, DeleteWorkspaceResponse, DriverCondition, DriverPlatformEvent,
+    DriverSandbox, DriverSandboxStatus, DriverSandboxTemplate, EnsureWorkspaceRequest,
+    EnsureWorkspaceResponse, GatewayListenerRequirement, GetCapabilitiesRequest,
     GetCapabilitiesResponse, GetGatewayListenerRequirementsRequest,
     GetGatewayListenerRequirementsResponse, GetSandboxRequest, GetSandboxResponse,
     GpuResourceRequirements, ListSandboxesRequest, ListSandboxesResponse, StartSandboxRequest,
@@ -54,8 +56,7 @@ use openshell_core::proto_struct::{
 };
 use openshell_core::{Config, Error, Result as CoreResult};
 use std::collections::{HashMap, HashSet};
-use std::io::Read;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -76,7 +77,6 @@ const TLS_CA_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_CA_MOUNT_PATH;
 const TLS_CERT_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_CERT_MOUNT_PATH;
 const TLS_KEY_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_KEY_MOUNT_PATH;
 const SANDBOX_TOKEN_MOUNT_PATH: &str = openshell_core::driver_utils::SANDBOX_TOKEN_MOUNT_PATH;
-const SANDBOX_COMMAND: &str = "sleep infinity";
 const SUPERVISOR_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const HOST_OPENSHELL_INTERNAL: &str = "host.openshell.internal";
 const HOST_DOCKER_INTERNAL: &str = "host.docker.internal";
@@ -177,6 +177,7 @@ struct DockerDriverRuntimeConfig {
     grpc_endpoint: String,
     network_name: String,
     gateway_route: DockerGatewayRoute,
+    gateway_callback_bind_address: Option<SocketAddr>,
     ssh_socket_path: String,
     stop_timeout_secs: u32,
     log_level: String,
@@ -428,6 +429,8 @@ impl DockerComputeDriver {
         let host_gateway_ip = parse_optional_host_gateway_ip(&docker_config.host_gateway_ip)?;
         let gateway_route =
             docker_gateway_route(&info, bridge_gateway_ip, gateway_port, host_gateway_ip);
+        let gateway_callback_bind_address =
+            docker_gateway_callback_bind_address(&gateway_route, config.bind_address);
         let mut docker_config = docker_config.clone();
         if docker_config.grpc_endpoint.trim().is_empty() {
             let scheme = if docker_guest_tls_configured(&docker_config) {
@@ -456,6 +459,7 @@ impl DockerComputeDriver {
                 grpc_endpoint,
                 network_name,
                 gateway_route,
+                gateway_callback_bind_address,
                 ssh_socket_path: docker_config.ssh_socket_path.clone(),
                 stop_timeout_secs: DEFAULT_STOP_TIMEOUT_SECS,
                 log_level: config.log_level.clone(),
@@ -485,11 +489,12 @@ impl DockerComputeDriver {
     }
 
     fn capabilities(&self) -> GetCapabilitiesResponse {
-        openshell_core::driver_utils::build_capabilities_response(
-            "docker",
-            &self.config.daemon_version,
-            &self.config.default_image,
-        )
+        GetCapabilitiesResponse {
+            driver_name: "docker".to_string(),
+            driver_version: self.config.daemon_version.clone(),
+            default_image: self.config.default_image.clone(),
+            gateway_manages_lifecycle: true,
+        }
     }
 
     #[cfg(test)]
@@ -1050,69 +1055,6 @@ impl DockerComputeDriver {
         }
     }
 
-    pub async fn stop_managed_containers_on_shutdown(&self) -> Result<usize, Status> {
-        let containers = self.list_managed_container_summaries().await?;
-        let targets = containers
-            .into_iter()
-            .filter_map(|container| {
-                let state = container.state.unwrap_or(ContainerSummaryStateEnum::EMPTY);
-                if container_state_needs_shutdown_stop(state) {
-                    summary_container_target(&container)
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-        let target_count = targets.len();
-        let mut stopped = 0usize;
-        let mut failures = Vec::new();
-        let stop_timeout_secs = self.config.stop_timeout_secs;
-
-        let mut stop_results = futures::stream::iter(targets.into_iter().map(|target| {
-            let docker = self.docker.clone();
-            async move {
-                let result = docker
-                    .stop_container(
-                        &target,
-                        Some(
-                            StopContainerOptionsBuilder::default()
-                                .t(docker_stop_timeout_secs(stop_timeout_secs))
-                                .build(),
-                        ),
-                    )
-                    .await;
-                (target, result)
-            }
-        }))
-        .buffer_unordered(16);
-
-        while let Some((target, result)) = stop_results.next().await {
-            match result {
-                Ok(()) => {
-                    stopped += 1;
-                }
-                Err(err) if is_not_found_error(&err) || is_not_modified_error(&err) => {}
-                Err(err) => {
-                    warn!(
-                        container = %target,
-                        error = %err,
-                        "Failed to stop Docker sandbox container during shutdown"
-                    );
-                    failures.push(target);
-                }
-            }
-        }
-
-        if !failures.is_empty() {
-            return Err(Status::internal(format!(
-                "failed to stop {} of {target_count} Docker sandbox containers during shutdown",
-                failures.len()
-            )));
-        }
-
-        Ok(stopped)
-    }
-
     async fn reserve_pending_sandbox(&self, sandbox: &DriverSandbox) -> Result<(), Status> {
         let mut pending = self.pending.lock().await;
         if pending
@@ -1577,15 +1519,19 @@ impl ComputeDriver for DockerComputeDriver {
         &self,
         _request: Request<GetGatewayListenerRequirementsRequest>,
     ) -> Result<Response<GetGatewayListenerRequirementsResponse>, Status> {
-        let requirements = match self.config.gateway_route {
-            DockerGatewayRoute::Bridge { bind_address, .. } => {
-                vec![GatewayListenerRequirement {
-                    reason: "docker managed bridge gateway".to_string(),
-                    selector: Some(Selector::ExactBindAddress(bind_address.to_string())),
-                }]
-            }
-            DockerGatewayRoute::HostGateway => Vec::new(),
-        };
+        let requirements =
+            self.config
+                .gateway_callback_bind_address
+                .map_or_else(Vec::new, |bind_address| {
+                    vec![GatewayListenerRequirement {
+                        reason: match self.config.gateway_route {
+                            DockerGatewayRoute::Bridge { .. } => "docker managed bridge gateway",
+                            DockerGatewayRoute::HostGateway => "docker host-gateway IPv4 loopback",
+                        }
+                        .to_string(),
+                        selector: Some(Selector::ExactBindAddress(bind_address.to_string())),
+                    }]
+                });
         Ok(Response::new(GetGatewayListenerRequirementsResponse {
             requirements,
         }))
@@ -1752,6 +1698,20 @@ impl ComputeDriver for DockerComputeDriver {
         });
 
         Ok(Response::new(Box::pin(ReceiverStream::new(out_rx))))
+    }
+
+    async fn ensure_workspace(
+        &self,
+        _request: Request<EnsureWorkspaceRequest>,
+    ) -> Result<Response<EnsureWorkspaceResponse>, Status> {
+        Ok(Response::new(EnsureWorkspaceResponse {}))
+    }
+
+    async fn delete_workspace(
+        &self,
+        _request: Request<DeleteWorkspaceRequest>,
+    ) -> Result<Response<DeleteWorkspaceResponse>, Status> {
+        Ok(Response::new(DeleteWorkspaceResponse {}))
     }
 }
 
@@ -2425,13 +2385,20 @@ fn build_environment_for_oci_user(
         openshell_core::sandbox_env::SSH_SOCKET_PATH.to_string(),
         config.ssh_socket_path.clone(),
     );
+    let main_process =
+        openshell_core::sandbox_env::MainProcessConfig::encode_driver_spec(sandbox.spec.as_ref())
+            .expect("main process config serialization cannot fail");
     environment.insert(
-        openshell_core::sandbox_env::SANDBOX_COMMAND.to_string(),
-        SANDBOX_COMMAND.to_string(),
+        openshell_core::sandbox_env::MAIN_PROCESS_SPEC.to_string(),
+        main_process,
     );
     environment.insert(
         openshell_core::sandbox_env::TELEMETRY_ENABLED.to_string(),
         openshell_core::telemetry::enabled_env_value().to_string(),
+    );
+    environment.insert(
+        openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES.to_string(),
+        openshell_core::sandbox_env::POLICY_DNS_TRANSPARENT_TCP_CAPABILITY.to_string(),
     );
     // The root supervisor executes namespace helpers during bootstrap; keep
     // their search path driver-owned even when the template/spec set PATH.
@@ -2673,10 +2640,9 @@ fn build_container_create_body_for_image(
                 Some(binds)
             },
             mounts: Some(user_mounts),
-            restart_policy: Some(RestartPolicy {
-                name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),
-                maximum_retry_count: None,
-            }),
+            // Canonical main-process exit is terminal. Runtime restart would
+            // silently create a new process generation behind the gateway.
+            restart_policy: None,
             cap_add: Some(vec![
                 "SYS_ADMIN".to_string(),
                 "NET_ADMIN".to_string(),
@@ -2790,6 +2756,22 @@ fn docker_gateway_route_for_host(
             bind_address: SocketAddr::new(bridge_gateway_ip, port),
             host_alias_ip: bridge_gateway_ip,
         }
+    }
+}
+
+fn docker_gateway_callback_bind_address(
+    route: &DockerGatewayRoute,
+    primary_bind_address: SocketAddr,
+) -> Option<SocketAddr> {
+    match route {
+        DockerGatewayRoute::Bridge { bind_address, .. } => Some(*bind_address),
+        DockerGatewayRoute::HostGateway => match primary_bind_address.ip() {
+            IpAddr::V4(ip) if ip.is_unspecified() || ip == Ipv4Addr::LOCALHOST => None,
+            _ => Some(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                primary_bind_address.port(),
+            )),
+        },
     }
 }
 
@@ -3161,15 +3143,6 @@ fn summary_container_target(summary: &ContainerSummary) -> Option<String> {
         .or_else(|| summary_container_name(summary))
 }
 
-fn container_state_needs_shutdown_stop(state: ContainerSummaryStateEnum) -> bool {
-    matches!(
-        state,
-        ContainerSummaryStateEnum::RUNNING
-            | ContainerSummaryStateEnum::RESTARTING
-            | ContainerSummaryStateEnum::PAUSED
-    )
-}
-
 /// States from which a managed container can be brought back to running by
 /// `start_container`. Skip `Restarting` (already coming up), `Removing`,
 /// `Dead` (terminal), `Paused` (needs `unpause`, not `start`), and
@@ -3319,7 +3292,7 @@ fn resolve_supervisor_bin_source(
     // Tier 1: explicit supervisor_bin in [openshell.drivers.docker].
     if let Some(path) = docker_config.supervisor_bin.clone() {
         let path = canonicalize_existing_file(&path, "docker supervisor binary")?;
-        validate_linux_elf_binary(&path)?;
+        validate_linux_elf_binary(&path).map_err(Error::config)?;
         return Ok(SupervisorBinSource::Binary(path));
     }
 
@@ -3459,24 +3432,13 @@ async fn extract_supervisor_bin_from_image(docker: &Docker, image: &str) -> Core
         ))
     })?;
 
-    let cache_path = supervisor_cache_path(&digest)?;
+    let cache_path =
+        openshell_core::driver_utils::supervisor_cache_path("docker-supervisor", &digest)
+            .map_err(Error::config)?;
     if cache_path.is_file() {
-        validate_linux_elf_binary(&cache_path)?;
+        validate_linux_elf_binary(&cache_path).map_err(Error::config)?;
         return Ok(cache_path);
     }
-
-    let cache_dir = cache_path.parent().ok_or_else(|| {
-        Error::config(format!(
-            "docker supervisor cache path '{}' has no parent directory",
-            cache_path.display(),
-        ))
-    })?;
-    std::fs::create_dir_all(cache_dir).map_err(|err| {
-        Error::config(format!(
-            "failed to create docker supervisor cache dir '{}': {err}",
-            cache_dir.display(),
-        ))
-    })?;
 
     info!(
         image = image,
@@ -3486,8 +3448,8 @@ async fn extract_supervisor_bin_from_image(docker: &Docker, image: &str) -> Core
     );
 
     let binary_bytes = extract_supervisor_binary_bytes(docker, image).await?;
-    write_cache_binary_atomic(&cache_path, &binary_bytes)?;
-    validate_linux_elf_binary(&cache_path)?;
+    write_cache_binary_atomic(&cache_path, &binary_bytes).map_err(Error::config)?;
+    validate_linux_elf_binary(&cache_path).map_err(Error::config)?;
     Ok(cache_path)
 }
 
@@ -3580,98 +3542,6 @@ async fn download_binary_from_container(
     })
 }
 
-/// Extract the payload of the first regular-file entry in a tar archive.
-/// Docker's `/containers/<id>/archive` endpoint returns a single-file tar
-/// when `path` points to a file, so we only need the first entry.
-fn extract_first_tar_entry(tar_bytes: &[u8]) -> Result<Vec<u8>, String> {
-    let mut archive = tar::Archive::new(std::io::Cursor::new(tar_bytes));
-    let mut entries = archive
-        .entries()
-        .map_err(|err| format!("open tar archive: {err}"))?;
-    let mut entry = entries
-        .next()
-        .ok_or_else(|| "tar archive was empty".to_string())?
-        .map_err(|err| format!("read tar entry: {err}"))?;
-    let mut bytes = Vec::new();
-    entry
-        .read_to_end(&mut bytes)
-        .map_err(|err| format!("read tar entry payload: {err}"))?;
-    Ok(bytes)
-}
-
-fn write_cache_binary_atomic(final_path: &Path, bytes: &[u8]) -> CoreResult<()> {
-    let dir = final_path.parent().ok_or_else(|| {
-        Error::config(format!(
-            "docker supervisor cache path '{}' has no parent directory",
-            final_path.display(),
-        ))
-    })?;
-    let mut temp = tempfile::Builder::new()
-        .prefix(".openshell-sandbox-")
-        .tempfile_in(dir)
-        .map_err(|err| {
-            Error::config(format!(
-                "failed to create temp file for supervisor binary in '{}': {err}",
-                dir.display(),
-            ))
-        })?;
-    std::io::Write::write_all(&mut temp, bytes).map_err(|err| {
-        Error::config(format!(
-            "failed to write supervisor binary to temp file: {err}",
-        ))
-    })?;
-    temp.as_file().sync_all().map_err(|err| {
-        Error::config(format!("failed to sync supervisor binary temp file: {err}"))
-    })?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o755)).map_err(
-            |err| {
-                Error::config(format!(
-                    "failed to chmod supervisor binary temp file: {err}",
-                ))
-            },
-        )?;
-    }
-
-    temp.persist(final_path).map_err(|err| {
-        Error::config(format!(
-            "failed to rename supervisor binary into '{}': {}",
-            final_path.display(),
-            err.error,
-        ))
-    })?;
-    Ok(())
-}
-
-/// Cache path for an extracted supervisor binary, keyed by the image's
-/// content-addressable digest (e.g. `sha256:abc123…`). The digest-prefixed
-/// directory keeps stale extractions from earlier releases isolated so they
-/// can be GC'd without affecting the active binary.
-fn supervisor_cache_path(digest: &str) -> CoreResult<PathBuf> {
-    let base = openshell_core::paths::xdg_data_dir()
-        .map_err(|err| Error::config(format!("failed to resolve XDG data dir: {err}")))?;
-    Ok(supervisor_cache_path_with_base(&base, digest))
-}
-
-fn supervisor_cache_path_with_base(base: &Path, digest: &str) -> PathBuf {
-    let sanitized = digest.replace(':', "-");
-    base.join("openshell")
-        .join("docker-supervisor")
-        .join(sanitized)
-        .join("openshell-sandbox")
-}
-
-fn temp_extract_container_name() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let pid = std::process::id();
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    format!("openshell-supervisor-extract-{pid}-{seq}")
-}
-
 fn canonicalize_existing_file(path: &Path, description: &str) -> CoreResult<PathBuf> {
     if !path.is_file() {
         return Err(Error::config(format!(
@@ -3685,29 +3555,6 @@ fn canonicalize_existing_file(path: &Path, description: &str) -> CoreResult<Path
             path.display()
         ))
     })
-}
-
-pub(crate) fn validate_linux_elf_binary(path: &Path) -> CoreResult<()> {
-    let mut file = std::fs::File::open(path).map_err(|err| {
-        Error::config(format!(
-            "failed to open docker supervisor binary '{}': {err}",
-            path.display()
-        ))
-    })?;
-    let mut magic = [0_u8; 4];
-    file.read_exact(&mut magic).map_err(|err| {
-        Error::config(format!(
-            "failed to read docker supervisor binary '{}': {err}",
-            path.display()
-        ))
-    })?;
-    if magic != [0x7f, b'E', b'L', b'F'] {
-        return Err(Error::config(format!(
-            "docker supervisor binary '{}' must be a Linux ELF executable",
-            path.display()
-        )));
-    }
-    Ok(())
 }
 
 fn docker_guest_tls_configured(docker_config: &DockerComputeConfig) -> bool {
