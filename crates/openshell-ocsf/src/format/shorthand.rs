@@ -59,6 +59,30 @@ pub fn severity_tag(severity_id: u8) -> &'static str {
     }
 }
 
+/// Recover the severity id from a formatted shorthand line.
+///
+/// The inverse of [`severity_tag`], for consumers that receive a shorthand
+/// line rather than the event it was built from. The gateway forwards sandbox
+/// OCSF events as their rendered text, so the severity the sandbox assigned
+/// survives only inside that text; exporters read it back through here rather
+/// than matching the tag spellings themselves, which would silently disagree
+/// with [`severity_tag`] the moment a tag changes.
+///
+/// Returns `None` when no known tag is present. `[INFO]` reports `1`
+/// (Informational) rather than `0` (Unknown): [`severity_tag`] renders both as
+/// `[INFO]`, so a rendered line cannot tell them apart.
+///
+/// Ids 1 through 6 cover every distinct tag. The leftmost match wins, because
+/// the tag sits immediately after `CLASS:ACTIVITY` while a later `[...]` of the
+/// same spelling could appear inside a message or reason.
+#[must_use]
+pub fn severity_id_from_shorthand(line: &str) -> Option<u8> {
+    (1..=6u8)
+        .filter_map(|id| line.find(severity_tag(id)).map(|at| (at, id)))
+        .min()
+        .map(|(_, id)| id)
+}
+
 /// Max length for the reason text in `[reason:...]` before truncation. A
 /// denial reason carries the full destination endpoint plus the rejecting
 /// policy name (e.g. `endpoint host.example:443 not in policy <name>`), so the
@@ -118,12 +142,53 @@ fn escape_context_field(text: &str) -> String {
     escaped
 }
 
+/// Flatten a value that appears inside a bracketed context tag but may
+/// legitimately contain spaces (reasons, messages, command lines). Control
+/// characters (terminal escapes included) collapse to spaces, and brackets
+/// and backslashes are escaped, so workload-sourced text cannot forge extra
+/// lines or lookalike tags or drive the operator's terminal.
+fn tag_text(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '[' => escaped.push_str("\\["),
+            ']' => escaped.push_str("\\]"),
+            character if character == '\n' || character == '\r' || character.is_control() => {
+                escaped.push(' ');
+            }
+            character => escaped.push(character),
+        }
+    }
+    escaped
+}
+
+/// Render an actor/user for the shorthand text plane as `name(uid)`.
+///
+/// The display name is often a self-asserted identity claim
+/// (`preferred_username`), so the stable uid must accompany it — in the
+/// default push format the shorthand is the only actor identity that leaves
+/// the box, and a display name alone would let one user pose as another.
+/// The uid is omitted when absent or identical to the name.
+fn user_display(user: &crate::objects::User) -> String {
+    let name = truncate_with_ellipsis(&single_line(&user.name), MAX_MESSAGE_LEN);
+    match user.uid.as_deref() {
+        Some(uid) if uid != user.name => {
+            format!(
+                "{name}({})",
+                truncate_with_ellipsis(&single_line(uid), MAX_MESSAGE_LEN)
+            )
+        }
+        _ => name,
+    }
+}
+
 fn reason_text(text: Option<&str>) -> Option<String> {
     let text = text?;
     if text.is_empty() {
         return None;
     }
-    let text = text.replace(['\n', '\r'], " ");
+    let text = tag_text(text);
     Some(truncate_with_ellipsis(&text, MAX_REASON_LEN))
 }
 
@@ -176,8 +241,24 @@ fn message_tag(base: &BaseEventData) -> String {
     if text.is_empty() {
         return String::new();
     }
-    let text = text.replace(['\n', '\r'], " ");
+    let text = tag_text(text);
     format!(" [msg:{}]", truncate_with_ellipsis(&text, MAX_MESSAGE_LEN))
+}
+
+/// Flatten a field that appears bare (unquoted, unbracketed) in a shorthand
+/// line. Line breaks and other control characters collapse to spaces so a
+/// value sourced from a request payload or token claim cannot forge
+/// additional lines in the text plane.
+fn single_line(text: &str) -> String {
+    text.chars()
+        .map(|character| {
+            if character == '\n' || character == '\r' || character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
 }
 
 impl OcsfEvent {
@@ -196,7 +277,8 @@ impl OcsfEvent {
                 let actor_str = e
                     .actor
                     .as_ref()
-                    .map(|a| format!("{}({})", a.process.name, a.process.pid))
+                    .and_then(|a| a.process.as_ref())
+                    .map(|p| format!("{}({})", single_line(&p.name), p.pid))
                     .unwrap_or_default();
                 let dst = e
                     .dst_endpoint
@@ -266,7 +348,8 @@ impl OcsfEvent {
                 let actor_str = e
                     .actor
                     .as_ref()
-                    .map(|a| format!("{}({})", a.process.name, a.process.pid))
+                    .and_then(|a| a.process.as_ref())
+                    .map(|p| format!("{}({})", single_line(&p.name), p.pid))
                     .unwrap_or_default();
                 let url_str = e
                     .http_request
@@ -394,7 +477,10 @@ impl OcsfEvent {
 
             Self::ProcessActivity(e) => {
                 let activity = e.base.activity_name.to_uppercase();
-                let proc_str = format!("{}({})", e.process.name, e.process.pid);
+                // Process names and command lines are workload-chosen —
+                // flatten/escape them so a sandboxed process cannot forge
+                // extra shorthand lines or lookalike tags.
+                let proc_str = format!("{}({})", single_line(&e.process.name), e.process.pid);
                 let exit_ctx = e
                     .exit_code
                     .map(|c| format!(" [exit:{c}]"))
@@ -403,7 +489,12 @@ impl OcsfEvent {
                     .process
                     .cmd_line
                     .as_ref()
-                    .map(|c| format!(" [cmd:{c}]"))
+                    .map(|c| {
+                        format!(
+                            " [cmd:{}]",
+                            truncate_with_ellipsis(&tag_text(c), MAX_MESSAGE_LEN)
+                        )
+                    })
                     .unwrap_or_default();
 
                 format!("PROC:{activity} {sev} {proc_str}{exit_ctx}{cmd_ctx}")
@@ -443,6 +534,59 @@ impl OcsfEvent {
                 format!("LIFECYCLE:{activity} {sev} {app} {status}")
             }
 
+            Self::EntityManagement(e) => {
+                let activity = e.base.activity_name.to_uppercase();
+                let outcome = match e.base.status.map(crate::enums::StatusId::label) {
+                    Some("Failure") => " FAILED",
+                    _ => "",
+                };
+                // Entity names, uids, and actor names come from request
+                // payloads and token claims — escape/flatten them so they
+                // cannot forge lines or close the quoted field.
+                let actor_str = e
+                    .actor
+                    .as_ref()
+                    .and_then(|a| a.user.as_ref())
+                    .map(|u| format!(" by {}", user_display(u)))
+                    .unwrap_or_default();
+                format!(
+                    "ENTITY:{activity} {sev}{outcome} {} \"{}\"{actor_str}",
+                    single_line(&e.entity.entity_type),
+                    truncate_with_ellipsis(
+                        &escape_quoted_field(e.entity.display()),
+                        MAX_REASON_LEN
+                    ),
+                )
+            }
+
+            Self::Authentication(e) => {
+                let activity = e.base.activity_name.to_uppercase();
+                let outcome = match e.base.status.map(crate::enums::StatusId::label) {
+                    Some("Success") => "OK",
+                    _ => "FAILED",
+                };
+                let protocol = e
+                    .auth_protocol
+                    .map(|p| format!(" {}", p.label().to_lowercase()))
+                    .unwrap_or_default();
+                let who = e
+                    .user
+                    .as_ref()
+                    .map(|u| format!(" user:{}", user_display(u)))
+                    .unwrap_or_default();
+                let from = e
+                    .src_endpoint
+                    .as_ref()
+                    .map(|ep| {
+                        let host = ep.domain_or_ip();
+                        let port = ep.port.map_or(String::new(), |p| format!(":{p}"));
+                        format!(" from {host}{port}")
+                    })
+                    .unwrap_or_default();
+                let reason = reason_tag(&e.base);
+                format!("AUTHN:{activity} {sev} {outcome}{protocol}{who}{from}{reason}")
+            }
+
             Self::DeviceConfigStateChange(e) => {
                 let state = e.state.map_or_else(
                     || "UNKNOWN".to_string(),
@@ -453,7 +597,13 @@ impl OcsfEvent {
                             .to_uppercase()
                     },
                 );
-                let what = e.base.message.as_deref().unwrap_or("config");
+                let outcome = match e.base.status.map(crate::enums::StatusId::label) {
+                    Some("Failure") => " FAILED",
+                    _ => "",
+                };
+                // The message interpolates request-sourced values (chunk rule
+                // names, binaries) — flatten so they cannot forge lines.
+                let what = single_line(e.base.message.as_deref().unwrap_or("config"));
                 // Bracketed suffix carries the structured provenance fields a
                 // reviewer needs to scan a CONFIG audit line. Auto-approval
                 // emits `auto`/`source`/`prover_delta`; every config change
@@ -465,9 +615,11 @@ impl OcsfEvent {
                     .as_ref()
                     .map(|u| {
                         let mut parts: Vec<String> = Vec::new();
+                        // `source` echoes the request's analysis mode —
+                        // escape every value like the generic unmapped path.
                         let mut push = |key: &str| {
                             if let Some(value) = u.get(key).and_then(|v| v.as_str()) {
-                                parts.push(format!("{key}:{value}"));
+                                parts.push(format!("{key}:{}", escape_context_field(value)));
                             }
                         };
                         push("auto");
@@ -475,10 +627,10 @@ impl OcsfEvent {
                         push("prover_delta");
                         push("resolved_from");
                         if let Some(ver) = u.get("policy_version").and_then(|v| v.as_str()) {
-                            parts.push(format!("version:{ver}"));
+                            parts.push(format!("version:{}", escape_context_field(ver)));
                         }
                         if let Some(hash) = u.get("policy_hash").and_then(|v| v.as_str()) {
-                            parts.push(format!("hash:{hash}"));
+                            parts.push(format!("hash:{}", escape_context_field(hash)));
                         }
                         if parts.is_empty() {
                             String::new()
@@ -488,11 +640,20 @@ impl OcsfEvent {
                     })
                     .unwrap_or_default();
 
-                format!("CONFIG:{state} {sev} {what}{suffix}")
+                let actor_str = e
+                    .actor
+                    .as_ref()
+                    .and_then(|a| a.user.as_ref())
+                    .map(|u| format!(" by {}", single_line(&u.name)))
+                    .unwrap_or_default();
+                format!("CONFIG:{state} {sev}{outcome} {what}{suffix}{actor_str}")
             }
 
             Self::Base(e) => {
-                let message = e.base.message.as_deref().unwrap_or("");
+                // The fallback arm renders whatever a producer supplied —
+                // flatten/escape like every other arm so it cannot become
+                // the unescaped path.
+                let message = single_line(e.base.message.as_deref().unwrap_or(""));
                 let unmapped_ctx = e
                     .base
                     .unmapped
@@ -507,7 +668,11 @@ impl OcsfEvent {
                             .take(3) // Limit to 3 most important fields
                             .map(|(k, v)| {
                                 let val = v.as_str().map_or_else(|| v.to_string(), String::from);
-                                format!("{k}:{val}")
+                                format!(
+                                    "{}:{}",
+                                    escape_context_field(k),
+                                    escape_context_field(&val)
+                                )
                             })
                             .collect();
                         Some(format!(" [{}]", fields.join(" ")))
@@ -530,6 +695,37 @@ mod tests {
         HttpActivityEvent, NetworkActivityEvent, ProcessActivityEvent, SshActivityEvent,
     };
     use crate::objects::*;
+
+    #[test]
+    fn severity_survives_a_round_trip_through_the_shorthand_tag() {
+        // Pins the parser to the formatter: renaming a tag in `severity_tag`
+        // without teaching `severity_id_from_shorthand` about it fails here
+        // rather than silently flattening severity at the export boundary.
+        for id in 1..=6u8 {
+            let line = format!("NET:OPEN {} DENIED curl(1) -> host:443", severity_tag(id));
+            assert_eq!(
+                severity_id_from_shorthand(&line),
+                Some(id),
+                "id {id} did not survive the round trip"
+            );
+        }
+        // Unknown renders as `[INFO]`, so it comes back as Informational.
+        let unknown = format!("NET:OPEN {} ALLOWED", severity_tag(0));
+        assert_eq!(severity_id_from_shorthand(&unknown), Some(1));
+    }
+
+    #[test]
+    fn severity_parsing_prefers_the_tag_over_a_later_lookalike() {
+        // The reason text carries an operator-supplied string; a bracketed
+        // lookalike in it must not outrank the real tag.
+        let line = "NET:OPEN [MED] DENIED curl(1) -> host:443 [reason:downgraded from [HIGH]]";
+        assert_eq!(severity_id_from_shorthand(line), Some(3));
+    }
+
+    #[test]
+    fn severity_parsing_reports_no_tag() {
+        assert_eq!(severity_id_from_shorthand("plain log line, no tag"), None);
+    }
 
     fn test_metadata() -> Metadata {
         Metadata {
@@ -597,9 +793,7 @@ mod tests {
             src_endpoint: None,
             dst_endpoint: Some(Endpoint::from_domain("api.example.com", 443)),
             proxy_endpoint: None,
-            actor: Some(Actor {
-                process: Process::new("python3", 42),
-            }),
+            actor: Some(Actor::from_process(Process::new("python3", 42))),
             firewall_rule: Some(FirewallRule::new("default-egress", "mechanistic")),
             connection_info: None,
             action: Some(ActionId::Allowed),
@@ -626,9 +820,7 @@ mod tests {
             src_endpoint: None,
             dst_endpoint: Some(Endpoint::from_ip_str("93.184.216.34", 443)),
             proxy_endpoint: None,
-            actor: Some(Actor {
-                process: Process::new("node", 1234),
-            }),
+            actor: Some(Actor::from_process(Process::new("node", 1234))),
             firewall_rule: Some(FirewallRule::new("bypass-detect", "nftables")),
             connection_info: Some(ConnectionInfo::new("tcp")),
             action: Some(ActionId::Denied),
@@ -656,9 +848,7 @@ mod tests {
             src_endpoint: None,
             dst_endpoint: None,
             proxy_endpoint: None,
-            actor: Some(Actor {
-                process: Process::new("curl", 88),
-            }),
+            actor: Some(Actor::from_process(Process::new("curl", 88))),
             firewall_rule: Some(FirewallRule::new("default-egress", "mechanistic")),
             action: Some(ActionId::Allowed),
             disposition: None,
@@ -773,9 +963,7 @@ mod tests {
             src_endpoint: None,
             dst_endpoint: Some(Endpoint::from_domain("169.254.169.254", 80)),
             proxy_endpoint: None,
-            actor: Some(Actor {
-                process: Process::new("curl", 1618),
-            }),
+            actor: Some(Actor::from_process(Process::new("curl", 1618))),
             firewall_rule: Some(FirewallRule::new("-", "ssrf")),
             connection_info: None,
             action: Some(ActionId::Denied),
@@ -802,9 +990,7 @@ mod tests {
             src_endpoint: None,
             dst_endpoint: Some(Endpoint::from_domain("api.example.com", 443)),
             proxy_endpoint: None,
-            actor: Some(Actor {
-                process: Process::new("python3", 42),
-            }),
+            actor: Some(Actor::from_process(Process::new("python3", 42))),
             firewall_rule: Some(FirewallRule::new("default-egress", "mechanistic")),
             connection_info: None,
             action: Some(ActionId::Allowed),
@@ -863,9 +1049,7 @@ mod tests {
             src_endpoint: None,
             dst_endpoint: None,
             proxy_endpoint: None,
-            actor: Some(Actor {
-                process: Process::new("curl", 1618),
-            }),
+            actor: Some(Actor::from_process(Process::new("curl", 1618))),
             firewall_rule: Some(FirewallRule::new("aws_iam", "ssrf")),
             action: Some(ActionId::Denied),
             disposition: Some(DispositionId::Blocked),
@@ -986,9 +1170,7 @@ mod tests {
             src_endpoint: None,
             dst_endpoint: None,
             proxy_endpoint: None,
-            actor: Some(Actor {
-                process: Process::new("curl", 68),
-            }),
+            actor: Some(Actor::from_process(Process::new("curl", 68))),
             firewall_rule: Some(FirewallRule::new("allow_host_9876", "mechanistic")),
             action: Some(ActionId::Allowed),
             disposition: None,
@@ -1040,6 +1222,34 @@ mod tests {
         assert_eq!(
             shorthand,
             "PROC:LAUNCH [INFO] python3(42) [cmd:python3 /app/main.py]"
+        );
+    }
+
+    #[test]
+    fn process_names_and_cmd_lines_cannot_forge_shorthand_lines() {
+        // A sandboxed workload chooses its own argv and comm — the exact
+        // party this log stream surveils must not be able to forge lines,
+        // lookalike tags, or terminal escapes.
+        let event = OcsfEvent::ProcessActivity(ProcessActivityEvent {
+            base: base(1007, "Process Activity", 1, "System Activity", 1, "Launch"),
+            process: Process::new("sh\nNET:OPEN [INFO] ALLOWED forged", 7)
+                .with_cmd_line("run]\x1b[2J[sev:HIGH] --flag"),
+            actor: None,
+            launch_type: Some(LaunchTypeId::Spawn),
+            exit_code: None,
+            action: None,
+            disposition: None,
+        });
+
+        let shorthand = event.format_shorthand();
+        assert!(!shorthand.contains('\n'), "no forged lines: {shorthand}");
+        assert!(
+            !shorthand.contains('\x1b'),
+            "no terminal escapes: {shorthand}"
+        );
+        assert!(
+            shorthand.contains("run\\]"),
+            "cmd brackets are escaped: {shorthand}"
         );
     }
 
@@ -1192,6 +1402,7 @@ mod tests {
             state_custom_label: Some("LOADED".to_string()),
             security_level: None,
             prev_security_level: None,
+            actor: None,
         });
 
         let shorthand = event.format_shorthand();
@@ -1221,6 +1432,7 @@ mod tests {
             state_custom_label: Some("APPROVED".to_string()),
             security_level: None,
             prev_security_level: None,
+            actor: None,
         });
 
         let shorthand = event.format_shorthand();
@@ -1230,6 +1442,41 @@ mod tests {
              [auto:true source:agent_authored prover_delta:empty resolved_from:sandbox \
              version:v4 hash:sha256:cafe]"
         );
+    }
+
+    /// Request payloads and token claims flow into entity names, actor
+    /// names, and audit messages. None of them may forge extra lines (or
+    /// close the quoted entity field) in the text visibility plane.
+    #[test]
+    fn request_sourced_fields_cannot_forge_shorthand_lines() {
+        use crate::events::EntityManagementEvent;
+
+        let entity_event = OcsfEvent::EntityManagement(EntityManagementEvent {
+            base: base(3004, "Entity Management", 3, "IAM", 1, "Create"),
+            entity: ManagedEntity::new(
+                "workspace_member",
+                "bob\"\nAUTHN:LOGON [INFO] OK user:forged",
+            ),
+            actor: Some(Actor::from_user(User::named("eve\nNET:OPEN [INFO] fake"))),
+        });
+        let line = entity_event.format_shorthand();
+        assert!(!line.contains('\n'), "forged newline survived: {line}");
+
+        let mut config_base = base(5019, "Device Config State Change", 5, "Discovery", 1, "Log");
+        config_base.set_message(
+            "gateway rejected draft chunk c1: evil\nCONFIG:APPROVED [INFO] forged /bin/sh",
+        );
+        config_base.add_unmapped("source", serde_json::json!("agent\nauthored"));
+        let config_event = OcsfEvent::DeviceConfigStateChange(DeviceConfigStateChangeEvent {
+            base: config_base,
+            state: Some(StateId::Other),
+            state_custom_label: Some("REJECTED".to_string()),
+            security_level: None,
+            prev_security_level: None,
+            actor: None,
+        });
+        let line = config_event.format_shorthand();
+        assert!(!line.contains('\n'), "forged newline survived: {line}");
     }
 
     #[test]

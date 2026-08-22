@@ -149,6 +149,58 @@ tests:
           path: data["gateway.toml"]
           pattern: 'supervisor_image\s*='
 
+  - it: omits the OTLP table when no endpoint is set
+    template: templates/gateway-config.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '\[openshell\.gateway\.otlp\]'
+
+  - it: renders the OTLP table with log export when configured
+    template: templates/gateway-config.yaml
+    set:
+      server.otlp.endpoint: http://otel-collector.observability.svc:4317
+      server.otlp.exportLogs: true
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\.otlp\].*?endpoint\s*=\s*"http://otel-collector\.observability\.svc:4317"'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\.otlp\].*?export_logs\s*=\s*true'
+
+  - it: omits the audit table when all toggles keep their defaults
+    template: templates/gateway-config.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '\[openshell\.gateway\.audit\]'
+
+  - it: renders enabled = false when audit events are turned off
+    template: templates/gateway-config.yaml
+    set:
+      server.audit.enabled: false
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\.audit\].*?enabled\s*=\s*false'
+
+  - it: renders the audit table with only the non-default toggles
+    template: templates/gateway-config.yaml
+    set:
+      server.audit.authSuccessEvents: true
+      server.audit.settingsValues: false
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\.audit\].*?auth_success_events\s*=\s*true'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\.audit\].*?settings_values\s*=\s*false'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'exec_args\s*='
+
   - it: renders a supervisor tag override with the official repository
     template: templates/gateway-config.yaml
     set:

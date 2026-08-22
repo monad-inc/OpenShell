@@ -411,6 +411,42 @@ server:
     # issuer uses a non-public CA (e.g. OpenShift ingress, private PKI).
     caConfigMapName: ""
 
+  # OpenTelemetry export over OTLP/gRPC. Renders the [openshell.gateway.otlp]
+  # table only when endpoint is set.
+  otlp:
+    # -- OTLP/gRPC collector endpoint (e.g.
+    # http://otel-collector.observability.svc:4317). Empty disables all
+    # OpenTelemetry export.
+    endpoint: ""
+    # -- `service.name` resource attribute. Empty defaults to "openshell-gateway".
+    serviceName: ""
+    # -- Also export the gateway's aggregated logs and OCSF security events as
+    # OTLP log records, in addition to traces. Requires endpoint.
+    exportLogs: false
+    # -- Carry structured OCSF fields on exported log records rather than only
+    # the human-readable summary. No effect unless exportLogs is true.
+    ocsfFullPayload: false
+
+  # Gateway audit event toggles. Renders the [openshell.gateway.audit]
+  # table only when a value differs from the gateway's built-in default.
+  audit:
+    # -- Emit gateway audit events (OCSF records for state-changing RPCs,
+    # carrying the authenticated principal). On by default; set false for
+    # deployments that do not want a governance paper trail.
+    enabled: true
+    # -- Also emit an Authentication event for every successfully
+    # authenticated request, producing a complete authentication ledger.
+    # Failures are always emitted; successes multiply volume by request rate.
+    authSuccessEvents: false
+    # -- Record the full command line in sandbox exec audit events. Set false
+    # for deployments whose command lines may carry secrets; records then
+    # carry only the binary name.
+    execArgs: true
+    # -- Record before/after values of changed settings in settings audit
+    # events. Set false to record key names only. Keys matching credential
+    # patterns are always redacted regardless of this toggle.
+    settingsValues: true
+
 # NetworkPolicy restricting SSH ingress on sandbox pods to the gateway only.
 networkPolicy:
   # -- Restrict SSH ingress on sandbox pods to the gateway. In managed mode,

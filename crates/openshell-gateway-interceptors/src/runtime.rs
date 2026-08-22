@@ -42,6 +42,10 @@ pub struct EvaluationContext {
 #[derive(Debug, Clone)]
 pub struct InterceptedRequest {
     pub body: Vec<u8>,
+    /// Names of interceptors whose `modify_operation` patches actually
+    /// changed the request, in application order. Lets the gateway mark
+    /// interceptor-modified mutations in its audit trail.
+    pub modified_by: Vec<String>,
     selector: RpcSelector,
 }
 
@@ -133,7 +137,8 @@ impl GatewayInterceptorRuntime {
         let mut operation = ValidatedOperation::new(&self.codec, &input_type, operation)
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
 
-        operation = self
+        let modified_by;
+        (operation, modified_by) = self
             .evaluate_phase(
                 &selector,
                 Phase::ModifyOperation,
@@ -142,7 +147,7 @@ impl GatewayInterceptorRuntime {
                 context,
             )
             .await?;
-        operation = self
+        (operation, _) = self
             .evaluate_phase(&selector, Phase::Validate, &input_type, operation, context)
             .await?;
 
@@ -166,7 +171,11 @@ impl GatewayInterceptorRuntime {
         .encode()
         .map_err(|err| Status::invalid_argument(err.to_string()))?;
 
-        Ok(InterceptedRequest { body, selector })
+        Ok(InterceptedRequest {
+            body,
+            modified_by,
+            selector,
+        })
     }
 
     pub async fn evaluate_post_commit(
@@ -211,12 +220,13 @@ impl GatewayInterceptorRuntime {
         operation_type: &str,
         operation: ValidatedOperation,
         context: &EvaluationContext,
-    ) -> std::result::Result<ValidatedOperation, Status> {
+    ) -> std::result::Result<(ValidatedOperation, Vec<String>), Status> {
         let Some(plans) = self.plan.bindings(selector, phase) else {
-            return Ok(operation);
+            return Ok((operation, Vec::new()));
         };
 
         let mut operation = operation;
+        let mut modified_by = Vec::new();
         for plan in plans {
             let interceptor_view = self
                 .codec
@@ -230,23 +240,29 @@ impl GatewayInterceptorRuntime {
                     continue;
                 }
             };
-            operation =
+            let changed;
+            (operation, changed) =
                 apply_evaluation_result(&self.codec, operation_type, plan, &result, operation)?;
+            if changed {
+                modified_by.push(plan.interceptor_name.clone());
+            }
         }
-        Ok(operation)
+        Ok((operation, modified_by))
     }
 }
 
+/// Returns the (possibly patched) operation and whether this plan's patches
+/// actually changed its encoded form.
 fn apply_evaluation_result(
     codec: &ProtoJsonCodec,
     operation_type: &str,
     plan: &BindingPlan,
     result: &InterceptorResult,
     operation: ValidatedOperation,
-) -> std::result::Result<ValidatedOperation, Status> {
+) -> std::result::Result<(ValidatedOperation, bool), Status> {
     if let Err(err) = validate_result_contract(plan, result) {
         apply_failure_policy(plan, &err)?;
-        return Ok(operation);
+        return Ok((operation, false));
     }
 
     if !result.allowed {
@@ -264,23 +280,24 @@ fn apply_evaluation_result(
         let patch_count = result.patches.len();
         if let Err(err) = validate_patch_visibility(codec, operation_type, &result.patches) {
             apply_failure_policy(plan, &err)?;
-            return Ok(operation);
+            return Ok((operation, false));
         }
         match operation.apply_patches(codec, operation_type, &result.patches) {
             Ok(candidate) => {
                 emit_evaluation_metrics(plan, "allow", patch_count);
                 emit_evaluation_log(plan, result, "allow", patch_count);
-                Ok(candidate)
+                let changed = candidate.encoded != operation.encoded;
+                Ok((candidate, changed))
             }
             Err(err) => {
                 apply_failure_policy(plan, &err)?;
-                Ok(operation)
+                Ok((operation, false))
             }
         }
     } else {
         emit_evaluation_metrics(plan, "allow", 0);
         emit_evaluation_log(plan, result, "allow", 0);
-        Ok(operation)
+        Ok((operation, false))
     }
 }
 
@@ -805,7 +822,7 @@ mod tests {
             Value::Null,
         )]);
 
-        let outcome = apply_evaluation_result(
+        let (outcome, changed) = apply_evaluation_result(
             &codec,
             "openshell.v1.CreateProviderRequest",
             &test_modify_plan(FailurePolicy::FailOpen),
@@ -815,6 +832,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(outcome, prior);
+        assert!(!changed);
     }
 
     #[tokio::test]
@@ -850,7 +868,7 @@ mod tests {
             json!("new"),
         )]);
 
-        let outcome = apply_evaluation_result(
+        let (outcome, changed) = apply_evaluation_result(
             &codec,
             "openshell.v1.CreateProviderRequest",
             &test_modify_plan(FailurePolicy::FailClosed),
@@ -858,6 +876,7 @@ mod tests {
             operation,
         )
         .unwrap();
+        assert!(changed);
         let decoded = CreateProviderRequest::decode(outcome.encoded.as_slice()).unwrap();
         let provider = decoded.provider.unwrap();
 
@@ -1195,7 +1214,7 @@ mod tests {
         )]);
         let recorder = TestRecorder::default();
 
-        let outcome = metrics::with_local_recorder(&recorder, || {
+        let (outcome, changed) = metrics::with_local_recorder(&recorder, || {
             apply_evaluation_result(
                 &codec,
                 "openshell.v1.UpdateConfigRequest",
@@ -1207,6 +1226,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(outcome, prior);
+        assert!(!changed);
         assert_eq!(TestRecorder::count(&recorder.fail_open), 1);
         assert_eq!(TestRecorder::count(&recorder.fail_closed), 0);
         assert_eq!(TestRecorder::count(&recorder.evaluations), 0);
@@ -1268,7 +1288,7 @@ mod tests {
             patch("replace", "/expectedResourceVersion", json!("not-a-number")),
         ]);
 
-        let outcome = apply_evaluation_result(
+        let (outcome, changed) = apply_evaluation_result(
             &codec,
             "openshell.v1.UpdateConfigRequest",
             &test_modify_plan(FailurePolicy::FailOpen),
@@ -1278,6 +1298,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(outcome, prior);
+        assert!(!changed);
         assert_eq!(outcome.json["name"], "demo");
     }
 
@@ -1302,7 +1323,7 @@ mod tests {
             patch("replace", "/name", json!("accepted-candidate")),
         ]);
 
-        let operation = apply_evaluation_result(
+        let (operation, _) = apply_evaluation_result(
             &codec,
             "openshell.v1.UpdateConfigRequest",
             &plan,
@@ -1310,7 +1331,7 @@ mod tests {
             operation,
         )
         .unwrap();
-        let operation = apply_evaluation_result(
+        let (operation, _) = apply_evaluation_result(
             &codec,
             "openshell.v1.UpdateConfigRequest",
             &plan,
@@ -1338,7 +1359,7 @@ mod tests {
         .unwrap();
         let result = allowed_result(vec![patch("add", "/removeRule", json!({}))]);
 
-        let fail_open = apply_evaluation_result(
+        let (fail_open, _) = apply_evaluation_result(
             &codec,
             "openshell.v1.PolicyMergeOperation",
             &test_modify_plan(FailurePolicy::FailOpen),
@@ -1374,7 +1395,7 @@ mod tests {
         let result = allowed_result(vec![patch("replace", "/name", json!("accepted"))]);
         let recorder = TestRecorder::default();
 
-        let operation = metrics::with_local_recorder(&recorder, || {
+        let (operation, changed) = metrics::with_local_recorder(&recorder, || {
             apply_evaluation_result(
                 &codec,
                 "openshell.v1.UpdateConfigRequest",
@@ -1384,6 +1405,7 @@ mod tests {
             )
         })
         .unwrap();
+        assert!(changed);
 
         let decoded = UpdateConfigRequest::decode(operation.encoded.as_slice()).unwrap();
         assert_eq!(decoded.name, "accepted");

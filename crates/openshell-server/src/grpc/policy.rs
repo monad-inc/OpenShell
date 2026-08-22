@@ -50,14 +50,11 @@ use openshell_core::telemetry::{
     LifecycleOperation, LifecycleResource, PolicyDecisionOperation, TelemetryOutcome,
 };
 use openshell_core::{
-    VERSION,
     endpoint_path::EndpointPathPattern,
     host_pattern::{host_matches, host_patterns_overlap},
     settings::{self, SettingValueKind},
 };
-use openshell_ocsf::{
-    ConfigStateChangeBuilder, OCSF_TARGET, OcsfEvent, SandboxContext, SeverityId, StateId, StatusId,
-};
+use openshell_ocsf::{ConfigStateChangeBuilder, OcsfEvent, SeverityId, StateId, StatusId};
 use openshell_policy::{
     PolicyMergeOp, ProviderPolicyLayer, canonicalize_advisor_add_rule, compose_effective_policy,
     merge_policy, policy_covers_rule, serialize_sandbox_policy, strip_provider_rule_names,
@@ -75,7 +72,7 @@ use openshell_providers::normalize_provider_type;
 use prost::Message;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::IpAddr;
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 use tracing::{debug, info, warn};
@@ -155,102 +152,230 @@ fn emit_policy_decision_failure(operation: PolicyDecisionOperation, rule_count: 
     );
 }
 
-fn emit_gateway_policy_audit_log(
-    sandbox_id: &str,
-    sandbox_name: &str,
-    state_label: &str,
-    detail: impl Into<String>,
-    version: i64,
-    policy_hash: &str,
-) {
-    let message = build_gateway_policy_audit_message(
-        sandbox_id,
-        sandbox_name,
-        state_label,
-        detail,
-        version,
-        policy_hash,
-        &[],
-    );
-    info!(
-        target: OCSF_TARGET,
-        sandbox_id = %sandbox_id,
-        message = %message
-    );
+/// One `update_config` settings mutation, captured for its audit event.
+struct SettingsAuditEvent<'a> {
+    /// `Some((sandbox_id, sandbox_name))` routes the event into that
+    /// sandbox's stream; `None` rides the gateway lane.
+    sandbox: Option<(&'a str, &'a str)>,
+    /// Request-named sandbox, for failure context when resolution never
+    /// happened. Redundant with `sandbox` on success paths.
+    sandbox_name: Option<&'a str>,
+    workspace: Option<&'a str>,
+    key: &'a str,
+    deleted: bool,
+    changed: bool,
+    success: bool,
+    before: Option<&'a StoredSettingValue>,
+    after: Option<&'a StoredSettingValue>,
 }
 
-/// Emit a `CONFIG:APPROVED` audit event for an auto-approval — same event
-/// class as a human approval, with extra unmapped fields carrying the
-/// safety reasoning so the audit is reconstructable. `source` records the
-/// proposer (`mechanistic` or `agent_authored`) for provenance.
-/// `resolved_from` records the scope that supplied the `auto` mode setting
-/// (`gateway`, `sandbox`, or `default`) so operators can see why a given
-/// approval was auto vs manual.
-fn emit_gateway_policy_auto_approve_audit_log(
-    sandbox_id: &str,
-    sandbox_name: &str,
-    detail: impl Into<String>,
-    version: i64,
-    policy_hash: &str,
-    source: &str,
-    resolved_from: &str,
-) {
-    let extra = [
-        ("auto", "true".to_string()),
-        ("source", source.to_string()),
-        ("prover_delta", "empty".to_string()),
-        ("resolved_from", resolved_from.to_string()),
-    ];
-    let message = build_gateway_policy_audit_message(
-        sandbox_id,
-        sandbox_name,
-        "approved",
-        detail,
-        version,
-        policy_hash,
-        &extra,
-    );
-    info!(
-        target: OCSF_TARGET,
-        sandbox_id = %sandbox_id,
-        message = %message
-    );
+/// A stored setting value as it appears in audit events. Bytes summarize to
+/// a length marker: the only Bytes setting is the policy payload, which has
+/// its own audit trail and would bloat every record here.
+fn stored_setting_audit_value(value: &StoredSettingValue) -> serde_json::Value {
+    match value {
+        StoredSettingValue::String(v) => serde_json::Value::from(v.clone()),
+        StoredSettingValue::Bool(v) => serde_json::Value::from(*v),
+        StoredSettingValue::Int(v) => serde_json::Value::from(*v),
+        StoredSettingValue::Bytes(hex) => {
+            serde_json::Value::from(format!("<{} bytes>", hex.len() / 2))
+        }
+    }
 }
 
-fn build_gateway_policy_audit_message(
-    sandbox_id: &str,
-    sandbox_name: &str,
-    state_label: &str,
-    detail: impl Into<String>,
+/// Build the Device Config State Change \[5019\] audit event for an
+/// `update_config` settings mutation.
+///
+/// Before/after values ride along when `settings_values` allows (the
+/// `[openshell.gateway.audit]` toggle, default on), and keys matching
+/// credential patterns are always redacted regardless of the toggle.
+fn build_update_config_settings_audit_event(
+    settings_values: bool,
+    principal: &Principal,
+    request_id: Option<&str>,
+    event: &SettingsAuditEvent<'_>,
+) -> OcsfEvent {
+    let scope = if event.workspace.is_some() {
+        "sandbox"
+    } else {
+        "global"
+    };
+    let action = if event.deleted { "delete" } else { "update" };
+    let key = event.key;
+    let message = if event.success {
+        format!("{scope} setting {key} {action}d")
+    } else {
+        format!("{scope} setting {key} {action} failed")
+    };
+
+    let sandbox_ctx;
+    let ctx = match event.sandbox {
+        Some((id, name)) => {
+            sandbox_ctx = crate::audit::ctx_for_sandbox(id, name);
+            &sandbox_ctx
+        }
+        None => crate::audit::ctx(),
+    };
+    let mut builder = ConfigStateChangeBuilder::new(ctx)
+        .state(
+            if event.deleted {
+                StateId::Disabled
+            } else {
+                StateId::Enabled
+            },
+            if event.deleted {
+                "setting_deleted"
+            } else {
+                "setting_updated"
+            },
+        )
+        // Failed mutations at Low so Warn+ alerting can see them.
+        .severity(if event.success {
+            SeverityId::Informational
+        } else {
+            SeverityId::Low
+        })
+        .status(if event.success {
+            StatusId::Success
+        } else {
+            StatusId::Failure
+        })
+        .actor_user(crate::audit::actor_user(principal))
+        .message(message)
+        .unmapped("scope", scope)
+        .unmapped("setting_key", key)
+        .unmapped("changed", event.changed);
+    if let Some(workspace) = event.workspace {
+        builder = builder.unmapped("workspace", workspace);
+    }
+    if let Some(name) = event.sandbox.map(|(_, name)| name).or(event.sandbox_name) {
+        builder = builder.unmapped("sandbox", name);
+    }
+    if settings_values {
+        let redacted = crate::audit::is_credential_like_key(key);
+        let render = |value: &StoredSettingValue| {
+            if redacted {
+                serde_json::Value::from("[REDACTED]")
+            } else {
+                stored_setting_audit_value(value)
+            }
+        };
+        if let Some(before) = event.before {
+            builder = builder.unmapped("before", render(before));
+        }
+        if let Some(after) = event.after {
+            builder = builder.unmapped("after", render(after));
+        }
+    }
+    if let Some(request_id) = request_id {
+        builder = builder.unmapped("request_id", request_id);
+    }
+
+    builder.build()
+}
+
+/// Emit the settings-mutation audit event once the outcome is known:
+/// sandbox-scoped mutations land in that sandbox's stream, global ones ride
+/// the gateway lane. No-op when the master audit toggle
+/// (`[openshell.gateway.audit] enabled`, `OPENSHELL_AUDIT_EVENTS`) is off.
+fn emit_update_config_settings_audit(
+    state: &ServerState,
+    principal: &Principal,
+    request_id: Option<&str>,
+    event: &SettingsAuditEvent<'_>,
+) {
+    if !state.config.audit.enabled {
+        return;
+    }
+    let built = build_update_config_settings_audit_event(
+        state.config.audit.settings_values,
+        principal,
+        request_id,
+        event,
+    );
+    match event.sandbox {
+        Some((id, _)) => crate::audit::emit_for_sandbox(id, built),
+        None => crate::audit::emit(built),
+    }
+}
+
+/// Facts for one gateway policy/draft audit event (Device Config State
+/// Change \[5019\]).
+struct PolicyAuditEvent<'a> {
+    /// Resolved sandbox (id, name); routes the event into that sandbox's
+    /// stream. `None` when the mutation failed before the sandbox resolved —
+    /// the event rides the gateway lane, naming the sandbox in `extra`.
+    sandbox: Option<(&'a str, &'a str)>,
+    state_label: &'a str,
+    detail: String,
     version: i64,
-    policy_hash: &str,
-    extra_fields: &[(&str, String)],
-) -> String {
-    let ctx = SandboxContext {
-        sandbox_id: sandbox_id.to_string(),
-        sandbox_name: sandbox_name.to_string(),
-        container_image: "openshell/gateway".to_string(),
-        hostname: "openshell-gateway".to_string(),
-        product_version: VERSION.to_string(),
-        proxy_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
-        proxy_port: 0,
+    policy_hash: &'a str,
+    success: bool,
+    extra: Vec<(&'static str, serde_json::Value)>,
+}
+
+/// Build the policy audit event: `CONFIG:<STATE>` shorthand with the stable
+/// `version`/`hash` suffix, the full document in `ocsf.raw`, and the acting
+/// principal when one is in play (auto-approvals pass the submitting
+/// sandbox's principal).
+fn build_gateway_policy_audit_event(
+    principal: Option<&Principal>,
+    request_id: Option<&str>,
+    event: &PolicyAuditEvent<'_>,
+) -> OcsfEvent {
+    let ctx = match event.sandbox {
+        Some((id, name)) => crate::audit::ctx_for_sandbox(id, name),
+        None => crate::audit::ctx().clone(),
     };
     let mut builder = ConfigStateChangeBuilder::new(&ctx)
-        .state(StateId::Other, state_label)
-        .severity(SeverityId::Informational)
-        .status(StatusId::Success)
-        .message(detail.into());
-    if version > 0 {
-        builder = builder.unmapped("policy_version", format!("v{version}"));
+        .state(StateId::Other, event.state_label)
+        // Failed mutations at Low so Warn+ alerting can see them.
+        .severity(if event.success {
+            SeverityId::Informational
+        } else {
+            SeverityId::Low
+        })
+        .status(if event.success {
+            StatusId::Success
+        } else {
+            StatusId::Failure
+        })
+        .message(event.detail.clone());
+    if let Some(principal) = principal {
+        builder = builder.actor_user(crate::audit::actor_user(principal));
     }
-    if !policy_hash.is_empty() {
-        builder = builder.unmapped("policy_hash", policy_hash.to_string());
+    if event.version > 0 {
+        builder = builder.unmapped("policy_version", format!("v{}", event.version));
     }
-    for (key, value) in extra_fields {
+    if !event.policy_hash.is_empty() {
+        builder = builder.unmapped("policy_hash", event.policy_hash.to_string());
+    }
+    for (key, value) in &event.extra {
         builder = builder.unmapped(key, value.clone());
     }
-    let event: OcsfEvent = builder.build();
-    event.format_shorthand()
+    if let Some(request_id) = request_id {
+        builder = builder.unmapped("request_id", request_id);
+    }
+    builder.build()
+}
+
+/// Emit a policy/draft audit event once the outcome is known. No-op when
+/// the master audit toggle (`[openshell.gateway.audit] enabled`,
+/// `OPENSHELL_AUDIT_EVENTS`) is off.
+fn emit_gateway_policy_audit(
+    state: &ServerState,
+    principal: Option<&Principal>,
+    request_id: Option<&str>,
+    event: &PolicyAuditEvent<'_>,
+) {
+    if !state.config.audit.enabled {
+        return;
+    }
+    let built = build_gateway_policy_audit_event(principal, request_id, event);
+    match event.sandbox {
+        Some((id, _)) => crate::audit::emit_for_sandbox(id, built),
+        None => crate::audit::emit(built),
+    }
 }
 
 fn summarize_cli_policy_merge_op(operation: &PolicyMergeOp) -> String {
@@ -1428,6 +1553,9 @@ struct AutoApproveChunkContext<'a> {
     workspace: &'a str,
     source: &'a str,
     resolved_from: &'a str,
+    /// The principal whose submission triggered the auto-approval — the
+    /// audit event's actor.
+    principal: &'a Principal,
 }
 
 async fn auto_approve_chunk(
@@ -1509,6 +1637,14 @@ async fn auto_approve_chunk(
         provider_names,
     )
     .await?;
+    // Summarize before the merge so a decode failure cannot land between
+    // the policy commit and its audit event.
+    let chunk_summary = summarize_draft_chunk_rule(&chunk)?;
+    let source_label = if context.source.is_empty() {
+        "unspecified"
+    } else {
+        context.source
+    };
     let credential_binding_context = merge_validation.credential_binding_context();
     let merge_result = merge_chunk_into_policy_with_validation(
         state.store.as_ref(),
@@ -1528,7 +1664,36 @@ async fn auto_approve_chunk(
             return Err(status);
         }
     };
-    let chunk_summary = summarize_draft_chunk_rule(&chunk)?;
+    // Emit at the policy commit, before the fallible chunk-status update —
+    // if that update fails the chunk stays pending, but the policy revision
+    // is durably in effect and must already be on the audit trail.
+    // Same event class as a human approval; the extra fields carry the
+    // safety reasoning so the audit is reconstructable, and the actor is
+    // the principal whose submission triggered the approval.
+    emit_gateway_policy_audit(
+        state,
+        Some(context.principal),
+        None,
+        &PolicyAuditEvent {
+            sandbox: Some((sandbox_id, sandbox_name)),
+            state_label: "approved",
+            detail: format!(
+                "auto-approved: no new prover findings (source={source_label}) — chunk {chunk_id}: {chunk_summary}"
+            ),
+            version,
+            policy_hash: &hash,
+            success: true,
+            extra: vec![
+                ("auto", serde_json::Value::from("true")),
+                ("source", serde_json::Value::from(source_label)),
+                ("prover_delta", serde_json::Value::from("empty")),
+                (
+                    "resolved_from",
+                    serde_json::Value::from(context.resolved_from),
+                ),
+            ],
+        },
+    );
 
     let now_ms = current_time_ms();
     clear_pending_application_error(state, chunk_id).await;
@@ -1549,23 +1714,6 @@ async fn auto_approve_chunk(
             "failed to reconcile pending policy proposals after auto-approval"
         );
     }
-
-    let source_label = if context.source.is_empty() {
-        "unspecified"
-    } else {
-        context.source
-    };
-    emit_gateway_policy_auto_approve_audit_log(
-        sandbox_id,
-        sandbox_name,
-        format!(
-            "auto-approved: no new prover findings (source={source_label}) — chunk {chunk_id}: {chunk_summary}"
-        ),
-        version,
-        &hash,
-        source_label,
-        context.resolved_from,
-    );
 
     info!(
         sandbox_id = %sandbox_id,
@@ -2272,6 +2420,7 @@ async fn persist_existing_policy_projection(
 
 async fn resolve_sandbox_by_name_for_principal(
     store: &Store,
+    audit: &openshell_core::GatewayAuditConfig,
     workspace: &str,
     principal: &Principal,
     name: &str,
@@ -2288,15 +2437,14 @@ async fn resolve_sandbox_by_name_for_principal(
                     "sandbox not found or not owned by caller",
                 ));
             };
-            crate::auth::guard::ensure_sandbox_scope(principal, sandbox.object_id()).map_err(
-                |status| {
+            crate::auth::guard::ensure_sandbox_scope(principal, sandbox.object_id(), audit)
+                .map_err(|status| {
                     if status.code() == tonic::Code::PermissionDenied {
                         Status::permission_denied("sandbox not found or not owned by caller")
                     } else {
                         status
                     }
-                },
-            )?;
+                })?;
             Ok(sandbox)
         }
         Principal::User(_) => sandbox.ok_or_else(|| Status::not_found("sandbox not found")),
@@ -2316,7 +2464,7 @@ pub(super) async fn handle_get_sandbox_config(
 ) -> Result<Response<GetSandboxConfigResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let sandbox_id = request.get_ref().sandbox_id.clone();
-    crate::auth::guard::enforce_sandbox_scope(&request, &sandbox_id)?;
+    crate::auth::guard::enforce_sandbox_scope(&request, &sandbox_id, &state.config.audit)?;
     drop(request);
 
     let sandbox =
@@ -3033,7 +3181,7 @@ pub(super) async fn handle_get_sandbox_provider_environment(
 ) -> Result<Response<GetSandboxProviderEnvironmentResponse>, Status> {
     let sandbox_id = request.get_ref().sandbox_id.clone();
     let supports_static_credential_bindings = request.get_ref().supports_static_credential_bindings;
-    crate::auth::guard::enforce_sandbox_scope(&request, &sandbox_id)?;
+    crate::auth::guard::enforce_sandbox_scope(&request, &sandbox_id, &state.config.audit)?;
     drop(request);
 
     let sandbox = state
@@ -3135,12 +3283,48 @@ pub(super) async fn handle_update_config(
 ) -> Result<Response<UpdateConfigResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let sandbox_caller = matches!(&principal, Principal::Sandbox(_));
+    let request_id = crate::audit::request_id(&request);
     let update = request.get_ref();
     let should_emit_policy_failure = should_emit_config_update_policy_telemetry(sandbox_caller)
         && (update.policy.is_some() || !update.merge_operations.is_empty());
+    // Captured for the failure audit event; success paths emit inline where
+    // the before/after values are known.
+    let setting_audit = {
+        let key = update.setting_key.trim();
+        (!key.is_empty()).then(|| {
+            (
+                key.to_string(),
+                update.global,
+                update.delete_setting,
+                super::workspace::audit_workspace_name(&update.workspace).to_string(),
+                update.name.clone(),
+            )
+        })
+    };
     let result = handle_update_config_inner(state, request, &principal, sandbox_caller).await;
     if result.is_err() && should_emit_policy_failure {
         emit_sandbox_policy_update_failure();
+    }
+    if let Err(status) = &result
+        && let Some((key, global, deleted, workspace, name)) = &setting_audit
+        && crate::audit::audited_failure(status)
+    {
+        emit_update_config_settings_audit(
+            state,
+            &principal,
+            request_id.as_deref(),
+            &SettingsAuditEvent {
+                sandbox: None,
+                sandbox_name: (!global && !name.is_empty()).then_some(name.as_str()),
+                workspace: (!global).then_some(workspace.as_str()),
+                key,
+                deleted: *deleted,
+                changed: false,
+                success: false,
+                before: None,
+                after: None,
+            },
+        );
     }
     result
 }
@@ -3151,10 +3335,11 @@ async fn handle_update_config_inner(
     principal: &Principal,
     sandbox_caller: bool,
 ) -> Result<Response<UpdateConfigResponse>, Status> {
+    let request_id = crate::audit::request_id(&request);
     let req = request.into_inner();
     validate_annotations(&req.annotations, "annotations")?;
     let workspace = if req.global {
-        require_platform_admin(&state.admin_role, principal)?;
+        require_platform_admin(&state.admin_role, principal, &state.config.audit)?;
         String::new()
     } else {
         let min_role = if sandbox_caller {
@@ -3178,6 +3363,7 @@ async fn handle_update_config_inner(
         validate_sandbox_caller_update(&req)?;
         resolve_sandbox_by_name_for_principal(
             state.store.as_ref(),
+            &state.config.audit,
             &workspace,
             principal,
             &req.name,
@@ -3289,6 +3475,23 @@ async fn handle_update_config_inner(
                     Status::internal(format!("persist global policy revision failed: {e}"))
                 })?;
 
+            // Audit at the revision commit — a wholesale policy replacement
+            // must be at least as visible as an incremental merge.
+            emit_gateway_policy_audit(
+                state,
+                Some(principal),
+                request_id.as_deref(),
+                &PolicyAuditEvent {
+                    sandbox: None,
+                    state_label: "updated",
+                    detail: "global policy replaced".to_string(),
+                    version: next_version,
+                    policy_hash: &hash,
+                    success: true,
+                    extra: vec![("scope", serde_json::Value::from("global"))],
+                },
+            );
+
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_millis() as i64);
@@ -3341,6 +3544,8 @@ async fn handle_update_config_inner(
         let mut global_settings = load_global_settings(state.store.as_ref()).await?;
         let provider_composition_was_enabled =
             provider_policy_composition_enabled_in(&global_settings)?;
+        let audit_before = global_settings.settings.get(key).cloned();
+        let mut audit_after = None;
         let changed = if req.delete_setting {
             global_settings.settings.remove(key).is_some()
         } else {
@@ -3349,6 +3554,7 @@ async fn handle_update_config_inner(
                 .as_ref()
                 .ok_or_else(|| Status::invalid_argument("setting_value is required"))?;
             let stored = proto_setting_to_stored(key, setting)?;
+            audit_after = Some(stored.clone());
             upsert_setting_value(&mut global_settings.settings, key, stored)
         };
 
@@ -3375,6 +3581,23 @@ async fn handle_update_config_inner(
                     .await;
             }
         }
+
+        emit_update_config_settings_audit(
+            state,
+            principal,
+            request_id.as_deref(),
+            &SettingsAuditEvent {
+                sandbox: None,
+                sandbox_name: None,
+                workspace: None,
+                key,
+                deleted: req.delete_setting,
+                changed,
+                success: true,
+                before: audit_before.as_ref(),
+                after: audit_after.as_ref(),
+            },
+        );
 
         return Ok(update_config_response(
             0,
@@ -3423,7 +3646,8 @@ async fn handle_update_config_inner(
             let mut sandbox_settings =
                 load_sandbox_settings(state.store.as_ref(), &workspace, sandbox.object_name())
                     .await?;
-            let removed = sandbox_settings.settings.remove(key).is_some();
+            let removed_value = sandbox_settings.settings.remove(key);
+            let removed = removed_value.is_some();
             if removed {
                 sandbox_settings.revision = sandbox_settings.revision.wrapping_add(1);
                 save_sandbox_settings(
@@ -3434,6 +3658,26 @@ async fn handle_update_config_inner(
                 )
                 .await?;
             }
+
+            // Audit the moment the settings commit lands: if the annotation
+            // persist below fails, the deletion still happened and must be
+            // on record (the wrapper adds a Failure event for the RPC).
+            emit_update_config_settings_audit(
+                state,
+                principal,
+                request_id.as_deref(),
+                &SettingsAuditEvent {
+                    sandbox: Some((&sandbox_id, sandbox.object_name())),
+                    sandbox_name: None,
+                    workspace: Some(&workspace),
+                    key,
+                    deleted: true,
+                    changed: removed,
+                    success: true,
+                    before: removed_value.as_ref(),
+                    after: None,
+                },
+            );
 
             response_annotations = persist_update_config_annotations(
                 state,
@@ -3467,6 +3711,8 @@ async fn handle_update_config_inner(
 
         let mut sandbox_settings =
             load_sandbox_settings(state.store.as_ref(), &workspace, sandbox.object_name()).await?;
+        let audit_before = sandbox_settings.settings.get(key).cloned();
+        let audit_after = stored.clone();
         let changed = upsert_setting_value(&mut sandbox_settings.settings, key, stored);
         if changed {
             sandbox_settings.revision = sandbox_settings.revision.wrapping_add(1);
@@ -3478,6 +3724,26 @@ async fn handle_update_config_inner(
             )
             .await?;
         }
+
+        // Audit the moment the settings commit lands: if the annotation
+        // persist below fails, the update still happened and must be on
+        // record (the wrapper adds a Failure event for the RPC).
+        emit_update_config_settings_audit(
+            state,
+            principal,
+            request_id.as_deref(),
+            &SettingsAuditEvent {
+                sandbox: Some((&sandbox_id, sandbox.object_name())),
+                sandbox_name: None,
+                workspace: Some(&workspace),
+                key,
+                deleted: false,
+                changed,
+                success: true,
+                before: audit_before.as_ref(),
+                after: Some(&audit_after),
+            },
+        );
 
         response_annotations = persist_update_config_annotations(
             state,
@@ -3550,28 +3816,40 @@ async fn handle_update_config_inner(
         };
 
         state.sandbox_watch_bus.notify(&sandbox_id);
-        emit_gateway_policy_audit_log(
-            &sandbox_id,
-            sandbox.object_name(),
-            "merged",
-            format!(
-                "gateway merged {} incremental policy operation(s)",
-                merge_ops.len()
-            ),
-            version,
-            &hash,
-        );
-        for operation in &merge_ops {
-            emit_gateway_policy_audit_log(
-                &sandbox_id,
-                sandbox.object_name(),
-                "merged",
-                format!(
-                    "gateway merged incremental policy op: {}",
-                    summarize_cli_policy_merge_op(operation)
+        emit_gateway_policy_audit(
+            state,
+            Some(principal),
+            request_id.as_deref(),
+            &PolicyAuditEvent {
+                sandbox: Some((&sandbox_id, sandbox.object_name())),
+                state_label: "merged",
+                detail: format!(
+                    "gateway merged {} incremental policy operation(s)",
+                    merge_ops.len()
                 ),
                 version,
-                &hash,
+                policy_hash: &hash,
+                success: true,
+                extra: vec![("operation_count", serde_json::Value::from(merge_ops.len()))],
+            },
+        );
+        for operation in &merge_ops {
+            emit_gateway_policy_audit(
+                state,
+                Some(principal),
+                request_id.as_deref(),
+                &PolicyAuditEvent {
+                    sandbox: Some((&sandbox_id, sandbox.object_name())),
+                    state_label: "merged",
+                    detail: format!(
+                        "gateway merged incremental policy op: {}",
+                        summarize_cli_policy_merge_op(operation)
+                    ),
+                    version,
+                    policy_hash: &hash,
+                    success: true,
+                    extra: Vec::new(),
+                },
             );
         }
         info!(
@@ -3671,7 +3949,7 @@ async fn handle_update_config_inner(
 
     let payload = new_policy.encode_to_vec();
     let hash = deterministic_policy_hash(&new_policy);
-    let (_next_version, committed_annotations) = {
+    let (committed_version, committed_annotations) = {
         let mut committed = None;
         for attempt in 1..=MERGE_RETRY_LIMIT {
             let latest = state
@@ -3752,6 +4030,25 @@ async fn handle_update_config_inner(
         })?
     };
     response_annotations = committed_annotations;
+    // Audit at the revision commit — a full policy replacement must be at
+    // least as visible as the incremental merge path above.
+    emit_gateway_policy_audit(
+        state,
+        Some(principal),
+        request_id.as_deref(),
+        &PolicyAuditEvent {
+            sandbox: Some((&sandbox_id, sandbox.object_name())),
+            state_label: "updated",
+            detail: format!("sandbox policy replaced for {}", sandbox.object_name()),
+            version: committed_version,
+            policy_hash: &hash,
+            success: true,
+            extra: vec![(
+                "sandbox_sync",
+                serde_json::Value::from(sandbox_caller.to_string()),
+            )],
+        },
+    );
     state.sandbox_watch_bus.notify(&sandbox_id);
 
     if backfill_policy.is_some() {
@@ -3798,6 +4095,26 @@ async fn handle_update_config_inner(
         .await
         .map_err(|e| Status::internal(format!("persist policy revision failed: {e}")))?;
 
+    // Rarely-reached re-commit (a concurrent writer superseded the atomic
+    // write above); audit it like any other committed revision.
+    emit_gateway_policy_audit(
+        state,
+        Some(principal),
+        request_id.as_deref(),
+        &PolicyAuditEvent {
+            sandbox: Some((&sandbox_id, sandbox.object_name())),
+            state_label: "updated",
+            detail: format!("sandbox policy replaced for {}", sandbox.object_name()),
+            version: next_version,
+            policy_hash: &hash,
+            success: true,
+            extra: vec![(
+                "sandbox_sync",
+                serde_json::Value::from(sandbox_caller.to_string()),
+            )],
+        },
+    );
+
     let _ = state
         .store
         .supersede_older_policies(&sandbox_id, next_version)
@@ -3833,7 +4150,7 @@ pub(super) async fn handle_get_sandbox_policy_status(
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
     let workspace = if req.global {
-        require_platform_admin(&state.admin_role, &principal)?;
+        require_platform_admin(&state.admin_role, &principal, &state.config.audit)?;
         String::new()
     } else {
         let authz = authorize_workspace(
@@ -3901,7 +4218,7 @@ pub(super) async fn handle_list_sandbox_policies(
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
     let workspace = if req.global {
-        require_platform_admin(&state.admin_role, &principal)?;
+        require_platform_admin(&state.admin_role, &principal, &state.config.audit)?;
         String::new()
     } else {
         let authz = authorize_workspace(
@@ -3952,7 +4269,7 @@ pub(super) async fn handle_report_policy_status(
     request: Request<ReportPolicyStatusRequest>,
 ) -> Result<Response<ReportPolicyStatusResponse>, Status> {
     let sandbox_id = request.get_ref().sandbox_id.clone();
-    crate::auth::guard::enforce_sandbox_scope(&request, &sandbox_id)?;
+    crate::auth::guard::enforce_sandbox_scope(&request, &sandbox_id, &state.config.audit)?;
     let req = request.into_inner();
     if req.sandbox_id.is_empty() {
         return Err(Status::invalid_argument("sandbox_id is required"));
@@ -4102,15 +4419,35 @@ pub(super) async fn handle_push_sandbox_logs(
         )
         .await?;
 
-        for log in batch.logs.into_iter().take(100) {
+        // Ingest the whole batch — no silent truncation. The sandbox bounds
+        // each batch it sends (≤50 lines, ≤200 on reconnect flush), so this is
+        // memory-safe, and dropping security telemetry here would defeat the
+        // reliability guarantee the export pipeline exists to provide.
+        for log in batch.logs {
             let mut log = log;
             log.source = "sandbox".to_string();
             log.sandbox_id.clone_from(&batch.sandbox_id);
+            sanitize_pushed_log_fields(&mut log);
             state.tracing_log_bus.publish_external(log);
         }
     }
 
     Ok(Response::new(PushSandboxLogsResponse {}))
+}
+
+/// Strip pushed field keys that collide with the identity attributes the
+/// gateway stamps on every exported record (`sandbox.id`, `log.source`,
+/// `log.target`, `log.level`, `log.ocsf`). A pushed field with one of those
+/// keys would export as a duplicate attribute and let a compromised sandbox
+/// masquerade as another sandbox — or as the gateway — in downstream
+/// consumers that resolve duplicate keys last-wins.
+fn sanitize_pushed_log_fields(log: &mut SandboxLogLine) {
+    log.fields.retain(|key, _| {
+        !matches!(
+            key.as_str(),
+            "sandbox.id" | "log.source" | "log.target" | "log.level" | "log.ocsf"
+        )
+    });
 }
 
 async fn ensure_log_stream_sandbox_scope(
@@ -4121,6 +4458,18 @@ async fn ensure_log_stream_sandbox_scope(
 ) -> Result<(), Status> {
     if let Some(validated) = validated_sandbox_id.as_deref() {
         if sandbox_id != validated {
+            // The sneaky variant of a cross-sandbox attempt: authenticate a
+            // stream for one sandbox, then switch ids mid-stream. Escalate
+            // exactly like the up-front scope guard would have.
+            let principal_sandbox_id = match principal {
+                Principal::Sandbox(sandbox) => sandbox.sandbox_id.as_str(),
+                _ => validated,
+            };
+            crate::audit::emit_cross_sandbox_finding(
+                &state.config.audit,
+                principal_sandbox_id,
+                sandbox_id,
+            );
             return Err(Status::permission_denied(
                 "log stream sandbox_id changed after validation",
             ));
@@ -4128,7 +4477,7 @@ async fn ensure_log_stream_sandbox_scope(
         return Ok(());
     }
 
-    crate::auth::guard::ensure_sandbox_scope(principal, sandbox_id)?;
+    crate::auth::guard::ensure_sandbox_scope(principal, sandbox_id, &state.config.audit)?;
     state
         .store
         .get_message::<Sandbox>(sandbox_id)
@@ -4147,11 +4496,37 @@ pub(super) async fn handle_submit_policy_analysis(
     state: &Arc<ServerState>,
     request: Request<SubmitPolicyAnalysisRequest>,
 ) -> Result<Response<SubmitPolicyAnalysisResponse>, Status> {
+    let principal = crate::audit::principal(&request);
+    let request_id = crate::audit::request_id(&request);
+    let name = request.get_ref().name.clone();
+    let result = handle_submit_policy_analysis_inner(state, request).await;
+    if let Err(status) = &result {
+        emit_draft_failure_audit(
+            state,
+            &principal,
+            request_id.as_deref(),
+            status,
+            DraftFailureAudit {
+                state_label: "draft_submitted",
+                detail: "policy analysis submission failed".to_string(),
+                sandbox_name: &name,
+                chunk_id: None,
+            },
+        );
+    }
+    result
+}
+
+async fn handle_submit_policy_analysis_inner(
+    state: &Arc<ServerState>,
+    request: Request<SubmitPolicyAnalysisRequest>,
+) -> Result<Response<SubmitPolicyAnalysisResponse>, Status> {
     let principal = request
         .extensions()
         .get::<Principal>()
         .cloned()
         .ok_or_else(|| Status::unauthenticated("missing principal"))?;
+    let request_id = crate::audit::request_id(&request);
     let req = request.into_inner();
     let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
         .await?
@@ -4162,6 +4537,7 @@ pub(super) async fn handle_submit_policy_analysis(
 
     let sandbox = resolve_sandbox_by_name_for_principal(
         state.store.as_ref(),
+        &state.config.audit,
         &workspace,
         &principal,
         &req.name,
@@ -4515,6 +4891,7 @@ pub(super) async fn handle_submit_policy_analysis(
                     workspace: &workspace,
                     source: &req.analysis_mode,
                     resolved_from,
+                    principal: &principal,
                 },
             )
             .await
@@ -4540,6 +4917,33 @@ pub(super) async fn handle_submit_policy_analysis(
         draft_version = draft_version,
         summaries = req.summaries.len(),
         "SubmitPolicyAnalysis: persisted draft chunks"
+    );
+    // The actor is typically the sandbox principal — the in-sandbox agent
+    // proposing its own policy — which is exactly what the audit trail
+    // needs to distinguish from human edits.
+    emit_gateway_policy_audit(
+        state,
+        Some(&principal),
+        request_id.as_deref(),
+        &PolicyAuditEvent {
+            sandbox: Some((&sandbox_id, sandbox.object_name())),
+            state_label: "draft_submitted",
+            detail: format!(
+                "policy analysis submitted: {accepted} chunk(s) accepted, {rejected} rejected"
+            ),
+            version: 0,
+            policy_hash: "",
+            success: true,
+            extra: vec![
+                ("accepted_chunks", serde_json::Value::from(accepted)),
+                ("rejected_chunks", serde_json::Value::from(rejected)),
+                ("draft_version", serde_json::Value::from(draft_version)),
+                (
+                    "analysis_mode",
+                    serde_json::Value::from(req.analysis_mode.clone()),
+                ),
+            ],
+        },
     );
 
     Ok(Response::new(SubmitPolicyAnalysisResponse {
@@ -4577,6 +4981,7 @@ pub(super) async fn handle_get_draft_policy(
 
     let sandbox = resolve_sandbox_by_name_for_principal(
         state.store.as_ref(),
+        &state.config.audit,
         &workspace,
         &principal,
         &req.name,
@@ -4624,13 +5029,72 @@ pub(super) async fn handle_get_draft_policy(
     }))
 }
 
+/// A failed draft mutation's audit facts. The sandbox is carried by name
+/// only, since the failure may have struck before it resolved.
+struct DraftFailureAudit<'a> {
+    state_label: &'static str,
+    detail: String,
+    sandbox_name: &'a str,
+    chunk_id: Option<&'a str>,
+}
+
+/// Emit the gateway-lane Failure audit event for a draft mutation, unless
+/// the rejection was an authentication/authorization denial.
+fn emit_draft_failure_audit(
+    state: &ServerState,
+    principal: &Principal,
+    request_id: Option<&str>,
+    status: &Status,
+    failure: DraftFailureAudit<'_>,
+) {
+    if !crate::audit::audited_failure(status) {
+        return;
+    }
+    let mut extra = vec![("sandbox", serde_json::Value::from(failure.sandbox_name))];
+    if let Some(chunk_id) = failure.chunk_id {
+        extra.push(("chunk_id", serde_json::Value::from(chunk_id)));
+    }
+    emit_gateway_policy_audit(
+        state,
+        Some(principal),
+        request_id,
+        &PolicyAuditEvent {
+            sandbox: None,
+            state_label: failure.state_label,
+            detail: failure.detail,
+            version: 0,
+            policy_hash: "",
+            success: false,
+            extra,
+        },
+    );
+}
+
 pub(super) async fn handle_approve_draft_chunk(
     state: &Arc<ServerState>,
     request: Request<ApproveDraftChunkRequest>,
 ) -> Result<Response<ApproveDraftChunkResponse>, Status> {
+    let principal = crate::audit::principal(&request);
+    let request_id = crate::audit::request_id(&request);
+    let (name, chunk_id) = {
+        let req = request.get_ref();
+        (req.name.clone(), req.chunk_id.clone())
+    };
     let result = handle_approve_draft_chunk_inner(state, request).await;
-    if result.is_err() {
+    if let Err(status) = &result {
         emit_policy_decision_failure(PolicyDecisionOperation::Approve, 1);
+        emit_draft_failure_audit(
+            state,
+            &principal,
+            request_id.as_deref(),
+            status,
+            DraftFailureAudit {
+                state_label: "approved",
+                detail: format!("gateway approve of draft chunk {chunk_id} failed"),
+                sandbox_name: &name,
+                chunk_id: Some(&chunk_id),
+            },
+        );
     }
     result
 }
@@ -4640,6 +5104,7 @@ async fn handle_approve_draft_chunk_inner(
     request: Request<ApproveDraftChunkRequest>,
 ) -> Result<Response<ApproveDraftChunkResponse>, Status> {
     let principal = super::extract_principal(&request)?;
+    let request_id = crate::audit::request_id(&request);
     let req = request.into_inner();
     let authz = authorize_workspace(
         &state.store,
@@ -4732,6 +5197,27 @@ async fn handle_approve_draft_chunk_inner(
     };
     let chunk_summary = summarize_draft_chunk_rule(&chunk)?;
 
+    // Audit the moment the policy revision is committed: if the chunk
+    // status update below fails, the policy still changed and must be on
+    // record (the wrapper adds a Failure event for the RPC).
+    emit_gateway_policy_audit(
+        state,
+        Some(&principal),
+        request_id.as_deref(),
+        &PolicyAuditEvent {
+            sandbox: Some((&sandbox_id, sandbox.object_name())),
+            state_label: "approved",
+            detail: format!(
+                "gateway approved draft chunk {}: {chunk_summary}",
+                req.chunk_id
+            ),
+            version,
+            policy_hash: &hash,
+            success: true,
+            extra: vec![("chunk_id", serde_json::Value::from(req.chunk_id.clone()))],
+        },
+    );
+
     let now_ms = current_time_ms();
     clear_pending_application_error(state, &req.chunk_id).await;
     state
@@ -4750,17 +5236,6 @@ async fn handle_approve_draft_chunk_inner(
             "failed to reconcile pending policy proposals after approval"
         );
     }
-    emit_gateway_policy_audit_log(
-        &sandbox_id,
-        sandbox.object_name(),
-        "approved",
-        format!(
-            "gateway approved draft chunk {}: {chunk_summary}",
-            req.chunk_id
-        ),
-        version,
-        &hash,
-    );
 
     info!(
         sandbox_id = %sandbox_id,
@@ -4783,9 +5258,27 @@ pub(super) async fn handle_reject_draft_chunk(
     state: &Arc<ServerState>,
     request: Request<RejectDraftChunkRequest>,
 ) -> Result<Response<RejectDraftChunkResponse>, Status> {
+    let principal = crate::audit::principal(&request);
+    let request_id = crate::audit::request_id(&request);
+    let (name, chunk_id) = {
+        let req = request.get_ref();
+        (req.name.clone(), req.chunk_id.clone())
+    };
     let result = handle_reject_draft_chunk_inner(state, request).await;
-    if result.is_err() {
+    if let Err(status) = &result {
         emit_policy_decision_failure(PolicyDecisionOperation::Reject, 1);
+        emit_draft_failure_audit(
+            state,
+            &principal,
+            request_id.as_deref(),
+            status,
+            DraftFailureAudit {
+                state_label: "rejected",
+                detail: format!("gateway reject of draft chunk {chunk_id} failed"),
+                sandbox_name: &name,
+                chunk_id: Some(&chunk_id),
+            },
+        );
     }
     result
 }
@@ -4795,6 +5288,7 @@ async fn handle_reject_draft_chunk_inner(
     request: Request<RejectDraftChunkRequest>,
 ) -> Result<Response<RejectDraftChunkResponse>, Status> {
     let principal = super::extract_principal(&request)?;
+    let request_id = crate::audit::request_id(&request);
     let req = request.into_inner();
     let authz = authorize_workspace(
         &state.store,
@@ -4854,16 +5348,22 @@ async fn handle_reject_draft_chunk_inner(
         require_no_global_policy(state).await?;
         let (version, hash) =
             remove_chunk_from_policy(state, &sandbox_id, &workspace, &chunk).await?;
-        emit_gateway_policy_audit_log(
-            &sandbox_id,
-            sandbox.object_name(),
-            "removed",
-            format!(
-                "gateway removed previously approved draft chunk {}: remove-binary {} {}",
-                req.chunk_id, chunk.rule_name, chunk.binary
-            ),
-            version,
-            &hash,
+        emit_gateway_policy_audit(
+            state,
+            Some(&principal),
+            request_id.as_deref(),
+            &PolicyAuditEvent {
+                sandbox: Some((&sandbox_id, sandbox.object_name())),
+                state_label: "removed",
+                detail: format!(
+                    "gateway removed previously approved draft chunk {}: remove-binary {} {}",
+                    req.chunk_id, chunk.rule_name, chunk.binary
+                ),
+                version,
+                policy_hash: &hash,
+                success: true,
+                extra: vec![("chunk_id", serde_json::Value::from(req.chunk_id.clone()))],
+            },
         );
         emit_sandbox_policy_update_success();
     }
@@ -4884,6 +5384,29 @@ async fn handle_reject_draft_chunk_inner(
         .map_err(|e| Status::internal(format!("update chunk status failed: {e}")))?;
 
     state.sandbox_watch_bus.notify(&sandbox_id);
+    let mut extra = vec![("chunk_id", serde_json::Value::from(req.chunk_id.clone()))];
+    // The reviewer's guidance is part of the decision record; free-form but
+    // reviewer-authored, so safe to carry.
+    if !req.reason.is_empty() {
+        extra.push(("reason", serde_json::Value::from(req.reason.clone())));
+    }
+    emit_gateway_policy_audit(
+        state,
+        Some(&principal),
+        request_id.as_deref(),
+        &PolicyAuditEvent {
+            sandbox: Some((&sandbox_id, sandbox.object_name())),
+            state_label: "rejected",
+            detail: format!(
+                "gateway rejected draft chunk {}: {} {}",
+                req.chunk_id, chunk.rule_name, chunk.binary
+            ),
+            version: 0,
+            policy_hash: "",
+            success: true,
+            extra,
+        },
+    );
     emit_policy_decision_success(PolicyDecisionOperation::Reject, 1);
 
     Ok(Response::new(RejectDraftChunkResponse {}))
@@ -4893,9 +5416,24 @@ pub(super) async fn handle_approve_all_draft_chunks(
     state: &Arc<ServerState>,
     request: Request<ApproveAllDraftChunksRequest>,
 ) -> Result<Response<ApproveAllDraftChunksResponse>, Status> {
+    let principal = crate::audit::principal(&request);
+    let request_id = crate::audit::request_id(&request);
+    let name = request.get_ref().name.clone();
     let result = handle_approve_all_draft_chunks_inner(state, request).await;
-    if result.is_err() {
+    if let Err(status) = &result {
         emit_policy_decision_failure(PolicyDecisionOperation::ApproveAll, 0);
+        emit_draft_failure_audit(
+            state,
+            &principal,
+            request_id.as_deref(),
+            status,
+            DraftFailureAudit {
+                state_label: "merged",
+                detail: "gateway bulk-approve of draft chunks failed".to_string(),
+                sandbox_name: &name,
+                chunk_id: None,
+            },
+        );
     }
     result
 }
@@ -4905,6 +5443,7 @@ async fn handle_approve_all_draft_chunks_inner(
     request: Request<ApproveAllDraftChunksRequest>,
 ) -> Result<Response<ApproveAllDraftChunksResponse>, Status> {
     let principal = super::extract_principal(&request)?;
+    let request_id = crate::audit::request_id(&request);
     let req = request.into_inner();
     let authz = authorize_workspace(
         &state.store,
@@ -5146,6 +5685,23 @@ async fn handle_approve_all_draft_chunks_inner(
     };
 
     for (chunk, _, chunk_summary) in &accepted {
+        // Audit right after the policy commit — a failed status update on a
+        // later step must not erase the record of this merge.
+        emit_gateway_policy_audit(
+            state,
+            Some(&principal),
+            request_id.as_deref(),
+            &PolicyAuditEvent {
+                sandbox: Some((&sandbox_id, sandbox.object_name())),
+                state_label: "approved",
+                detail: format!("gateway approved draft chunk {}: {chunk_summary}", chunk.id),
+                version: last_version,
+                policy_hash: &last_hash,
+                success: true,
+                extra: vec![("chunk_id", serde_json::Value::from(chunk.id.clone()))],
+            },
+        );
+
         let now_ms = current_time_ms();
         clear_pending_application_error(state, &chunk.id).await;
         state
@@ -5153,15 +5709,6 @@ async fn handle_approve_all_draft_chunks_inner(
             .update_draft_chunk_status(&chunk.id, "approved", Some(now_ms), None)
             .await
             .map_err(|e| Status::internal(format!("update chunk status failed: {e}")))?;
-
-        emit_gateway_policy_audit_log(
-            &sandbox_id,
-            sandbox.object_name(),
-            "approved",
-            format!("gateway approved draft chunk {}: {chunk_summary}", chunk.id),
-            last_version,
-            &last_hash,
-        );
         emit_sandbox_policy_update_success();
     }
     let chunks_approved = u32::try_from(accepted.len()).unwrap_or(u32::MAX);
@@ -5176,15 +5723,24 @@ async fn handle_approve_all_draft_chunks_inner(
             "failed to reconcile pending policy proposals after bulk approval"
         );
     }
-    emit_gateway_policy_audit_log(
-        &sandbox_id,
-        sandbox.object_name(),
-        "merged",
-        format!(
-            "gateway bulk-approved {chunks_approved} draft chunk(s) and skipped {chunks_skipped}"
-        ),
-        last_version,
-        &last_hash,
+    emit_gateway_policy_audit(
+        state,
+        Some(&principal),
+        request_id.as_deref(),
+        &PolicyAuditEvent {
+            sandbox: Some((&sandbox_id, sandbox.object_name())),
+            state_label: "merged",
+            detail: format!(
+                "gateway bulk-approved {chunks_approved} draft chunk(s) and skipped {chunks_skipped}"
+            ),
+            version: last_version,
+            policy_hash: &last_hash,
+            success: true,
+            extra: vec![
+                ("chunks_approved", serde_json::Value::from(chunks_approved)),
+                ("chunks_skipped", serde_json::Value::from(chunks_skipped)),
+            ],
+        },
     );
 
     info!(
@@ -5212,7 +5768,36 @@ pub(super) async fn handle_edit_draft_chunk(
     state: &Arc<ServerState>,
     request: Request<EditDraftChunkRequest>,
 ) -> Result<Response<EditDraftChunkResponse>, Status> {
+    let principal = crate::audit::principal(&request);
+    let request_id = crate::audit::request_id(&request);
+    let (name, chunk_id) = {
+        let req = request.get_ref();
+        (req.name.clone(), req.chunk_id.clone())
+    };
+    let result = handle_edit_draft_chunk_inner(state, request).await;
+    if let Err(status) = &result {
+        emit_draft_failure_audit(
+            state,
+            &principal,
+            request_id.as_deref(),
+            status,
+            DraftFailureAudit {
+                state_label: "edited",
+                detail: format!("gateway edit of draft chunk {chunk_id} failed"),
+                sandbox_name: &name,
+                chunk_id: Some(&chunk_id),
+            },
+        );
+    }
+    result
+}
+
+async fn handle_edit_draft_chunk_inner(
+    state: &Arc<ServerState>,
+    request: Request<EditDraftChunkRequest>,
+) -> Result<Response<EditDraftChunkResponse>, Status> {
     let principal = super::extract_principal(&request)?;
+    let request_id = crate::audit::request_id(&request);
     let req = request.into_inner();
     let authz = authorize_workspace(
         &state.store,
@@ -5274,6 +5859,23 @@ pub(super) async fn handle_edit_draft_chunk(
         chunk_id = %req.chunk_id,
         "EditDraftChunk: proposed rule updated"
     );
+    emit_gateway_policy_audit(
+        state,
+        Some(&principal),
+        request_id.as_deref(),
+        &PolicyAuditEvent {
+            sandbox: Some((&sandbox_id, sandbox.object_name())),
+            state_label: "edited",
+            detail: format!(
+                "gateway edited pending draft chunk {}: {}",
+                req.chunk_id, chunk.rule_name
+            ),
+            version: 0,
+            policy_hash: "",
+            success: true,
+            extra: vec![("chunk_id", serde_json::Value::from(req.chunk_id.clone()))],
+        },
+    );
 
     Ok(Response::new(EditDraftChunkResponse {}))
 }
@@ -5282,9 +5884,27 @@ pub(super) async fn handle_undo_draft_chunk(
     state: &Arc<ServerState>,
     request: Request<UndoDraftChunkRequest>,
 ) -> Result<Response<UndoDraftChunkResponse>, Status> {
+    let principal = crate::audit::principal(&request);
+    let request_id = crate::audit::request_id(&request);
+    let (name, chunk_id) = {
+        let req = request.get_ref();
+        (req.name.clone(), req.chunk_id.clone())
+    };
     let result = handle_undo_draft_chunk_inner(state, request).await;
-    if result.is_err() {
+    if let Err(status) = &result {
         emit_policy_decision_failure(PolicyDecisionOperation::Undo, 1);
+        emit_draft_failure_audit(
+            state,
+            &principal,
+            request_id.as_deref(),
+            status,
+            DraftFailureAudit {
+                state_label: "removed",
+                detail: format!("gateway undo of approved draft chunk {chunk_id} failed"),
+                sandbox_name: &name,
+                chunk_id: Some(&chunk_id),
+            },
+        );
     }
     result
 }
@@ -5294,6 +5914,7 @@ async fn handle_undo_draft_chunk_inner(
     request: Request<UndoDraftChunkRequest>,
 ) -> Result<Response<UndoDraftChunkResponse>, Status> {
     let principal = super::extract_principal(&request)?;
+    let request_id = crate::audit::request_id(&request);
     let req = request.into_inner();
     let authz = authorize_workspace(
         &state.store,
@@ -5347,6 +5968,27 @@ async fn handle_undo_draft_chunk_inner(
 
     let (version, hash) = remove_chunk_from_policy(state, &sandbox_id, &workspace, &chunk).await?;
 
+    // Audit the moment the policy revision is committed: if the chunk
+    // status update below fails, the rule is still gone and must be on
+    // record (the wrapper adds a Failure event for the RPC).
+    emit_gateway_policy_audit(
+        state,
+        Some(&principal),
+        request_id.as_deref(),
+        &PolicyAuditEvent {
+            sandbox: Some((&sandbox_id, sandbox.object_name())),
+            state_label: "removed",
+            detail: format!(
+                "gateway reverted approved draft chunk {}: remove-binary {} {}",
+                req.chunk_id, chunk.rule_name, chunk.binary
+            ),
+            version,
+            policy_hash: &hash,
+            success: true,
+            extra: vec![("chunk_id", serde_json::Value::from(req.chunk_id.clone()))],
+        },
+    );
+
     // Clear any prior rejection_reason on the way back to "pending" so an
     // agent reading the chunk via policy.local cannot see a stale guidance
     // string left over from a previous reject → undo round.
@@ -5357,17 +5999,6 @@ async fn handle_undo_draft_chunk_inner(
         .map_err(|e| Status::internal(format!("update chunk status failed: {e}")))?;
 
     state.sandbox_watch_bus.notify(&sandbox_id);
-    emit_gateway_policy_audit_log(
-        &sandbox_id,
-        sandbox.object_name(),
-        "removed",
-        format!(
-            "gateway reverted approved draft chunk {}: remove-binary {} {}",
-            req.chunk_id, chunk.rule_name, chunk.binary
-        ),
-        version,
-        &hash,
-    );
 
     info!(
         sandbox_id = %sandbox_id,
@@ -5390,7 +6021,33 @@ pub(super) async fn handle_clear_draft_chunks(
     state: &Arc<ServerState>,
     request: Request<ClearDraftChunksRequest>,
 ) -> Result<Response<ClearDraftChunksResponse>, Status> {
+    let principal = crate::audit::principal(&request);
+    let request_id = crate::audit::request_id(&request);
+    let name = request.get_ref().name.clone();
+    let result = handle_clear_draft_chunks_inner(state, request).await;
+    if let Err(status) = &result {
+        emit_draft_failure_audit(
+            state,
+            &principal,
+            request_id.as_deref(),
+            status,
+            DraftFailureAudit {
+                state_label: "cleared",
+                detail: "gateway clear of pending draft chunks failed".to_string(),
+                sandbox_name: &name,
+                chunk_id: None,
+            },
+        );
+    }
+    result
+}
+
+async fn handle_clear_draft_chunks_inner(
+    state: &Arc<ServerState>,
+    request: Request<ClearDraftChunksRequest>,
+) -> Result<Response<ClearDraftChunksResponse>, Status> {
     let principal = super::extract_principal(&request)?;
+    let request_id = crate::audit::request_id(&request);
     let req = request.into_inner();
     let authz = authorize_workspace(
         &state.store,
@@ -5427,6 +6084,20 @@ pub(super) async fn handle_clear_draft_chunks(
         sandbox_id = %sandbox_id,
         chunks_cleared = deleted,
         "ClearDraftChunks: pending chunks cleared"
+    );
+    emit_gateway_policy_audit(
+        state,
+        Some(&principal),
+        request_id.as_deref(),
+        &PolicyAuditEvent {
+            sandbox: Some((&sandbox_id, sandbox.object_name())),
+            state_label: "cleared",
+            detail: format!("gateway cleared {deleted} pending draft chunk(s)"),
+            version: 0,
+            policy_hash: "",
+            success: true,
+            extra: vec![("chunks_cleared", serde_json::Value::from(deleted))],
+        },
     );
 
     Ok(Response::new(ClearDraftChunksResponse {
@@ -6913,6 +7584,31 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tonic::Code;
+
+    #[test]
+    fn pushed_log_fields_cannot_shadow_gateway_identity_attributes() {
+        let mut log = SandboxLogLine {
+            fields: HashMap::from([
+                ("sandbox.id".to_string(), "victim-sb".to_string()),
+                ("log.source".to_string(), "gateway".to_string()),
+                ("log.target".to_string(), "audit".to_string()),
+                ("log.level".to_string(), "OCSF".to_string()),
+                ("log.ocsf".to_string(), "true".to_string()),
+                ("ocsf.raw".to_string(), "{}".to_string()),
+                ("custom.field".to_string(), "kept".to_string()),
+            ]),
+            ..Default::default()
+        };
+        sanitize_pushed_log_fields(&mut log);
+        assert_eq!(
+            log.fields.keys().count(),
+            2,
+            "only non-reserved keys survive: {:?}",
+            log.fields
+        );
+        assert!(log.fields.contains_key("ocsf.raw"));
+        assert!(log.fields.contains_key("custom.field"));
+    }
 
     /// Wrap a request with a user `Principal` so handler scope guards treat
     /// the test caller as a CLI user. Most handler tests exercise
@@ -15271,22 +15967,239 @@ mod tests {
         assert_eq!(undo_err.code(), Code::NotFound);
     }
 
+    /// The draft-chunk lifecycle must leave a structured 5019 audit trail:
+    /// a sandbox-principal submission audits as `draft_submitted` with the
+    /// sandbox as actor and routes into that sandbox's stream, a human
+    /// approval audits with the reviewer as actor plus version/hash, and a
+    /// failed approval audits as a gateway-lane Failure.
+    #[tokio::test]
+    async fn draft_chunk_lifecycle_emits_structured_audit_events() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let exporter = opentelemetry_sdk::logs::InMemoryLogExporter::default();
+        let (handle, worker) = crate::log_export::spawn(
+            exporter.clone(),
+            opentelemetry_sdk::Resource::builder_empty().build(),
+            true,
+        );
+        let bus = crate::tracing_bus::TracingLogBus::new();
+        bus.set_export(handle);
+        let state = test_server_state().await;
+        let sandbox_name = "audit-drafts";
+        let sandbox_id = "sb-audit-drafts";
+        state
+            .store
+            .put_message(&test_sandbox(
+                sandbox_id,
+                sandbox_name,
+                ProtoSandboxPolicy::default(),
+                vec![],
+            ))
+            .await
+            .unwrap();
+
+        let chunk_id;
+        {
+            let subscriber = tracing_subscriber::registry().with(bus.layer());
+            let _guard = crate::otel_tracing::test_exporter::install_scoped(subscriber);
+
+            let submit = handle_submit_policy_analysis(
+                &state,
+                with_sandbox(
+                    Request::new(SubmitPolicyAnalysisRequest {
+                        name: sandbox_name.to_string(),
+                        analysis_mode: "agent_authored".to_string(),
+                        proposed_chunks: vec![PolicyChunk {
+                            rule_name: "api_access".to_string(),
+                            proposed_rule: Some(NetworkPolicyRule {
+                                name: "api_access".to_string(),
+                                endpoints: vec![NetworkEndpoint {
+                                    host: "api.example.com".to_string(),
+                                    port: 443,
+                                    ..Default::default()
+                                }],
+                                binaries: vec![NetworkBinary {
+                                    path: "/usr/bin/curl".to_string(),
+                                    ..Default::default()
+                                }],
+                            }),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }),
+                    sandbox_id,
+                ),
+            )
+            .await
+            .unwrap()
+            .into_inner();
+            assert_eq!(submit.accepted_chunks, 1);
+            chunk_id = submit.accepted_chunk_ids[0].clone();
+            let review_token = state
+                .store
+                .get_draft_chunk(&chunk_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .review_token;
+
+            handle_approve_draft_chunk(
+                &state,
+                with_user(Request::new(ApproveDraftChunkRequest {
+                    name: sandbox_name.to_string(),
+                    chunk_id: chunk_id.clone(),
+                    review_token,
+                    ..Default::default()
+                })),
+            )
+            .await
+            .unwrap();
+
+            let error = handle_approve_draft_chunk(
+                &state,
+                with_user(Request::new(ApproveDraftChunkRequest {
+                    name: sandbox_name.to_string(),
+                    chunk_id: "no-such-chunk".to_string(),
+                    ..Default::default()
+                })),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code(), Code::NotFound);
+        }
+
+        // Interleaved plain handler logs share the lane; keep the OCSF
+        // records, paired with their sandbox routing attribute.
+        let audit_records = || -> Vec<(serde_json::Value, Option<String>)> {
+            exporter
+                .get_emitted_logs()
+                .unwrap()
+                .iter()
+                .filter_map(|log| {
+                    let raw = log
+                        .record
+                        .attributes_iter()
+                        .find(|(k, _)| k.as_str() == "ocsf.raw")
+                        .map(|(_, v)| v.clone())?;
+                    let opentelemetry::logs::AnyValue::String(raw) = raw else {
+                        panic!("ocsf.raw should be a string");
+                    };
+                    let sandbox_attr = log
+                        .record
+                        .attributes_iter()
+                        .find(|(k, _)| k.as_str() == "sandbox.id")
+                        .and_then(|(_, v)| match v {
+                            opentelemetry::logs::AnyValue::String(s) => {
+                                Some(s.as_str().to_string())
+                            }
+                            _ => None,
+                        });
+                    Some((
+                        serde_json::from_str::<serde_json::Value>(raw.as_str()).unwrap(),
+                        sandbox_attr,
+                    ))
+                })
+                .collect()
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while audit_records().len() < 3 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "audit records never arrived"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let records = audit_records();
+        let find = |label: &str, success: bool| {
+            records
+                .iter()
+                .find(|(json, _)| {
+                    json["state"] == label && (json["status"] == "Success") == success
+                })
+                .unwrap_or_else(|| panic!("no {label} (success={success}) record: {records:?}"))
+        };
+
+        let (submitted, submitted_sandbox) = find("draft_submitted", true);
+        assert_eq!(submitted["class_uid"], 5019);
+        assert_eq!(
+            submitted["actor"]["user"]["name"],
+            format!("sandbox:{sandbox_id}"),
+            "submission actor is the sandbox principal"
+        );
+        assert_eq!(submitted["unmapped"]["accepted_chunks"], 1);
+        assert_eq!(
+            submitted_sandbox.as_deref(),
+            Some(sandbox_id),
+            "draft events route into the sandbox stream"
+        );
+
+        let (approved, _) = find("approved", true);
+        assert_eq!(approved["actor"]["user"]["uid"], "test-user");
+        assert_eq!(approved["unmapped"]["chunk_id"], chunk_id);
+        assert_eq!(approved["unmapped"]["policy_version"], "v1");
+
+        let (failed, failed_sandbox) = find("approved", false);
+        assert_eq!(failed["unmapped"]["chunk_id"], "no-such-chunk");
+        assert_eq!(failed["unmapped"]["sandbox"], sandbox_name);
+        assert!(
+            failed_sandbox.is_none(),
+            "failure events ride the gateway lane"
+        );
+
+        worker.shutdown().await;
+    }
+
     #[test]
-    fn build_gateway_policy_audit_message_formats_ocsf_config_line() {
-        let message = build_gateway_policy_audit_message(
-            "sb-123",
-            "demo-sandbox",
-            "merged",
-            "gateway merged incremental policy op: add-allow api.github.com:443 [POST /repos/*/issues]",
-            7,
-            "sha256:testhash",
-            &[],
+    fn policy_audit_event_formats_ocsf_config_line_with_actor() {
+        let event = build_gateway_policy_audit_event(
+            Some(&audit_test_principal()),
+            Some("req-9"),
+            &PolicyAuditEvent {
+                sandbox: Some(("sb-123", "demo-sandbox")),
+                state_label: "merged",
+                detail: "gateway merged incremental policy op: add-allow api.github.com:443 [POST /repos/*/issues]".to_string(),
+                version: 7,
+                policy_hash: "sha256:testhash",
+                success: true,
+                extra: Vec::new(),
+            },
         );
 
         assert_eq!(
-            message,
-            "CONFIG:MERGED [INFO] gateway merged incremental policy op: add-allow api.github.com:443 [POST /repos/*/issues] [version:v7 hash:sha256:testhash]"
+            event.format_shorthand(),
+            "CONFIG:MERGED [INFO] gateway merged incremental policy op: add-allow api.github.com:443 [POST /repos/*/issues] [version:v7 hash:sha256:testhash] by alice"
         );
+        let json = event.to_json().unwrap();
+        assert_eq!(json["actor"]["user"]["uid"], "oidc|alice-123");
+        assert_eq!(json["metadata"]["uid"], "sb-123");
+        assert_eq!(json["unmapped"]["request_id"], "req-9");
+    }
+
+    #[test]
+    fn failed_policy_audit_events_render_failed_and_carry_failure_status() {
+        let event = build_gateway_policy_audit_event(
+            Some(&audit_test_principal()),
+            None,
+            &PolicyAuditEvent {
+                sandbox: None,
+                state_label: "approved",
+                detail: "gateway approve of draft chunk c-1 failed".to_string(),
+                version: 0,
+                policy_hash: "",
+                success: false,
+                extra: vec![("sandbox", serde_json::Value::from("demo-sandbox"))],
+            },
+        );
+        let line = event.format_shorthand();
+        // Failed mutations render at [LOW] so Warn+ alerting can see them.
+        assert!(
+            line.starts_with("CONFIG:APPROVED [LOW] FAILED "),
+            "unexpected shorthand: {line}"
+        );
+        let json = event.to_json().unwrap();
+        assert_eq!(json["status"], "Failure");
+        assert_eq!(json["severity_id"], 2);
+        assert_eq!(json["unmapped"]["sandbox"], "demo-sandbox");
     }
 
     /// Auto-approval audit messages carry `auto=true`, `source=<mode>`, and
@@ -15296,21 +16209,25 @@ mod tests {
     /// findings" — never "safe" — because the claim is about the prover's
     /// reasoning, not the world.
     #[test]
-    fn build_gateway_policy_audit_message_carries_auto_approve_provenance() {
-        let extra = [
-            ("auto", "true".to_string()),
-            ("source", "agent_authored".to_string()),
-            ("prover_delta", "empty".to_string()),
-        ];
-        let message = build_gateway_policy_audit_message(
-            "sb-123",
-            "demo-sandbox",
-            "approved",
-            "auto-approved: no new prover findings (source=agent_authored) — chunk abc: add-rule x",
-            12,
-            "sha256:autohash",
-            &extra,
+    fn policy_audit_event_carries_auto_approve_provenance() {
+        let event = build_gateway_policy_audit_event(
+            Some(&audit_test_principal()),
+            None,
+            &PolicyAuditEvent {
+                sandbox: Some(("sb-123", "demo-sandbox")),
+                state_label: "approved",
+                detail: "auto-approved: no new prover findings (source=agent_authored) — chunk abc: add-rule x".to_string(),
+                version: 12,
+                policy_hash: "sha256:autohash",
+                success: true,
+                extra: vec![
+                    ("auto", serde_json::Value::from("true")),
+                    ("source", serde_json::Value::from("agent_authored")),
+                    ("prover_delta", serde_json::Value::from("empty")),
+                ],
+            },
         );
+        let message = event.format_shorthand();
         assert!(
             message.contains("CONFIG:APPROVED"),
             "auto-approval reuses CONFIG:APPROVED; got: {message}"
@@ -16877,6 +17794,283 @@ mod tests {
         assert!(changed);
     }
 
+    // ---- Settings audit events ----
+
+    fn audit_test_principal() -> Principal {
+        Principal::User(UserPrincipal {
+            identity: Identity {
+                subject: "oidc|alice-123".to_string(),
+                display_name: Some("alice".to_string()),
+                roles: vec![],
+                scopes: vec![],
+                provider: IdentityProvider::Oidc,
+            },
+        })
+    }
+
+    #[test]
+    fn settings_audit_event_carries_values_actor_and_request_id() {
+        let before = StoredSettingValue::String("manual".to_string());
+        let after = StoredSettingValue::String("auto".to_string());
+        let event = build_update_config_settings_audit_event(
+            true,
+            &audit_test_principal(),
+            Some("req-7"),
+            &SettingsAuditEvent {
+                sandbox: None,
+                sandbox_name: None,
+                workspace: None,
+                key: "proposal_approval_mode",
+                deleted: false,
+                changed: true,
+                success: true,
+                before: Some(&before),
+                after: Some(&after),
+            },
+        );
+
+        let json = event.to_json().unwrap();
+        assert_eq!(json["class_uid"], 5019);
+        assert_eq!(json["state"], "setting_updated");
+        assert_eq!(json["actor"]["user"]["name"], "alice");
+        assert_eq!(json["actor"]["user"]["uid"], "oidc|alice-123");
+        assert_eq!(json["unmapped"]["scope"], "global");
+        assert_eq!(json["unmapped"]["setting_key"], "proposal_approval_mode");
+        assert_eq!(json["unmapped"]["changed"], true);
+        assert_eq!(json["unmapped"]["before"], "manual");
+        assert_eq!(json["unmapped"]["after"], "auto");
+        assert_eq!(json["unmapped"]["request_id"], "req-7");
+
+        let line = event.format_shorthand();
+        assert!(
+            line.starts_with(
+                "CONFIG:SETTING_UPDATED [INFO] global setting proposal_approval_mode updated"
+            ) && line.ends_with("by alice"),
+            "unexpected shorthand: {line}"
+        );
+    }
+
+    #[test]
+    fn settings_audit_values_reduce_to_key_names_when_toggled_off() {
+        let before = StoredSettingValue::Bool(false);
+        let after = StoredSettingValue::Bool(true);
+        let event = build_update_config_settings_audit_event(
+            false,
+            &audit_test_principal(),
+            None,
+            &SettingsAuditEvent {
+                sandbox: None,
+                sandbox_name: None,
+                workspace: None,
+                key: "providers_v2_enabled",
+                deleted: false,
+                changed: true,
+                success: true,
+                before: Some(&before),
+                after: Some(&after),
+            },
+        );
+        let json = event.to_json().unwrap();
+        assert_eq!(json["unmapped"]["setting_key"], "providers_v2_enabled");
+        assert!(json["unmapped"].get("before").is_none());
+        assert!(json["unmapped"].get("after").is_none());
+    }
+
+    #[test]
+    fn settings_audit_always_redacts_credential_pattern_keys() {
+        let before = StoredSettingValue::String("hunter2".to_string());
+        let event = build_update_config_settings_audit_event(
+            true,
+            &audit_test_principal(),
+            None,
+            &SettingsAuditEvent {
+                sandbox: None,
+                sandbox_name: None,
+                workspace: None,
+                key: "provider_api_key",
+                deleted: true,
+                changed: true,
+                success: true,
+                before: Some(&before),
+                after: None,
+            },
+        );
+        let json = event.to_json().unwrap();
+        assert_eq!(json["unmapped"]["before"], "[REDACTED]");
+        assert_eq!(json["state"], "setting_deleted");
+        assert!(
+            !json.to_string().contains("hunter2"),
+            "secret value must never appear anywhere in the event"
+        );
+    }
+
+    #[test]
+    fn sandbox_scoped_settings_audit_names_sandbox_and_workspace() {
+        let after = StoredSettingValue::Bool(true);
+        let event = build_update_config_settings_audit_event(
+            true,
+            &audit_test_principal(),
+            None,
+            &SettingsAuditEvent {
+                sandbox: Some(("sb-7f3a", "dev-box")),
+                sandbox_name: None,
+                workspace: Some("team-a"),
+                key: "agent_policy_proposals_enabled",
+                deleted: false,
+                changed: true,
+                success: true,
+                before: None,
+                after: Some(&after),
+            },
+        );
+        let json = event.to_json().unwrap();
+        assert_eq!(json["unmapped"]["scope"], "sandbox");
+        assert_eq!(json["unmapped"]["workspace"], "team-a");
+        assert_eq!(json["unmapped"]["sandbox"], "dev-box");
+        assert_eq!(json["metadata"]["uid"], "sb-7f3a");
+    }
+
+    #[test]
+    fn failed_settings_mutations_audit_with_failure_status() {
+        let event = build_update_config_settings_audit_event(
+            true,
+            &audit_test_principal(),
+            None,
+            &SettingsAuditEvent {
+                sandbox: None,
+                sandbox_name: Some("dev-box"),
+                workspace: Some("team-a"),
+                key: "providers_v2_enabled",
+                deleted: false,
+                changed: false,
+                success: false,
+                before: None,
+                after: None,
+            },
+        );
+        let json = event.to_json().unwrap();
+        assert_eq!(json["status"], "Failure");
+        assert_eq!(json["unmapped"]["sandbox"], "dev-box");
+        let line = event.format_shorthand();
+        assert!(
+            line.contains("update failed"),
+            "unexpected shorthand: {line}"
+        );
+    }
+
+    /// The `update_config` settings paths must audit through the gateway
+    /// lane: a global set emits a 5019 record with before/after values, a
+    /// failed mutation attempt emits with `Failure`, and an authorization
+    /// denial emits nothing (that is the authentication boundary's event).
+    #[tokio::test]
+    async fn update_config_settings_mutations_emit_audit_events() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let exporter = opentelemetry_sdk::logs::InMemoryLogExporter::default();
+        let (handle, worker) = crate::log_export::spawn(
+            exporter.clone(),
+            opentelemetry_sdk::Resource::builder_empty().build(),
+            true,
+        );
+        let bus = crate::tracing_bus::TracingLogBus::new();
+        bus.set_export(handle);
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".to_string();
+
+        {
+            let subscriber = tracing_subscriber::registry().with(bus.layer());
+            let _guard = crate::otel_tracing::test_exporter::install_scoped(subscriber);
+
+            // Denied first: `with_user` lacks the admin role, so this must
+            // not produce an audit record.
+            let error = handle_update_config(
+                &state,
+                with_user(Request::new(UpdateConfigRequest {
+                    global: true,
+                    setting_key: settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
+                    setting_value: Some(SettingValue {
+                        value: Some(setting_value::Value::BoolValue(true)),
+                    }),
+                    ..UpdateConfigRequest::default()
+                })),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code(), Code::PermissionDenied);
+
+            handle_update_config(
+                &state,
+                authed_request(UpdateConfigRequest {
+                    global: true,
+                    setting_key: settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
+                    setting_value: Some(SettingValue {
+                        value: Some(setting_value::Value::BoolValue(true)),
+                    }),
+                    ..UpdateConfigRequest::default()
+                }),
+            )
+            .await
+            .unwrap();
+
+            let error = handle_update_config(
+                &state,
+                authed_request(UpdateConfigRequest {
+                    global: true,
+                    setting_key: "no_such_setting".to_string(),
+                    setting_value: Some(SettingValue {
+                        value: Some(setting_value::Value::BoolValue(true)),
+                    }),
+                    ..UpdateConfigRequest::default()
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code(), Code::InvalidArgument);
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while exporter.get_emitted_logs().unwrap().len() < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "audit records never arrived"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let emitted = exporter.get_emitted_logs().unwrap();
+        let raw_json = |record: &opentelemetry_sdk::logs::SdkLogRecord| {
+            let raw = record
+                .attributes_iter()
+                .find(|(k, _)| k.as_str() == "ocsf.raw")
+                .map(|(_, v)| v.clone())
+                .expect("ocsf.raw attribute");
+            let opentelemetry::logs::AnyValue::String(raw) = raw else {
+                panic!("ocsf.raw should be a string");
+            };
+            serde_json::from_str::<serde_json::Value>(raw.as_str()).unwrap()
+        };
+
+        // Record 0 is the successful set — the earlier denial emitted nothing.
+        let set = raw_json(&emitted[0].record);
+        assert_eq!(set["class_uid"], 5019);
+        assert_eq!(set["state"], "setting_updated");
+        assert_eq!(set["status"], "Success");
+        assert_eq!(set["actor"]["user"]["uid"], "dev-user");
+        assert_eq!(set["unmapped"]["scope"], "global");
+        assert_eq!(
+            set["unmapped"]["setting_key"],
+            settings::PROVIDERS_V2_ENABLED_KEY
+        );
+        assert_eq!(set["unmapped"]["changed"], true);
+        assert!(set["unmapped"].get("before").is_none());
+        assert_eq!(set["unmapped"]["after"], true);
+
+        let failed = raw_json(&emitted[1].record);
+        assert_eq!(failed["status"], "Failure");
+        assert_eq!(failed["unmapped"]["setting_key"], "no_such_setting");
+
+        worker.shutdown().await;
+    }
+
     // ---- Settings persistence ----
 
     #[tokio::test]
@@ -17600,6 +18794,143 @@ mod tests {
                 "same-hash-signature".to_string(),
             )])
         );
+    }
+
+    #[tokio::test]
+    async fn update_config_full_policy_replacements_emit_audit_events() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let exporter = opentelemetry_sdk::logs::InMemoryLogExporter::default();
+        let (handle, worker) = crate::log_export::spawn(
+            exporter.clone(),
+            opentelemetry_sdk::Resource::builder_empty().build(),
+            true,
+        );
+        let bus = crate::tracing_bus::TracingLogBus::new();
+        bus.set_export(handle);
+        let state = test_server_state().await;
+        let policy = test_policy_with_rule("sandbox_only", "sandbox.example.com");
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-audit-replace",
+                "audit-replace",
+                policy.clone(),
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+
+        {
+            let subscriber = tracing_subscriber::registry().with(bus.layer());
+            let _guard = crate::otel_tracing::test_exporter::install_scoped(subscriber);
+
+            // Sandbox-scoped full replacement.
+            let mut replaced = policy.clone();
+            replaced
+                .network_policies
+                .extend(test_policy_with_rule("extra_rule", "extra.example.com").network_policies);
+            handle_update_config(
+                &state,
+                with_user(Request::new(UpdateConfigRequest {
+                    name: "audit-replace".to_string(),
+                    policy: Some(replaced.clone()),
+                    ..Default::default()
+                })),
+            )
+            .await
+            .unwrap();
+
+            // Idempotent re-set: no revision, no audit record.
+            handle_update_config(
+                &state,
+                with_user(Request::new(UpdateConfigRequest {
+                    name: "audit-replace".to_string(),
+                    policy: Some(replaced),
+                    ..Default::default()
+                })),
+            )
+            .await
+            .unwrap();
+
+            // Global full-policy set.
+            handle_update_config(
+                &state,
+                authed_request(UpdateConfigRequest {
+                    global: true,
+                    policy: Some(test_policy_with_rule("global_rule", "global.example.com")),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        }
+
+        let audit_records = || -> Vec<(serde_json::Value, Option<String>)> {
+            exporter
+                .get_emitted_logs()
+                .unwrap()
+                .iter()
+                .filter_map(|log| {
+                    let raw = log
+                        .record
+                        .attributes_iter()
+                        .find(|(k, _)| k.as_str() == "ocsf.raw")
+                        .map(|(_, v)| v.clone())?;
+                    let opentelemetry::logs::AnyValue::String(raw) = raw else {
+                        panic!("ocsf.raw should be a string");
+                    };
+                    let sandbox_attr = log
+                        .record
+                        .attributes_iter()
+                        .find(|(k, _)| k.as_str() == "sandbox.id")
+                        .and_then(|(_, v)| match v {
+                            opentelemetry::logs::AnyValue::String(s) => {
+                                Some(s.as_str().to_string())
+                            }
+                            _ => None,
+                        });
+                    Some((
+                        serde_json::from_str::<serde_json::Value>(raw.as_str()).unwrap(),
+                        sandbox_attr,
+                    ))
+                })
+                .collect()
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while audit_records().len() < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "audit records never arrived"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // Give any stray idempotent-path record a chance to surface.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let records = audit_records();
+        assert_eq!(
+            records.len(),
+            2,
+            "one record per committed revision, none for the idempotent re-set"
+        );
+
+        let (sandbox_replace, route) = &records[0];
+        assert_eq!(sandbox_replace["class_uid"], 5019);
+        assert_eq!(sandbox_replace["state"], "updated");
+        assert_eq!(sandbox_replace["status"], "Success");
+        assert_eq!(sandbox_replace["unmapped"]["policy_version"], "v1");
+        assert!(
+            sandbox_replace["actor"]["user"]["name"].is_string(),
+            "full replacements carry the acting principal"
+        );
+        assert_eq!(route.as_deref(), Some("sb-audit-replace"));
+
+        let (global_replace, route) = &records[1];
+        assert_eq!(global_replace["state"], "updated");
+        assert_eq!(global_replace["unmapped"]["scope"], "global");
+        assert!(route.is_none(), "global policy rides the gateway lane");
+
+        worker.shutdown().await;
     }
 
     #[tokio::test]

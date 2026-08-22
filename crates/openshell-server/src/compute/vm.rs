@@ -628,6 +628,8 @@ mod tests {
             Some(&OtlpConfig {
                 endpoint: "http://collector.internal:4317".to_string(),
                 service_name: Some("custom-gateway".to_string()),
+                export_logs: false,
+                ocsf_full_payload: false,
             }),
         );
 

@@ -74,10 +74,38 @@ impl Process {
 }
 
 /// OCSF Actor object — the entity that initiated the event.
+///
+/// Sandbox events carry the acting `process`; gateway audit events carry the
+/// authenticated `user`. At least one is always set.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Actor {
     /// The process that performed the action.
-    pub process: Process,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process: Option<Process>,
+
+    /// The authenticated identity that performed the action.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<crate::objects::User>,
+}
+
+impl Actor {
+    /// An actor acting through a process (sandbox events).
+    #[must_use]
+    pub fn from_process(process: Process) -> Self {
+        Self {
+            process: Some(process),
+            user: None,
+        }
+    }
+
+    /// An actor acting as an authenticated identity (gateway audit events).
+    #[must_use]
+    pub fn from_user(user: crate::objects::User) -> Self {
+        Self {
+            process: None,
+            user: Some(user),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -131,10 +159,12 @@ mod tests {
 
     #[test]
     fn test_actor_serialization() {
-        let actor = Actor {
-            process: Process::new("python3", 42),
-        };
+        let actor = Actor::from_process(Process::new("python3", 42));
         let json = serde_json::to_value(&actor).unwrap();
         assert_eq!(json["process"]["name"], "python3");
+        assert!(
+            json.get("user").is_none(),
+            "process actors serialize without a user"
+        );
     }
 }

@@ -57,12 +57,14 @@ pub use objects::{
 
 // --- Builders ---
 pub use builders::{
-    ApiActivityBuilder, AppLifecycleBuilder, BaseEventBuilder, ConfigStateChangeBuilder,
-    DetectionFindingBuilder, HttpActivityBuilder, NetworkActivityBuilder, ProcessActivityBuilder,
-    SandboxContext, SshActivityBuilder,
+    ApiActivityBuilder, AppLifecycleBuilder, AuthenticationBuilder, BaseEventBuilder,
+    ConfigStateChangeBuilder, DetectionFindingBuilder, EntityManagementBuilder,
+    HttpActivityBuilder, NetworkActivityBuilder, ProcessActivityBuilder, SandboxContext,
+    SshActivityBuilder,
 };
 
 // --- Tracing layers ---
 pub use tracing_layers::{
     OCSF_TARGET, OcsfJsonlLayer, OcsfShorthandLayer, clone_current_event, emit_ocsf_event,
+    emit_ocsf_event_for_sandbox,
 };

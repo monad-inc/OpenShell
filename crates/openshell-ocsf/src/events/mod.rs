@@ -5,9 +5,11 @@
 
 mod api_activity;
 mod app_lifecycle;
+mod authentication;
 pub(crate) mod base_event;
 mod config_state_change;
 mod detection_finding;
+mod entity_management;
 mod http_activity;
 mod network_activity;
 mod process_activity;
@@ -16,9 +18,11 @@ mod ssh_activity;
 
 pub use api_activity::ApiActivityEvent;
 pub use app_lifecycle::ApplicationLifecycleEvent;
+pub use authentication::AuthenticationEvent;
 pub use base_event::{BaseEvent, BaseEventData};
 pub use config_state_change::DeviceConfigStateChangeEvent;
 pub use detection_finding::DetectionFindingEvent;
+pub use entity_management::EntityManagementEvent;
 pub use http_activity::HttpActivityEvent;
 pub use network_activity::NetworkActivityEvent;
 pub use process_activity::ProcessActivityEvent;
@@ -47,6 +51,10 @@ pub enum OcsfEvent {
     ApplicationLifecycle(ApplicationLifecycleEvent),
     /// Device Config State Change [5019]
     DeviceConfigStateChange(DeviceConfigStateChangeEvent),
+    /// Entity Management [3004]
+    EntityManagement(EntityManagementEvent),
+    /// Authentication [3002]
+    Authentication(AuthenticationEvent),
     /// API Activity [6003]
     ApiActivity(ApiActivityEvent),
     /// Base Event [0]
@@ -63,6 +71,8 @@ impl Serialize for OcsfEvent {
             Self::DetectionFinding(e) => e.serialize(serializer),
             Self::ApplicationLifecycle(e) => e.serialize(serializer),
             Self::DeviceConfigStateChange(e) => e.serialize(serializer),
+            Self::EntityManagement(e) => e.serialize(serializer),
+            Self::Authentication(e) => e.serialize(serializer),
             Self::ApiActivity(e) => e.serialize(serializer),
             Self::Base(e) => e.serialize(serializer),
         }
@@ -101,6 +111,12 @@ impl<'de> Deserialize<'de> for OcsfEvent {
             5019 => serde_json::from_value::<DeviceConfigStateChangeEvent>(value)
                 .map(Self::DeviceConfigStateChange)
                 .map_err(serde::de::Error::custom),
+            3004 => serde_json::from_value::<EntityManagementEvent>(value)
+                .map(Self::EntityManagement)
+                .map_err(serde::de::Error::custom),
+            3002 => serde_json::from_value::<AuthenticationEvent>(value)
+                .map(Self::Authentication)
+                .map_err(serde::de::Error::custom),
             6003 => serde_json::from_value::<ApiActivityEvent>(value)
                 .map(Self::ApiActivity)
                 .map_err(serde::de::Error::custom),
@@ -126,6 +142,8 @@ impl OcsfEvent {
             Self::DetectionFinding(_) => 2004,
             Self::ApplicationLifecycle(_) => 6002,
             Self::DeviceConfigStateChange(_) => 5019,
+            Self::EntityManagement(_) => 3004,
+            Self::Authentication(_) => 3002,
             Self::ApiActivity(_) => 6003,
             Self::Base(_) => 0,
         }
@@ -142,6 +160,8 @@ impl OcsfEvent {
             Self::DetectionFinding(e) => &e.base,
             Self::ApplicationLifecycle(e) => &e.base,
             Self::DeviceConfigStateChange(e) => &e.base,
+            Self::EntityManagement(e) => &e.base,
+            Self::Authentication(e) => &e.base,
             Self::ApiActivity(e) => &e.base,
             Self::Base(e) => &e.base,
         }

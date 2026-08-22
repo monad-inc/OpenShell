@@ -444,6 +444,9 @@ pub struct Config {
     /// Gateway user authentication behavior.
     pub auth: GatewayAuthConfig,
 
+    /// Gateway audit event depth toggles.
+    pub audit: GatewayAuditConfig,
+
     /// Disabled-by-default gateway interceptor service configs.
     pub gateway_interceptors: Vec<GatewayInterceptorConfig>,
 
@@ -636,6 +639,61 @@ pub struct GatewayAuthConfig {
     /// gateway-minted sandbox JWTs.
     #[serde(default)]
     pub allow_unauthenticated_users: bool,
+}
+
+/// `[openshell.gateway.audit]` — gateway audit event toggles.
+///
+/// `enabled` is the master switch for gateway audit event emission (on by
+/// default); the remaining toggles trade record detail (or volume, for
+/// authentication successes) against privacy and throughput. Keys matching
+/// known credential patterns are redacted from settings audit events
+/// regardless of `settings_values`. Every field can also be set with an
+/// `OPENSHELL_AUDIT_*` environment variable or `--audit-*` CLI flag, which
+/// take precedence over this table.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+// A set of independent operator toggles is exactly what this table is; a
+// state machine would misrepresent it.
+#[allow(clippy::struct_excessive_bools)]
+pub struct GatewayAuditConfig {
+    /// Emit gateway audit events (OCSF Entity Management / Config State
+    /// Change records for state-changing RPCs). On by default; turn off for
+    /// deployments that do not want a governance paper trail.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Also emit an Authentication event for every successfully
+    /// authenticated request, producing a complete authentication ledger.
+    /// Off by default: failures are always emitted, successes multiply
+    /// volume by the request rate.
+    #[serde(default)]
+    pub auth_success_events: bool,
+
+    /// Record the full command line in sandbox exec audit events. When
+    /// `false`, the record carries only the binary name — for deployments
+    /// whose command lines may contain secrets.
+    #[serde(default = "default_true")]
+    pub exec_args: bool,
+
+    /// Record before/after values of changed settings in settings audit
+    /// events. When `false`, only the key names are recorded.
+    #[serde(default = "default_true")]
+    pub settings_values: bool,
+}
+
+impl Default for GatewayAuditConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            auth_success_events: false,
+            exec_args: true,
+            settings_values: true,
+        }
+    }
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 /// One configured gateway interceptor service.
@@ -831,6 +889,7 @@ impl Config {
             tls,
             oidc: None,
             auth: GatewayAuthConfig::default(),
+            audit: GatewayAuditConfig::default(),
             gateway_interceptors: Vec::new(),
             provider_profile_sources: vec![
                 GatewayProviderProfileSourceConfig::Builtin,

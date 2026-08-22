@@ -682,11 +682,21 @@ table.
 
 ### OTLP export
 
+For the end-to-end telemetry pipeline — sandbox emission through fan-in to the
+collector, delivery guarantees, and performance ceilings — see
+[Logging & Observability](logging.md). This section covers the gateway's side
+of it.
+
 The gateway already uses Rust's `tracing` framework for structured log events
 and request-span context consumed by stdout and the sandbox log bus. OTLP export
 adds an OpenTelemetry layer to the same subscriber. That layer turns selected
-`tracing` spans into distributed traces; it does not export log events or
-replace the existing logging paths.
+`tracing` spans into distributed traces without replacing the existing logging
+paths. Log export is separately opt-in (`export_logs`): the log bus taps every
+line the gateway observes — its own events and lines pushed from sandboxes —
+into a bounded queue that a gateway-owned worker (`log_export.rs`) drains,
+converts to OTLP log records, and exports in batches. The worker drives the
+exporter directly rather than through the SDK's batch processor, so every
+batch's outcome is observable.
 
 `[openshell.gateway.otlp]` is the only enablement path for OpenTelemetry
 export: the table's presence is the on-switch, and `OTEL_EXPORTER_OTLP_ENDPOINT`
@@ -711,9 +721,25 @@ external drivers. Each driver exports under its own service name.
 
 Two invariants shape the failure behavior. Telemetry is diagnostic, so no OTLP
 failure stops the gateway from serving: a malformed endpoint is logged at
-startup and disables export. Export is best-effort — the SDK logs runtime
-failures, and a failed batch is dropped rather than retried. Buffered spans
-flush after the server loop exits so `SIGTERM` does not drop in-flight traces.
+startup and disables export. Spans are best-effort — the SDK logs runtime
+failures, and a failed span batch is dropped rather than retried. Log records
+are stronger: never silently lost. A failed log batch retries with bounded
+backoff, and any record the pipeline does drop — queue overflow during a
+collector outage, a batch that exhausts its retries — is counted and reported
+as a synthetic `telemetry_gap` record on the next successful export, mirroring
+the accounting the sandbox push path applies on its hop to the gateway.
+Buffered spans and queued log records flush after the server loop exits so
+`SIGTERM` does not drop in-flight telemetry.
+
+Per-record export cost is dominated by attribute count, not payload bytes, so
+the shape OCSF events arrive in sets the gateway's export ceiling: events
+pushed as one raw JSON field (the default) cost roughly an order of magnitude
+less per record at every stage than events flattened into dotted `ocsf.*`
+attributes (opt-in via `OPENSHELL_OCSF_PUSH_FORMAT=flat`). The `log_fanin` and
+`log_export` benches measure both stages; a sustained stream of
+`telemetry_gap` records in production is the signal that aggregate sandbox
+line rate has passed one gateway's ceiling and it is time to switch shapes or
+add gateways.
 
 ### Package-managed gateway registry
 

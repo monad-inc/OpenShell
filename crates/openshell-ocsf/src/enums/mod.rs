@@ -7,6 +7,7 @@ mod action;
 mod activity;
 mod auth;
 mod disposition;
+mod entity_activity;
 mod http_method;
 mod launch;
 mod security;
@@ -15,8 +16,9 @@ mod status;
 
 pub use action::ActionId;
 pub use activity::ActivityId;
-pub use auth::AuthTypeId;
+pub use auth::{AuthActivityId, AuthProtocolId, AuthTypeId};
 pub use disposition::DispositionId;
+pub use entity_activity::EntityActivityId;
 pub use http_method::HttpMethod;
 pub use launch::LaunchTypeId;
 pub use security::{ConfidenceId, RiskLevelId, SecurityLevelId};
@@ -49,7 +51,10 @@ macro_rules! impl_ocsf_enum {
 
 impl_ocsf_enum!(
     ActionId,
+    AuthActivityId,
+    AuthProtocolId,
     AuthTypeId,
+    EntityActivityId,
     ConfidenceId,
     DispositionId,
     LaunchTypeId,

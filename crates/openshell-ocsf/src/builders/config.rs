@@ -7,6 +7,7 @@ use crate::builders::SandboxContext;
 use crate::enums::{SecurityLevelId, SeverityId, StateId, StatusId};
 use crate::events::base_event::BaseEventData;
 use crate::events::{DeviceConfigStateChangeEvent, OcsfEvent};
+use crate::objects::{Actor, User};
 
 /// Builder for Device Config State Change [5019] events.
 pub struct ConfigStateChangeBuilder<'a> {
@@ -17,6 +18,7 @@ pub struct ConfigStateChangeBuilder<'a> {
     state_label: Option<String>,
     security_level: Option<SecurityLevelId>,
     prev_security_level: Option<SecurityLevelId>,
+    actor: Option<Actor>,
     message: Option<String>,
     unmapped: serde_json::Map<String, serde_json::Value>,
 }
@@ -32,6 +34,7 @@ impl<'a> ConfigStateChangeBuilder<'a> {
             state_label: None,
             security_level: None,
             prev_security_level: None,
+            actor: None,
             message: None,
             unmapped: serde_json::Map::new(),
         }
@@ -53,6 +56,14 @@ impl<'a> ConfigStateChangeBuilder<'a> {
     #[must_use]
     pub fn prev_security_level(mut self, id: SecurityLevelId) -> Self {
         self.prev_security_level = Some(id);
+        self
+    }
+
+    /// Set the authenticated identity performing the change (gateway audit
+    /// events).
+    #[must_use]
+    pub fn actor_user(mut self, user: User) -> Self {
+        self.actor = Some(Actor::from_user(user));
         self
     }
 
@@ -88,6 +99,7 @@ impl<'a> ConfigStateChangeBuilder<'a> {
             state_custom_label: self.state_label,
             security_level: self.security_level,
             prev_security_level: self.prev_security_level,
+            actor: self.actor,
         })
     }
 }
@@ -118,5 +130,32 @@ mod tests {
         assert_eq!(json["state_id"], 2);
         assert_eq!(json["security_level"], "Secure");
         assert_eq!(json["unmapped"]["policy_version"], "v3");
+    }
+
+    #[test]
+    fn config_builder_carries_the_actor_user() {
+        use crate::objects::UserTypeId;
+
+        let ctx = test_sandbox_context();
+        let event = ConfigStateChangeBuilder::new(&ctx)
+            .state(StateId::Enabled, "settings_updated")
+            .status(StatusId::Success)
+            .actor_user(User::new("alice", "oidc|alice-123", UserTypeId::User))
+            .message("global setting updated")
+            .build();
+
+        let json = event.to_json().unwrap();
+        assert_eq!(json["actor"]["user"]["name"], "alice");
+        assert_eq!(json["actor"]["user"]["uid"], "oidc|alice-123");
+        assert!(
+            json["actor"].get("process").is_none(),
+            "user actors serialize without a process"
+        );
+
+        let line = event.format_shorthand();
+        assert_eq!(
+            line,
+            "CONFIG:SETTINGS_UPDATED [INFO] global setting updated by alice"
+        );
     }
 }

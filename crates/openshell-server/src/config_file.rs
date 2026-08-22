@@ -29,7 +29,7 @@ use base64::Engine as _;
 use openshell_core::config::ComputeDriverKind;
 use openshell_core::proto::SupervisorMiddlewareService;
 use openshell_core::{
-    GatewayAuthConfig, GatewayInterceptorConfig, GatewayJwtConfig,
+    GatewayAuditConfig, GatewayAuthConfig, GatewayInterceptorConfig, GatewayJwtConfig,
     GatewayProviderProfileSourceConfig, MtlsAuthConfig, OidcConfig, TlsConfig,
 };
 use serde::{Deserialize, Serialize};
@@ -170,6 +170,8 @@ pub struct GatewayFileSection {
     #[serde(default)]
     pub auth: Option<GatewayAuthConfig>,
     #[serde(default)]
+    pub audit: Option<GatewayAuditConfig>,
+    #[serde(default)]
     pub interceptors: Vec<GatewayInterceptorConfig>,
     #[serde(default)]
     pub provider_profile_sources: Option<Vec<GatewayProviderProfileSourceConfig>>,
@@ -191,7 +193,8 @@ pub struct GatewayFileSection {
 
 /// `[openshell.gateway.otlp]` section.
 ///
-/// Presence of this table enables OTLP export; there is no `enabled` flag.
+/// Presence of this table enables OTLP **trace** export; there is no `enabled`
+/// flag. Log export is opt-in on top of the same endpoint via `export_logs`.
 /// SDK tuning knobs are deliberately absent — see [`crate::otel_tracing`] for what
 /// this table owns and what the `OTEL_*` environment variables own.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -204,6 +207,27 @@ pub struct OtlpConfig {
     /// `service.name` resource attribute. Defaults to `openshell-gateway`.
     #[serde(default)]
     pub service_name: Option<String>,
+
+    /// Export aggregated sandbox and gateway logs (including OCSF events) as
+    /// OTLP log records to `endpoint`, in addition to traces.
+    ///
+    /// Off by default: enabling it turns the gateway into the single egress
+    /// point for all sandbox log telemetry. Delivery is at-least-once — records
+    /// are held in a bounded in-memory queue and only released after the
+    /// collector accepts them. When the queue is saturated the sandbox side
+    /// blocks briefly and then records an accounted `telemetry_gap`, so loss is
+    /// never silent.
+    #[serde(default)]
+    pub export_logs: bool,
+
+    /// Carry the full structured OCSF payload on exported log records rather
+    /// than only the human-readable shorthand.
+    ///
+    /// Off by default because it increases per-record size and serialization
+    /// cost. Enable it when the downstream collector or SIEM consumes the OCSF
+    /// schema directly. Has no effect unless `export_logs` is set.
+    #[serde(default)]
+    pub ocsf_full_payload: bool,
 }
 
 /// `[openshell.supervisor]` section.
@@ -631,6 +655,24 @@ service_name = "openshell-gateway-dev"
             "http://otel-collector.observability.svc:4317"
         );
         assert_eq!(otlp.service_name.as_deref(), Some("openshell-gateway-dev"));
+        // Log export and full OCSF payload are opt-in and default off.
+        assert!(!otlp.export_logs);
+        assert!(!otlp.ocsf_full_payload);
+    }
+
+    #[test]
+    fn parses_gateway_otlp_log_export_flags() {
+        let toml = r#"
+[openshell.gateway.otlp]
+endpoint = "http://otel-collector.observability.svc:4317"
+export_logs = true
+ocsf_full_payload = true
+"#;
+        let tmp = write_tmp(toml);
+        let file = load(tmp.path()).expect("valid otlp config parses");
+        let otlp = file.openshell.gateway.otlp.expect("otlp config");
+        assert!(otlp.export_logs);
+        assert!(otlp.ocsf_full_payload);
     }
 
     #[test]
@@ -696,6 +738,59 @@ allow_unauthenticated_users = true
         let file = load(tmp.path()).expect("valid auth config parses");
         let auth = file.openshell.gateway.auth.expect("auth config");
         assert!(auth.allow_unauthenticated_users);
+    }
+
+    #[test]
+    fn parses_gateway_audit_config_with_defaults() {
+        let toml = r"
+[openshell.gateway.audit]
+auth_success_events = true
+";
+        let tmp = write_tmp(toml);
+        let file = load(tmp.path()).expect("valid audit config parses");
+        let audit = file.openshell.gateway.audit.expect("audit config");
+        assert!(audit.enabled, "enabled defaults to true");
+        assert!(audit.auth_success_events);
+        assert!(audit.exec_args, "exec_args defaults to true");
+        assert!(audit.settings_values, "settings_values defaults to true");
+    }
+
+    #[test]
+    fn audit_config_can_disable_audit_events() {
+        let tmp = write_tmp(
+            r"
+[openshell.gateway.audit]
+enabled = false
+",
+        );
+        let file = load(tmp.path()).expect("valid audit config parses");
+        assert!(!file.openshell.gateway.audit.expect("audit config").enabled);
+    }
+
+    #[test]
+    fn audit_config_defaults_match_the_absent_table() {
+        let tmp = write_tmp("[openshell.gateway]\n");
+        let file = load(tmp.path()).expect("empty gateway table parses");
+        assert!(file.openshell.gateway.audit.is_none());
+        let defaults = GatewayAuditConfig::default();
+        assert!(defaults.enabled);
+        assert!(!defaults.auth_success_events);
+        assert!(defaults.exec_args);
+        assert!(defaults.settings_values);
+    }
+
+    #[test]
+    fn rejects_unknown_audit_config_keys() {
+        let tmp = write_tmp(
+            r"
+[openshell.gateway.audit]
+log_secrets = true
+",
+        );
+        assert!(
+            load(tmp.path()).is_err(),
+            "unknown audit keys must fail TOML validation"
+        );
     }
 
     #[test]

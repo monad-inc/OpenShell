@@ -1512,6 +1512,7 @@ pub fn spawn_refresh_worker(state: std::sync::Arc<crate::ServerState>, interval:
                 state.store.as_ref(),
                 Some(&state.credentials),
                 Some(&state.compute),
+                &state.config.audit,
             )
             .await
             {
@@ -1534,6 +1535,7 @@ async fn run_refresh_worker_tick(
     store: &Store,
     credentials: Option<&crate::credentials::CredentialRuntime>,
     compute: Option<&crate::compute::ComputeRuntime>,
+    audit: &openshell_core::GatewayAuditConfig,
 ) -> Result<(), Status> {
     let now_ms = current_time_ms();
     let states = list_all_refresh_states(store).await.inspect_err(|_| {
@@ -1648,7 +1650,7 @@ async fn run_refresh_worker_tick(
             status = %state.status,
             "refreshing provider credential"
         );
-        if let Err(err) = refresh_provider_credential(
+        let result = refresh_provider_credential(
             store,
             state.object_workspace(),
             credentials,
@@ -1656,8 +1658,8 @@ async fn run_refresh_worker_tick(
             &state.provider_name,
             &state.credential_key,
         )
-        .await
-        {
+        .await;
+        if let Err(err) = &result {
             warn!(
                 provider = %state.provider_name,
                 credential_key = %state.credential_key,
@@ -1668,6 +1670,45 @@ async fn run_refresh_worker_tick(
                 "provider credential refresh failed"
             );
         }
+        // The same rotation performed via RotateProviderCredential is
+        // audited with the caller as actor; the timer-driven path must be
+        // just as visible. Identity fields only — never key material.
+        let target = format!("{}/{}", state.provider_name, state.credential_key);
+        crate::audit::emit_system_entity(
+            audit,
+            result.is_ok(),
+            crate::audit::SystemEntityOutcome {
+                activity: openshell_ocsf::enums::EntityActivityId::Update,
+                entity: openshell_ocsf::objects::ManagedEntity::new("credential", target.clone()),
+                sandbox: None,
+                component: "provider-refresh",
+                success_message: format!("credential auto-rotated for {target}"),
+                failure_message: format!("credential auto-rotate for {target} failed"),
+                unmapped: vec![
+                    ("operation", serde_json::Value::from("auto_rotate")),
+                    (
+                        "workspace",
+                        serde_json::Value::from(state.object_workspace().to_string()),
+                    ),
+                    (
+                        "provider",
+                        serde_json::Value::from(state.provider_name.clone()),
+                    ),
+                    (
+                        "credential_key",
+                        serde_json::Value::from(state.credential_key.clone()),
+                    ),
+                    (
+                        "trigger",
+                        serde_json::Value::from(if rotation_requested {
+                            "rotation_requested"
+                        } else {
+                            "scheduled"
+                        }),
+                    ),
+                ],
+            },
+        );
     }
     Ok(())
 }
@@ -2558,7 +2599,14 @@ mod tests {
         .unwrap();
         put_refresh_state(&store, &state).await.unwrap();
 
-        run_refresh_worker_tick(&store, None, None).await.unwrap();
+        run_refresh_worker_tick(
+            &store,
+            None,
+            None,
+            &openshell_core::GatewayAuditConfig::default(),
+        )
+        .await
+        .unwrap();
 
         let stored_state = get_refresh_state(
             &store,
@@ -2622,9 +2670,14 @@ mod tests {
         put_refresh_state(&store, &state).await.unwrap();
         assert_eq!(credentials.stored_credential_count(), Some(1));
 
-        run_refresh_worker_tick(&store, Some(&credentials), None)
-            .await
-            .unwrap();
+        run_refresh_worker_tick(
+            &store,
+            Some(&credentials),
+            None,
+            &openshell_core::GatewayAuditConfig::default(),
+        )
+        .await
+        .unwrap();
 
         assert!(
             get_refresh_state(
@@ -2650,7 +2703,14 @@ mod tests {
         let store = test_store().await;
 
         let traced = test_exporter::install_traced();
-        run_refresh_worker_tick(&store, None, None).await.unwrap();
+        run_refresh_worker_tick(
+            &store,
+            None,
+            None,
+            &openshell_core::GatewayAuditConfig::default(),
+        )
+        .await
+        .unwrap();
 
         let spans = traced.finished_spans();
         let root = spans

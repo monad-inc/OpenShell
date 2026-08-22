@@ -21,8 +21,21 @@ navigation:
   title: "Providers"
 - folder: extensibility
   title: "Extensibility"
-- folder: observability
-  title: "Observability"
+- section: "Observability"
+  slug: observability
+  contents:
+  - page: "Logging"
+    path: observability/logging.mdx
+  - page: "Accessing Logs"
+    path: observability/accessing-logs.mdx
+  - page: "OCSF JSON Export"
+    path: observability/ocsf-json-export.mdx
+  - page: "Gateway Audit"
+    path: observability/gateway-audit.mdx
+  - page: "Audit Toggles"
+    path: observability/audit-configuration.mdx
+  - page: "Audit Event Reference"
+    path: observability/audit-event-reference.mdx
 - folder: kubernetes
   title: "Kubernetes"
 - folder: reference

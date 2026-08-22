@@ -218,6 +218,10 @@ add `ci/values-spire.yaml` to the OpenShell release values files.
 | securityContext.runAsNonRoot | bool | `true` | Require the gateway container to run as a non-root user. |
 | securityContext.runAsUser | int | `1000` | UID assigned to the gateway container. |
 | server.appArmorProfile | string | `"Unconfined"` | Kubernetes AppArmor profile requested for sandbox agent containers. Default Unconfined avoids runtime/default AppArmor blocking the supervisor's network namespace mount setup on AppArmor-enabled nodes. Set to "" to omit the field, "RuntimeDefault" to force the runtime default profile, or "Localhost/profile-name" for an operator-managed localhost profile. |
+| server.audit.authSuccessEvents | bool | `false` | Also emit an Authentication event for every successfully authenticated request, producing a complete authentication ledger. Failures are always emitted; successes multiply volume by request rate. |
+| server.audit.enabled | bool | `true` | Emit gateway audit events (OCSF records for state-changing RPCs, carrying the authenticated principal). On by default; set false for deployments that do not want a governance paper trail. |
+| server.audit.execArgs | bool | `true` | Record the full command line in sandbox exec audit events. Set false for deployments whose command lines may carry secrets; records then carry only the binary name. |
+| server.audit.settingsValues | bool | `true` | Record before/after values of changed settings in settings audit events. Set false to record key names only. Keys matching credential patterns are always redacted regardless of this toggle. |
 | server.auth.allowUnauthenticatedUsers | bool | `false` | UNSAFE: accept unauthenticated CLI/user requests as a local developer principal. Intended only for trusted local Skaffold/k3d development or a fully trusted fronting proxy. Leave false for shared or production clusters. |
 | server.credentialDrivers.kubernetesSecrets.allowReferenceNamespace | bool | `false` | Deprecated compatibility field. Credential storage no longer supports user-authored namespace references. |
 | server.credentialDrivers.kubernetesSecrets.enabled | bool | `false` | Enable the in-tree Kubernetes Secret credential driver. WARNING: The RBAC Role grants read/write access to ALL Secrets in the configured namespace. Use a dedicated namespace to limit blast radius. |
@@ -256,6 +260,10 @@ add `ci/values-spire.yaml` to the OpenShell release values files.
 | server.oidc.rolesClaim | string | `""` | Dot-separated path to the roles array in the JWT claims. Keycloak: "realm_access.roles", Entra ID: "roles", Okta: "groups". |
 | server.oidc.scopesClaim | string | `""` | Dot-separated path to the scopes array in the JWT claims. |
 | server.oidc.userRole | string | `""` | Role name for standard user access. |
+| server.otlp.endpoint | string | `""` | OTLP/gRPC collector endpoint (e.g. http://otel-collector.observability.svc:4317). Empty disables all OpenTelemetry export. |
+| server.otlp.exportLogs | bool | `false` | Also export the gateway's aggregated logs and OCSF security events as OTLP log records, in addition to traces. Requires endpoint. |
+| server.otlp.ocsfFullPayload | bool | `false` | Carry structured OCSF fields on exported log records rather than only the human-readable summary. No effect unless exportLogs is true. |
+| server.otlp.serviceName | string | `""` | `service.name` resource attribute. Empty defaults to "openshell-gateway". |
 | server.policyValidationFailureMode | string | `"fail_closed"` | Posture when a candidate sandbox policy fails validation. `fail_closed` deactivates the previous policy; `retain_last_valid` keeps it active. |
 | server.providerTokenGrants.spiffe.enabled | bool | `false` | Mount the SPIFFE Workload API socket into sandbox pods for dynamic provider token grants. |
 | server.providerTokenGrants.spiffe.workloadApiSocketPath | string | `"/spiffe-workload-api/spire-agent.sock"` | Path to the SPIFFE Workload API socket mounted into sandbox pods. |

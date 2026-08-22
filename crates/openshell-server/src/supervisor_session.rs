@@ -358,7 +358,15 @@ impl SupervisorSessionRegistry {
         &self,
         channel_id: &str,
         principal: Option<&Principal>,
+        audit: Option<&openshell_core::GatewayAuditConfig>,
     ) -> Result<ClaimedRelay, Status> {
+        // The registry has no config of its own; callers with server state
+        // supply the audit toggles so scope denials can dual-emit findings.
+        let default_audit = openshell_core::GatewayAuditConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        let audit = audit.unwrap_or(&default_audit);
         let pending = {
             let mut map = self.pending_relays.lock().unwrap();
             let pending = map
@@ -369,6 +377,7 @@ impl SupervisorSessionRegistry {
                 && let Err(status) = crate::auth::guard::ensure_sandbox_principal_scope(
                     principal,
                     &pending.sandbox_id,
+                    audit,
                 )
             {
                 info!(
@@ -487,6 +496,12 @@ type RelayStreamResponse = Response<
 /// pending relay; subsequent frames carry raw bytes forward to the
 /// gateway-side waiter. Bytes flowing the other way are chunked and sent as
 /// `RelayFrame::data` messages back over the response stream.
+///
+/// **Test/embedding harness only**: this stateless variant runs with audit
+/// findings disabled (no `GatewayAuditConfig` in reach), so cross-sandbox
+/// claim denials are not escalated as Detection Findings. Production traffic
+/// must go through [`handle_relay_stream_for_state`], which the gateway's
+/// gRPC service uses.
 pub async fn handle_relay_stream(
     registry: &SupervisorSessionRegistry,
     request: Request<tonic::Streaming<RelayFrame>>,
@@ -528,7 +543,11 @@ async fn handle_relay_stream_inner(
     };
 
     // Claim the pending relay. Consumes the entry — it cannot be reused.
-    let claimed = registry.claim_relay(&channel_id, principal.as_ref())?;
+    let claimed = registry.claim_relay(
+        &channel_id,
+        principal.as_ref(),
+        state.as_ref().map(|s| &s.config.audit),
+    )?;
     let sandbox_id = claimed.sandbox_id;
     let supervisor_side = claimed.stream;
     info!(channel_id = %channel_id, sandbox_id = %sandbox_id, "relay stream: claimed pending relay, bridging");
@@ -702,7 +721,11 @@ pub async fn handle_connect_supervisor(
         return Err(Status::invalid_argument("sandbox_id is required"));
     }
     if let Some(principal) = principal.as_ref() {
-        crate::auth::guard::ensure_sandbox_principal_scope(principal, &sandbox_id)?;
+        crate::auth::guard::ensure_sandbox_principal_scope(
+            principal,
+            &sandbox_id,
+            &state.config.audit,
+        )?;
     }
     require_persisted_sandbox(&state.store, &sandbox_id).await?;
 
@@ -829,7 +852,11 @@ pub async fn handle_report_main_process_exit(
         return Err(Status::invalid_argument("instance_id is required"));
     }
     if let Some(principal) = principal.as_ref() {
-        crate::auth::guard::ensure_sandbox_principal_scope(principal, &report.sandbox_id)?;
+        crate::auth::guard::ensure_sandbox_principal_scope(
+            principal,
+            &report.sandbox_id,
+            &state.config.audit,
+        )?;
     }
     state
         .compute
@@ -1478,7 +1505,7 @@ mod tests {
         let registry = SupervisorSessionRegistry::new();
         let principal = sandbox_principal("sbx-test");
         let err = registry
-            .claim_relay("nonexistent", Some(&principal))
+            .claim_relay("nonexistent", Some(&principal), None)
             .expect_err("should err");
         assert_eq!(err.code(), tonic::Code::NotFound);
     }
@@ -1493,7 +1520,7 @@ mod tests {
         );
 
         let principal = sandbox_principal("sbx-test");
-        let result = registry.claim_relay("ch-1", Some(&principal));
+        let result = registry.claim_relay("ch-1", Some(&principal), None);
         assert!(result.is_ok());
         assert!(!registry.pending_relays.lock().unwrap().contains_key("ch-1"));
     }
@@ -1509,7 +1536,7 @@ mod tests {
 
         let attacker = sandbox_principal("sbx-attacker");
         let err = registry
-            .claim_relay("ch-cross", Some(&attacker))
+            .claim_relay("ch-cross", Some(&attacker), None)
             .expect_err("cross-sandbox relay claim must fail");
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
         assert!(
@@ -1532,7 +1559,7 @@ mod tests {
         );
 
         let err = registry
-            .claim_relay("ch-user", Some(&user_principal("alice")))
+            .claim_relay("ch-user", Some(&user_principal("alice")), None)
             .expect_err("users are not supervisor identities");
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
     }
@@ -1577,7 +1604,7 @@ mod tests {
         );
 
         let err = registry
-            .claim_relay("ch-old", Some(&sandbox_principal("sbx-test")))
+            .claim_relay("ch-old", Some(&sandbox_principal("sbx-test")), None)
             .expect_err("expired entry must fail");
         assert_eq!(err.code(), tonic::Code::DeadlineExceeded);
         // Entry must have been consumed regardless.
@@ -1601,7 +1628,7 @@ mod tests {
         );
 
         let err = registry
-            .claim_relay("ch-1", Some(&sandbox_principal("sbx-test")))
+            .claim_relay("ch-1", Some(&sandbox_principal("sbx-test")), None)
             .expect_err("should err when receiver is gone");
         assert_eq!(err.code(), tonic::Code::Internal);
     }
@@ -1616,7 +1643,7 @@ mod tests {
         );
 
         let mut supervisor_side = registry
-            .claim_relay("ch-io", Some(&sandbox_principal("sbx-test")))
+            .claim_relay("ch-io", Some(&sandbox_principal("sbx-test")), None)
             .expect("claim should succeed")
             .stream;
         let mut gateway_side = relay_rx

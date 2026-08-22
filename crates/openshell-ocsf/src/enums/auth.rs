@@ -77,3 +77,65 @@ mod tests {
         assert_eq!(deserialized, AuthTypeId::Other);
     }
 }
+
+/// OCSF Authentication [3002] activity ids.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize_repr, Deserialize_repr)]
+#[repr(u8)]
+pub enum AuthActivityId {
+    /// 0 — Unknown
+    Unknown = 0,
+    /// 1 — Logon
+    Logon = 1,
+    /// 2 — Logoff
+    Logoff = 2,
+    /// 99 — Other
+    Other = 99,
+}
+
+impl AuthActivityId {
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unknown => "Unknown",
+            Self::Logon => "Logon",
+            Self::Logoff => "Logoff",
+            Self::Other => "Other",
+        }
+    }
+
+    #[must_use]
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+}
+
+/// OCSF Auth Protocol ID for Authentication [3002] events.
+///
+/// Only the values the gateway can produce are represented; the rest of the
+/// OCSF vocabulary is unused here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize_repr, Deserialize_repr)]
+#[repr(u8)]
+pub enum AuthProtocolId {
+    /// 0 — Unknown
+    Unknown = 0,
+    /// 4 — `OpenID` (OIDC bearer tokens)
+    OpenId = 4,
+    /// 99 — Other (mTLS client certificates, gateway-minted sandbox JWTs)
+    Other = 99,
+}
+
+impl AuthProtocolId {
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unknown => "Unknown",
+            Self::OpenId => "OpenID",
+            Self::Other => "Other",
+        }
+    }
+
+    #[must_use]
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+}
