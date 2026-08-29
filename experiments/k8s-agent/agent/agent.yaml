@@ -1,0 +1,97 @@
+# SPDX-License-Identifier: Apache-2.0
+
+id: repo-watcher
+payload_version: 1
+display_name: Repo Watcher Agent
+description: Watch Slack channels for requests, act on one GitHub repository, and open PRs.
+
+sandbox:
+  name_prefix: watcher
+  # Local Dockerfile source: the launcher bakes the rendered payload into the
+  # image, so agent guts stay immutable and read-only at runtime.
+  from: agent://.
+  gateway: kind-experiments
+  background_log_dir: logs
+
+harness:
+  default: claude
+  supported:
+    claude:
+      model: claude-opus-5
+
+runtime:
+  mode: watch
+  poll_interval_seconds: 900
+  max_transient_failures: 5
+
+profile_paths:
+  - providers
+
+settings:
+  - key: providers_v2_enabled
+    value: true
+
+providers:
+  # Single-repo GitHub access, including the push + PR surface the builtin
+  # `github` profile deliberately withholds.
+  - id: github-watcher
+    name: github-watcher
+    profile: github-watcher
+    credential_mode: explicit
+    credentials:
+      - env: GITHUB_TOKEN
+        source:
+          kind: host_command
+          command: gh auth token
+        export: true
+
+  # Read-only Slack.
+  - id: slack-reader
+    name: slack-reader
+    profile: slack-reader
+    credential_mode: explicit
+    credentials:
+      - env: SLACK_BOT_TOKEN
+        source:
+          # `env` is not a supported source kind; the launcher understands
+          # host_command, file_json, and value. printenv keeps the secret in
+          # the launcher's environment (or a K8s Secret) and out of this file.
+          kind: host_command
+          command: printenv SLACK_BOT_TOKEN
+        export: true
+
+  # Claude Code, API-key billing. This is the `api-key` variant; to run the
+  # OAuth variant instead, comment this block out and uncomment the one below.
+  # The harness adapter refuses to start with both attached.
+  - id: claude-code
+    name: claude-code
+    profile: claude-code
+    harness: claude
+    credential_mode: explicit
+    credentials:
+      - env: ANTHROPIC_API_KEY
+        source:
+          kind: host_command
+          command: printenv ANTHROPIC_API_KEY
+        export: true
+
+  # Claude Code, subscription OAuth billing.
+  # - id: claude-code-oauth
+  #   name: claude-code-oauth
+  #   profile: claude-code-oauth
+  #   harness: claude
+  #   credential_mode: explicit
+  #   credentials:
+  #     - env: CLAUDE_CODE_OAUTH_TOKEN
+  #       source:
+  #         kind: host_command
+  #         command: printenv CLAUDE_CODE_OAUTH_TOKEN
+  #       export: true
+
+resources:
+  # Baked into the immutable payload; the agent reads this to learn its scope.
+  - id: watch-config
+    source: agent://watch-config.yaml
+    destination: watch-config.yaml
+
+prompt_template: prompts/watcher.md

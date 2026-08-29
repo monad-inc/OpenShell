@@ -1,0 +1,40 @@
+# SPDX-License-Identifier: Apache-2.0
+
+# Claude Code via an Anthropic API key.
+#
+# This exists instead of the builtin `claude-code` profile because of the
+# `binaries:` list. The builtin pins /usr/bin/claude and /usr/local/bin/claude,
+# but an npm global install puts the real executable at
+# /usr/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe and leaves
+# /usr/bin/claude as a symlink to it. With require_binary_identity enabled the
+# sandbox judges the resolved executable, so the builtin profile yields:
+#
+#   NET:OPEN [MED] DENIED .../claude-code/bin/claude.exe(70) -> api.anthropic.com:443
+#     [reason:network connections not allowed by policy]
+#
+# Listing the real path fixes it. Keep this list in sync with the image whenever
+# the Claude Code install method changes.
+id: claude-code-apikey
+display_name: Claude Code (API key)
+description: Claude Code CLI authenticated with an Anthropic API key, with npm-install binary paths
+category: agent
+inference_capable: true
+credentials:
+  - name: api_key
+    description: Anthropic API key used by Claude Code
+    env_vars: [ANTHROPIC_API_KEY, CLAUDE_API_KEY]
+    required: true
+    auth_style: header
+    header_name: x-api-key
+discovery:
+  credentials: [api_key]
+endpoints:
+  - host: api.anthropic.com
+    port: 443
+    protocol: rest
+    access: read-write
+    enforcement: enforce
+binaries:
+  - /usr/bin/claude
+  - /usr/local/bin/claude
+  - /usr/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe

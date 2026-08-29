@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: Apache-2.0
+
+# OpenShell gateway values for the local `kind-kind` experiments cluster.
+#
+# Scope: namespace `openshell-experiments` on the shared local kind cluster.
+# NOT production settings — TLS and user auth are both disabled because access
+# is via `kubectl port-forward` from the operator's workstation only.
+
+image:
+  # Chart appVersion is 0.0.0 (dev placeholder); pin an actually-published tag.
+  tag: "latest"
+  pullPolicy: IfNotPresent
+
+workload:
+  kind: statefulset
+replicaCount: 1
+
+supervisor:
+  image:
+    pullPolicy: IfNotPresent
+  # K8s 1.35 on this cluster => auto-detect selects image-volume. Pinned for clarity.
+  sideloadMethod: "image-volume"
+
+server:
+  logLevel: info
+  # Sandbox pods land in the release namespace.
+  sandboxNamespace: ""
+  # Local-only: plaintext gRPC over a port-forward.
+  disableTls: true
+  auth:
+    allowUnauthenticatedUsers: true
+  telemetryEnabled: false
+  sandboxImagePullPolicy: IfNotPresent
+
+# Must stay enabled even with disableTls=true: the certgen pre-install hook is
+# gated on `pkiInitJob.enabled || certManager.enabled` and creates the sandbox
+# JWT signing secret (openshell-jwt-keys) in addition to the PKI material. The
+# StatefulSet mounts that secret unconditionally, so disabling this job wedges
+# the gateway pod in ContainerCreating with a FailedMount on `sandbox-jwt`.
+pkiInitJob:
+  enabled: true

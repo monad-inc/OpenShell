@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: openshell-experiments
+  labels:
+    app.kubernetes.io/part-of: openshell-experiments
+    # Marks this as scratch space on a shared cluster. Nothing here is
+    # production, and the namespace is safe to delete wholesale.
+    monad.com/environment: experiment

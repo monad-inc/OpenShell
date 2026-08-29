@@ -1,0 +1,63 @@
+# SPDX-License-Identifier: Apache-2.0
+
+# GitHub access for the repo-watcher agent, narrowed to a single repository.
+#
+# The builtin `github` profile is read-only on api.github.com and denies
+# git-receive-pack, so it cannot open a PR. This profile grants the smallest
+# superset that can: read one repo, push branches under that repo, and open and
+# comment on PRs there. Every rule is pinned to monad-inc/OpenShell — a token
+# with broader scope still cannot reach another repo through this profile.
+id: github-watcher
+display_name: GitHub (repo-watcher)
+description: Single-repository read + PR-authoring access for the repo-watcher agent
+category: source_control
+credentials:
+  - name: api_token
+    description: GitHub token scoped to the watched repository
+    env_vars: [GITHUB_TOKEN, GH_TOKEN]
+    required: true
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [api_token]
+endpoints:
+  # REST surface, pinned to the one repo.
+  - host: api.github.com
+    port: 443
+    protocol: rest
+    enforcement: enforce
+    rules:
+      # gh CLI auth preflight (`gh api user`).
+      - allow: { method: GET, path: "/user" }
+      # Read anything within the watched repo. Both forms are needed: `/**`
+      # requires at least one further segment, so it matches
+      # /repos/monad-inc/OpenShell/pulls but NOT the bare /repos/monad-inc/OpenShell.
+      # Verified: with only the `/**` rule, `gh api repos/monad-inc/OpenShell`
+      # returns HTTP 403 from the proxy.
+      - allow: { method: GET, path: "/repos/monad-inc/OpenShell" }
+      - allow: { method: HEAD, path: "/repos/monad-inc/OpenShell" }
+      - allow: { method: GET, path: "/repos/monad-inc/OpenShell/**" }
+      - allow: { method: HEAD, path: "/repos/monad-inc/OpenShell/**" }
+      # Open a pull request and follow up on it.
+      - allow: { method: POST, path: "/repos/monad-inc/OpenShell/pulls" }
+      - allow: { method: POST, path: "/repos/monad-inc/OpenShell/pulls/**" }
+      - allow: { method: POST, path: "/repos/monad-inc/OpenShell/issues/**" }
+      # Maintain the durable state issue.
+      - allow: { method: PATCH, path: "/repos/monad-inc/OpenShell/issues/**" }
+      # Create the agent's own branches.
+      - allow: { method: POST, path: "/repos/monad-inc/OpenShell/git/refs" }
+      - allow: { method: PATCH, path: "/repos/monad-inc/OpenShell/git/refs/**" }
+  # Git smart-HTTP transport, pinned to the one repo. Unlike the builtin
+  # profile this allows git-receive-pack, because the agent's whole job is to
+  # push a branch and open a PR from it.
+  - host: github.com
+    port: 443
+    protocol: rest
+    enforcement: enforce
+    rules:
+      - allow: { method: GET, path: "/monad-inc/OpenShell/**" }
+      - allow: { method: HEAD, path: "/monad-inc/OpenShell/**" }
+      - allow: { method: OPTIONS, path: "/monad-inc/OpenShell/**" }
+      - allow: { method: POST, path: "/monad-inc/OpenShell/git-upload-pack" }
+      - allow: { method: POST, path: "/monad-inc/OpenShell/git-receive-pack" }
+binaries: [/usr/bin/gh, /usr/local/bin/gh, /usr/bin/git, /usr/local/bin/git]

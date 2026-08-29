@@ -1,0 +1,40 @@
+# SPDX-License-Identifier: Apache-2.0
+
+# Read-only Slack access for the repo-watcher agent.
+#
+# Enforcement is belt-and-braces: the bot token should carry only
+# channels:history / groups:history / channels:read, and this profile
+# additionally allows only the read methods on the wire. The agent cannot post
+# to Slack even if handed a token that could.
+id: slack-reader
+display_name: Slack (read-only)
+description: Read-only Slack Web API access for watching channels
+category: messaging
+credentials:
+  - name: bot_token
+    description: Slack bot token (xoxb-) with read-only history scopes
+    env_vars: [SLACK_BOT_TOKEN]
+    required: true
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [bot_token]
+endpoints:
+  - host: slack.com
+    port: 443
+    protocol: rest
+    enforcement: enforce
+    rules:
+      # Token/identity preflight.
+      - allow: { method: GET, path: "/api/auth.test" }
+      - allow: { method: POST, path: "/api/auth.test" }
+      # Channel discovery and reading.
+      - allow: { method: GET, path: "/api/conversations.list" }
+      - allow: { method: GET, path: "/api/conversations.info" }
+      - allow: { method: GET, path: "/api/conversations.history" }
+      - allow: { method: GET, path: "/api/conversations.replies" }
+      # Resolving author display names on messages the agent reads.
+      - allow: { method: GET, path: "/api/users.info" }
+      # Note: no chat.postMessage, chat.update, files.*, or admin.* rule
+      # exists here, so those calls are denied at the proxy.
+binaries: [/usr/bin/curl, /usr/local/bin/curl]
