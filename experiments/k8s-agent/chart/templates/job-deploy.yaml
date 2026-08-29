@@ -2,6 +2,13 @@
 {{- if not (or .Values.credentials.existingSecret .Values.credentials.create) }}
 {{- fail "set credentials.existingSecret, or credentials.create=true with inline values" }}
 {{- end }}
+{{- $ws := default .Values.agent.name .Values.agent.workspace }}
+{{- if gt (len $ws) 19 }}
+{{- fail (printf "agent.workspace %q exceeds the gateway's 19-character limit; set agent.workspace explicitly" $ws) }}
+{{- end }}
+{{- if not (regexMatch "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$" $ws) }}
+{{- fail (printf "agent.workspace %q must be a DNS-1123 label" $ws) }}
+{{- end }}
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -41,6 +48,14 @@ spec:
               value: {{ .Values.agent.image | quote }}
             - name: SANDBOX_NAME
               value: {{ .Values.agent.name | quote }}
+            - name: WORKSPACE
+              value: {{ default .Values.agent.name .Values.agent.workspace | quote }}
+            - name: GIT_SHA
+              value: {{ default "unknown" .Values.provenance.gitSha | quote }}
+            - name: CHART_VERSION
+              value: {{ .Chart.Version | quote }}
+            - name: SKILLS_VERSION
+              value: {{ default "unknown" .Values.provenance.skillsVersion | quote }}
             - name: RUN_MODE
               value: {{ .Values.agent.runMode | quote }}
             - name: POLL_INTERVAL_SECONDS

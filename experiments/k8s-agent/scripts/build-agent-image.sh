@@ -93,16 +93,37 @@ template_path = resolve.call(manifest.fetch("prompt_template"))
 rendered = File.read(template_path).gsub(/\{\{([A-Z0-9_]+)\}\}/) { values.fetch(Regexp.last_match(1)) }
 File.write(File.join(payload_dir, "agent-prompt.md"), rendered)
 
-(manifest["resources"] || []).each do |resource|
-  src = resolve.call(resource.fetch("source"))
-  dst = File.join(payload_dir, resource.fetch("destination"))
-  require "fileutils"
-  FileUtils.mkdir_p(File.dirname(dst))
-  FileUtils.cp(src, dst)
+# Same three manifest sections run.sh copies into the payload. Skills were
+# previously ignored here, which meant a manifest could declare a skill that
+# silently never reached the image.
+require "fileutils"
+%w[skills subagents resources].each do |section|
+  (manifest[section] || []).each do |entry|
+    src = resolve.call(entry.fetch("source"))
+    dst = File.join(payload_dir, entry.fetch("destination"))
+    abort "missing #{section} source: #{src}" unless File.exist?(src)
+    FileUtils.mkdir_p(File.dirname(dst))
+    FileUtils.cp(src, dst)
+  end
 end
 
+skill_ids = (manifest["skills"] || []).map { |e| e.fetch("id") }
 puts "harness=#{harness} run_mode=#{run_mode} poll=#{poll_interval}s payload_version=#{payload_version}"
+puts "skills=#{skill_ids.empty? ? '(none)' : skill_ids.join(',')}"
 RUBY
+
+# Content digest over the staged skills. This is the version identity for the
+# part of the agent that changes most often: it moves when a skill's bytes move
+# and not otherwise, so it is a truthful answer to "which skills is this agent
+# running?" and it is comparable against git.
+if [[ -d "$PAYLOAD/skills" ]]; then
+    SKILLS_VERSION="$(find "$PAYLOAD/skills" -type f -exec sha256sum {} + \
+        | sort -k2 | sha256sum | cut -c1-12)"
+else
+    SKILLS_VERSION="none"
+fi
+log "Skills version: $SKILLS_VERSION"
+printf '%s\n' "$SKILLS_VERSION" > "$PAYLOAD/skills-version"
 
 log "Staging build context."
 tar -C "$AGENT_DIR" --exclude './logs' -cf - . | tar -C "$STAGE" -xf -
@@ -121,12 +142,14 @@ File.open(dockerfile_path, "a") do |file|
   file.puts "COPY openshell-agent-payload/ #{payload_image_dir}/"
   file.puts "RUN chmod -R a+rX #{payload_image_dir}"
   file.puts "RUN chmod -R a-w #{payload_image_dir}"
+  file.puts "ARG SKILLS_VERSION=unknown"
+  file.puts "LABEL com.monad.openshell.skills-version=$SKILLS_VERSION"
   file.puts final_user if final_user
 end
 RUBY
 
 log "Building $IMAGE_REF"
-docker build -t "$IMAGE_REF" "$STAGE"
+docker build --build-arg "SKILLS_VERSION=$SKILLS_VERSION" -t "$IMAGE_REF" "$STAGE"
 
 if [[ "$PUSH" == "1" ]]; then
     log "Pushing $IMAGE_REF"
@@ -137,4 +160,5 @@ else
     kind load docker-image "$IMAGE_REF" --name "$KIND_CLUSTER"
 fi
 
-log "Done: $IMAGE_REF"
+log "Done: $IMAGE_REF (skills-version=$SKILLS_VERSION)"
+printf '%s\n' "$SKILLS_VERSION" > "${SKILLS_VERSION_FILE:-/dev/null}"

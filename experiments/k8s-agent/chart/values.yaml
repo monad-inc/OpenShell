@@ -21,8 +21,26 @@ agent:
   maxTransientFailures: 5
   model: claude-opus-5
   # Replace a running agent on redeploy. Left false, an existing agent is kept
-  # and the Job is a no-op, so `helm upgrade` is safe to re-run.
+  # and the Job is a no-op, so `helm upgrade` is safe to re-run. Must be true to
+  # pick up a new agent.image, since the payload is baked into that image.
   recreate: false
+  # Gateway workspace for this agent. Defaults to agent.name.
+  #
+  # One workspace per agent, and not the shared `default`. Provider profiles,
+  # providers, and sandboxes are workspace-scoped, and a profile name carries
+  # enforced scope — `github-watcher` pins one repository. Two agents sharing a
+  # workspace means the second one's deploy upserts over the first one's profile
+  # and silently re-pins what it may reach, invisibly to git and `helm diff`.
+  #
+  # DNS-1123 label, at most 19 characters.
+  workspace: ""
+
+# Provenance stamped as labels onto the sandbox, so `openshell sandbox list`
+# reports what is actually running instead of requiring trust that the cluster
+# matches git. Normally set by CI or scripts/update-skills.sh.
+provenance:
+  gitSha: ""
+  skillsVersion: ""
 
 # Scope assertions. These are NOT what the agent reads — watch-config.yaml is
 # baked into the sandbox image on purpose, so a running agent's scope cannot be

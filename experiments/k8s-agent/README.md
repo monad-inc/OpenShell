@@ -140,6 +140,7 @@ experiments/k8s-agent/
     policy.yaml              # filesystem + process policy
     Dockerfile               # sandbox image (Claude Code CLI, gh, git, curl, jq)
     prompts/watcher.md       # prompt template; renders to agent-prompt.md
+    skills/                  # refined frequently; baked, digest-versioned
     providers/
       github-watcher.yaml    # one repo, read + push + PR
       slack-reader.yaml      # read-only Slack Web API
@@ -154,7 +155,8 @@ experiments/k8s-agent/
     namespace.yaml
     secrets.example.yaml     # template; never holds real values
   scripts/
-    build-agent-image.sh     # sandbox image (payload baked in)
+    build-agent-image.sh     # sandbox image (payload + skills baked in)
+    update-skills.sh         # rebuild skills and roll one agent or the fleet
     build-launcher-image.sh  # launcher image (agent def + deploy script baked in)
     deploy-agent.sh
 ```
@@ -412,6 +414,107 @@ fenced ```json openshell-watcher-state block in a tracking issue named by
 `watch-config.yaml`, holding the per-channel Slack cursor and what it has
 already acted on. Set `github.state_issue`, or the agent correctly reports
 `blocked`.
+
+## Running More Than One Agent
+
+Two properties matter once there is a second bot.
+
+### One workspace per agent — not optional
+
+Provider profiles, providers, and sandboxes are **workspace-scoped**, and a
+profile name carries enforced scope: `github-watcher` pins one repository.
+
+Deploying two agents into the shared `default` workspace means the second one's
+`provider profile import` + `provider create` upsert **over the first one's**.
+The first agent keeps running, its sandbox untouched, but the scope it is
+granted has been silently re-pinned to the second agent's repository. Nothing
+appears in git. Neither Helm release looks wrong. `helm diff` shows nothing,
+because the change happened in gateway state rather than in a manifest.
+
+`agent.workspace` defaults to `agent.name`, so each release is isolated by
+default. Verified directly — the same profile id in two workspaces:
+
+```text
+bot-two workspace pins:        /repos/monad-inc/other-repo
+repo-watcher workspace pins:   /repos/monad-inc/OpenShell
+```
+
+Workspace names are DNS-1123 labels capped at **19 characters**. Both the chart
+and the deploy script reject an invalid name up front rather than failing at the
+first API call.
+
+### Provenance: what is actually running
+
+Every sandbox is stamped at creation, so the cluster reports its own version
+instead of being assumed to match git:
+
+```text
+Labels:
+  agent-image:    openshell-agents_repo-watcher_skills-6205cc23d675
+  chart-version:  0.1.0
+  git-sha:        9e664e72
+  skills-version: 6205cc23d675
+```
+
+`openshell sandbox get <name>` answers "which revision is this bot on?" without
+inspecting the image. Label values accept only alphanumerics, `-`, `_`, and `.`,
+so image references are flattened before being recorded.
+
+### Fleet layout
+
+```shell
+helm upgrade --install slack-triage experiments/k8s-agent/chart \
+  -f values/base.yaml -f values/slack-triage.yaml
+```
+
+A shared `base.yaml` carries fleet-wide settings — model, poll interval,
+gateway — and each bot's file carries only what differs. Both are diffable in
+git, `helm diff` previews a change before it lands, and each bot keeps its own
+release history and rollback.
+
+## Updating Skills
+
+Skills are the fastest-moving part of an agent: they get refined as its judgment
+is corrected. `agent.yaml` declares them, and they are baked into the immutable
+payload alongside the prompt.
+
+### Why baked rather than mounted
+
+A ConfigMap mount would make updates instant, and it is the wrong trade:
+
+- A running agent could have its instructions rewritten underneath it, and a
+  half-applied edit can land mid-cycle.
+- Behavior could change with no deploy, no diff, and no review — the same
+  invisible-change problem as the workspace collision above.
+- There would be no version to point at when asking what a given agent was
+  actually running when it did something surprising.
+
+Baking costs a rebuild and a sandbox restart. The base tooling layers are
+cached, so a skills-only rebuild takes seconds, and the restart costs one
+in-flight cycle.
+
+Note the division of responsibility that makes fast skill iteration safe: skills
+change what the agent *does*, while policy and provider profiles govern what it
+*can* do. A bad skill revision still cannot exceed the enforced boundary, so
+skills can iterate quickly without widening blast radius.
+
+### The loop
+
+```shell
+# edit experiments/k8s-agent/agent/skills/<skill>/SKILL.md
+./experiments/k8s-agent/scripts/update-skills.sh --agent repo-watcher
+./experiments/k8s-agent/scripts/update-skills.sh --all        # every release
+./experiments/k8s-agent/scripts/update-skills.sh --agent x --dry-run
+```
+
+The image tag *is* the skills digest — a sha256 over the staged skill files —
+so the reference names what changed, an unchanged rebuild is a no-op, and the
+digest is comparable against git. `--all` keeps going when one agent fails, so a
+single broken bot cannot block a fleet-wide skill fix.
+
+Verified end to end: appending a refinement moved the digest from `3dfe6dcfc2ce`
+to `6205cc23d675`, and the running agent picked up the new text under the new
+label.
 
 ## Changing What the Agent Watches
 
