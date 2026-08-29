@@ -88,6 +88,16 @@ providers:
   #         command: printenv CLAUDE_CODE_OAUTH_TOKEN
   #       export: true
 
+skills:
+  # Skills are the part of the agent that changes most often — they get refined
+  # as the agent's judgment is corrected. They are still baked into the
+  # immutable payload rather than mounted, so a running agent cannot have its
+  # instructions rewritten underneath it, and every revision is a reviewable
+  # diff. See scripts/update-skills.sh for the fast iteration loop.
+  - id: slack-request-triage
+    source: agent://skills/slack-request-triage/SKILL.md
+    destination: skills/slack-request-triage/SKILL.md
+
 resources:
   # Baked into the immutable payload; the agent reads this to learn its scope.
   - id: watch-config

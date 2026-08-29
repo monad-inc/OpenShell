@@ -44,6 +44,20 @@ CLAUDE_MODEL="${CLAUDE_MODEL:-claude-opus-5}"
 PAYLOAD_IMAGE_DIR="/etc/openshell/agent-payload"
 RECREATE="${RECREATE:-0}"
 
+# One workspace per agent. Provider profiles, providers, and sandboxes are all
+# workspace-scoped, and profile names carry enforced scope: `github-watcher`
+# pins one repository. Deploying a second agent into the shared `default`
+# workspace would upsert over the first agent's profile and silently re-pin what
+# it is allowed to reach, with nothing visible in git or in `helm diff`.
+# Isolating per agent makes that structurally impossible.
+WORKSPACE="${WORKSPACE:-$SANDBOX_NAME}"
+
+# Provenance stamped onto the sandbox so `openshell sandbox list` shows what is
+# actually running, rather than requiring trust that it matches git.
+GIT_SHA="${GIT_SHA:-unknown}"
+CHART_VERSION="${CHART_VERSION:-unknown}"
+SKILLS_VERSION="${SKILLS_VERSION:-unknown}"
+
 fail() { echo "error: $*" >&2; exit 1; }
 log() { echo "==> $*" >&2; }
 
@@ -54,6 +68,14 @@ else
     GATEWAY_ARGS=(--gateway "$GATEWAY")
     GATEWAY_LABEL="$GATEWAY"
 fi
+
+# Workspace names are DNS-1123 labels capped at 19 characters by the gateway.
+# Fail here with a clear message rather than at the first API call.
+if [[ ! "$WORKSPACE" =~ ^[a-z0-9]([a-z0-9-]{0,17}[a-z0-9])?$ ]]; then
+    fail "workspace '$WORKSPACE' is not a valid DNS-1123 label of at most 19 characters; set WORKSPACE (or agent.workspace) explicitly"
+fi
+
+GATEWAY_ARGS+=(--workspace "$WORKSPACE")
 
 osh() { "$OPENSHELL_BIN" "${GATEWAY_ARGS[@]}" "$@"; }
 
@@ -125,6 +147,7 @@ upsert_provider() {
 }
 
 log "Gateway: $GATEWAY_LABEL"
+log "Workspace: $WORKSPACE"
 osh status >/dev/null || fail "gateway $GATEWAY_LABEL is not reachable"
 
 # Apply manifest-declared gateway settings before anything else, exactly as
@@ -134,7 +157,16 @@ osh status >/dev/null || fail "gateway $GATEWAY_LABEL is not reachable"
 # fails to connect with "network connections not allowed by policy". The
 # symptom looks like a broken policy rather than a missing setting.
 log "Applying gateway settings."
+# Settings are global, not workspace-scoped; --workspace is harmless here.
 osh settings set --global --key providers_v2_enabled --value true --yes >/dev/null
+
+if osh workspace get "$WORKSPACE" >/dev/null 2>&1; then
+    log "Workspace: $WORKSPACE (exists)"
+else
+    log "Workspace: $WORKSPACE (creating)"
+    "$OPENSHELL_BIN" "${GATEWAY_ARGS[@]}" workspace create --name "$WORKSPACE" \
+        --label "managed-by=repo-watcher-chart" >/dev/null
+fi
 
 # Scope assertion. The Helm chart passes what its values *claim* the agent's
 # scope is; the profile below is what actually gets enforced. If someone changes
@@ -166,6 +198,10 @@ if osh sandbox list 2>/dev/null | grep -qE "^${SANDBOX_NAME}[[:space:]]"; then
     fi
 fi
 
+# Sandbox label values accept only alphanumerics, '-', '_', and '.', so an
+# image reference has to be flattened before it can be recorded as one.
+IMAGE_REF_LABEL="$(printf '%s' "$IMAGE_REF" | tr '/:' '__')"
+
 log "Creating sandbox '$SANDBOX_NAME' from $IMAGE_REF"
 
 # The supervisor runs as the sandbox's main process, with its configuration
@@ -185,6 +221,10 @@ env -u OPENSHELL_SANDBOX_POLICY "$OPENSHELL_BIN" "${GATEWAY_ARGS[@]}" sandbox cr
     --no-auto-providers \
     --no-tty \
     --detach \
+    --label "git-sha=$GIT_SHA" \
+    --label "chart-version=$CHART_VERSION" \
+    --label "agent-image=$IMAGE_REF_LABEL" \
+    --label "skills-version=$SKILLS_VERSION" \
     -- env \
     "OPENSHELL_AGENT_ID=repo-watcher" \
     "OPENSHELL_AGENT_HARNESS=claude" \
