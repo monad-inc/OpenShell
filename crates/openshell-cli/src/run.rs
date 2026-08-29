@@ -46,14 +46,16 @@ use openshell_core::proto::{
     GetSandboxRequest, GetServiceRequest, GpuResourceRequirements, ImportProviderProfilesRequest,
     LintProviderProfilesRequest, ListProviderProfilesRequest, ListProvidersRequest,
     ListSandboxPoliciesRequest, ListSandboxProvidersRequest, ListSandboxesRequest,
-    ListServicesRequest, PolicySource, PolicyStatus, Provider, ProviderCredentialRefreshStatus,
-    ProviderCredentialRefreshStrategy, ProviderProfile, ProviderProfileDiagnostic,
-    ProviderProfileImportItem, RejectDraftChunkRequest, ResourceRequirements,
-    RevokeSshSessionRequest, RotateProviderCredentialRequest, Sandbox, SandboxPhase, SandboxPolicy,
-    SandboxSpec, SandboxTemplate, ServiceEndpointResponse, SetInferenceRouteRequest, SettingScope,
-    StartSandboxRequest, StopSandboxRequest, TcpForwardFrame, TcpForwardInit, TcpRelayTarget,
-    UpdateConfigRequest, UpdateProviderProfilesRequest, UpdateProviderRequest, WatchSandboxRequest,
-    exec_sandbox_event, setting_value, tcp_forward_init,
+    ListServicesRequest, PolicySource, PolicyStatus, Provider,
+    ProviderCredentialRefreshRecoveryAction, ProviderCredentialRefreshStatus,
+    ProviderCredentialRefreshStrategy, ProviderCredentialTokenGrantType, ProviderProfile,
+    ProviderProfileDiagnostic, ProviderProfileImportItem, RejectDraftChunkRequest,
+    ResourceRequirements, RevokeSshSessionRequest, RotateProviderCredentialRequest, Sandbox,
+    SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate, ServiceEndpointResponse,
+    SetInferenceRouteRequest, SettingScope, StartSandboxRequest, StopSandboxRequest,
+    TcpForwardFrame, TcpForwardInit, TcpRelayTarget, UpdateConfigRequest,
+    UpdateProviderProfilesRequest, UpdateProviderRequest, WatchSandboxRequest, exec_sandbox_event,
+    setting_value, tcp_forward_init,
 };
 use openshell_core::settings;
 use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
@@ -222,6 +224,23 @@ fn sandbox_should_persist(keep: bool, forward: Option<&ForwardSpec>) -> bool {
     keep || forward.is_some()
 }
 
+fn has_main_process_result(sandbox: &Sandbox) -> bool {
+    let Some(status) = sandbox.status.as_ref() else {
+        return false;
+    };
+    if status.exit_code.is_none() {
+        return false;
+    }
+
+    let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
+    phase != SandboxPhase::Error
+        || status.conditions.iter().any(|condition| {
+            condition.r#type == "Ready"
+                && condition.status.eq_ignore_ascii_case("false")
+                && condition.reason == "MainProcessFailed"
+        })
+}
+
 fn build_sandbox_resource_limits(
     cpu: Option<&str>,
     memory: Option<&str>,
@@ -337,19 +356,21 @@ async fn finalize_sandbox_create_session(
     server: &str,
     sandbox_name: &str,
     persist: bool,
-    session_result: Result<()>,
+    session_result: Result<i32>,
     workspace: &str,
     tls: &TlsOptions,
     gateway: &str,
-) -> Result<()> {
+) -> Result<i32> {
     if persist {
         return session_result;
     }
 
     let names = [sandbox_name.to_string()];
     if let Err(err) = sandbox_delete(server, &names, false, workspace, tls, gateway).await {
-        if session_result.is_ok() {
-            return Err(err);
+        if let Ok(exit_code) = session_result.as_ref() {
+            return Err(miette::miette!(
+                "sandbox command exited with status {exit_code}, but ephemeral cleanup failed: {err}"
+            ));
         }
         eprintln!("Failed to delete sandbox {sandbox_name}: {err}");
     }
@@ -420,7 +441,7 @@ pub async fn sandbox_create(
     config: SandboxCreateConfig<'_>,
     workspace: &str,
     tls: &TlsOptions,
-) -> Result<()> {
+) -> Result<i32> {
     let SandboxCreateConfig {
         name,
         from,
@@ -452,6 +473,11 @@ pub async fn sandbox_create(
     if !uploads.is_empty() && !command.is_empty() {
         return Err(miette::miette!(
             "--upload cannot be combined with a trailing main command yet because uploads complete after the canonical process starts"
+        ));
+    }
+    if output != "table" && !command.is_empty() && !detach {
+        return Err(miette::miette!(
+            "structured output cannot be combined with an attached trailing command; use table output to stream the command or add --detach"
         ));
     }
 
@@ -536,6 +562,20 @@ pub async fn sandbox_create(
     } else {
         command.to_vec()
     };
+    let persist = sandbox_should_persist(keep, forward.as_ref());
+    let create_detaches = detach
+        || (persist
+            && command.is_empty()
+            && (!std::io::stdin().is_terminal() || !std::io::stdout().is_terminal()));
+    let await_main_process_attachment = output == "table" && editor.is_none() && !create_detaches;
+    let annotations = if persist {
+        HashMap::new()
+    } else {
+        HashMap::from([(
+            "openshell.nvidia.com/retention".to_string(),
+            "ephemeral".to_string(),
+        )])
+    };
     let request = CreateSandboxRequest {
         spec: Some(SandboxSpec {
             resource_requirements,
@@ -549,8 +589,9 @@ pub async fn sandbox_create(
         }),
         name: name.unwrap_or_default().to_string(),
         labels,
-        annotations: HashMap::new(),
+        annotations,
         workspace: workspace.to_string(),
+        await_main_process_attachment,
     };
 
     let response = match client.create_sandbox(request).await {
@@ -569,7 +610,6 @@ pub async fn sandbox_create(
         .ok_or_else(|| miette::miette!("sandbox missing from response"))?;
 
     let interactive = std::io::stdout().is_terminal();
-    let persist = sandbox_should_persist(keep, forward.as_ref());
     let sandbox_name = if sandbox.object_name().is_empty() {
         "unknown".to_string()
     } else {
@@ -746,8 +786,20 @@ pub async fn sandbox_create(
                     saw_non_ready = true;
                 }
 
-                // Capture error reason from conditions only when phase is Error
-                // to avoid showing stale transient error reasons
+                let main_process_result = has_main_process_result(&s);
+                if matches!(
+                    phase,
+                    SandboxPhase::Completed | SandboxPhase::Error | SandboxPhase::Stopped
+                ) && main_process_result
+                {
+                    if let Some(d) = display.as_interactive_mut() {
+                        d.clear();
+                    }
+                    break;
+                }
+
+                // Capture infrastructure error reasons only after excluding a
+                // canonical-command result, which must attach and drain output.
                 if phase == SandboxPhase::Error
                     && let Some(status) = &s.status
                 {
@@ -826,7 +878,11 @@ pub async fn sandbox_create(
 
     // If we exited the loop without hitting the Ready break, finish the display.
     let final_phase = SandboxPhase::try_from(last_phase).unwrap_or(SandboxPhase::Unknown);
-    if final_phase != SandboxPhase::Ready
+    let final_has_main_process_result = has_main_process_result(&last_sandbox);
+    if !(matches!(
+        final_phase,
+        SandboxPhase::Ready | SandboxPhase::Completed | SandboxPhase::Stopped
+    ) || final_phase == SandboxPhase::Error && final_has_main_process_result)
         && let Some(d) = display.as_interactive_mut()
     {
         if final_phase == SandboxPhase::Error {
@@ -939,7 +995,7 @@ pub async fn sandbox_create(
 
             if structured_output {
                 crate::output::print_output_single(output, &last_sandbox, sandbox_to_json)?;
-                return Ok(());
+                return Ok(0);
             }
 
             if let Some(editor) = editor {
@@ -953,18 +1009,18 @@ pub async fn sandbox_create(
                     workspace,
                 )
                 .await?;
-                return Ok(());
+                return Ok(0);
             }
 
-            // Persistent non-interactive creates detach implicitly. An
-            // explicitly ephemeral (`--no-keep`) create must still attach so
-            // it can observe the canonical process and delete the sandbox when
-            // that session ends.
+            // An explicit trailing command is foreground regardless of TTY
+            // detection. Only --detach opts out. Scratch shells retain the
+            // non-interactive implicit-detach behavior.
             if detach
                 || (persist
+                    && command.is_empty()
                     && (!std::io::stdin().is_terminal() || !std::io::stdout().is_terminal()))
             {
-                return Ok(());
+                return Ok(0);
             }
 
             let connect_result = if persist {
@@ -979,6 +1035,32 @@ pub async fn sandbox_create(
                 .await
             };
 
+            finalize_sandbox_create_session(
+                &effective_server,
+                &sandbox_name,
+                persist,
+                connect_result,
+                workspace,
+                &effective_tls,
+                gateway_name,
+            )
+            .await
+        }
+        SandboxPhase::Completed | SandboxPhase::Stopped | SandboxPhase::Error
+            if final_has_main_process_result =>
+        {
+            drop(stream);
+            drop(client);
+            if detach {
+                return Ok(0);
+            }
+            let connect_result = crate::ssh::sandbox_connect_terminal_main(
+                &effective_server,
+                &sandbox_name,
+                &effective_tls,
+                workspace,
+            )
+            .await;
             finalize_sandbox_create_session(
                 &effective_server,
                 &sandbox_name,
@@ -1324,6 +1406,9 @@ pub async fn sandbox_get(
     println!("  {} {}", "Id:".dimmed(), id);
     println!("  {} {}", "Name:".dimmed(), name);
     println!("  {} {}", "Phase:".dimmed(), phase_name(sandbox.phase()));
+    if let Some(exit_code) = sandbox.status.as_ref().and_then(|status| status.exit_code) {
+        println!("  {} {}", "Exit Code:".dimmed(), exit_code);
+    }
     println!(
         "  {} {}",
         "Resource version:".dimmed(),
@@ -2057,8 +2142,16 @@ pub async fn sandbox_list(
     for sandbox in sandboxes {
         let phase = phase_name(sandbox.phase());
         let phase_colored = match SandboxPhase::try_from(sandbox.phase()) {
-            Ok(SandboxPhase::Ready) => phase.green().to_string(),
+            Ok(SandboxPhase::Ready | SandboxPhase::Completed) => phase.green().to_string(),
             Ok(SandboxPhase::Error) => phase.red().to_string(),
+            Ok(SandboxPhase::Stopped)
+                if sandbox
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| status.exit_code.is_some()) =>
+            {
+                phase.red().to_string()
+            }
             Ok(SandboxPhase::Provisioning) => phase.yellow().to_string(),
             Ok(SandboxPhase::Deleting) => phase.dimmed().to_string(),
             _ => phase.to_string(),
@@ -2102,6 +2195,7 @@ fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
         "created_at": format_epoch_ms(meta.map_or(0, |m| m.created_at_ms)),
         "phase": phase_name(sandbox.phase()),
         "current_policy_version": sandbox.current_policy_version(),
+        "exit_code": sandbox.status.as_ref().and_then(|status| status.exit_code),
     })
 }
 
@@ -2391,13 +2485,21 @@ pub async fn sandbox_delete(
             }
         }
 
-        let response = client
+        let response = match client
             .delete_sandbox(DeleteSandboxRequest {
                 name: name.clone(),
                 workspace: workspace.to_string(),
             })
             .await
-            .into_diagnostic()?;
+        {
+            Ok(response) => response,
+            Err(status) if status.code() == Code::NotFound => {
+                clear_last_sandbox_if_matches(gateway, workspace, name);
+                println!("{} Sandbox {name} already deleted", "✓".green().bold());
+                continue;
+            }
+            Err(status) => return Err(status).into_diagnostic(),
+        };
 
         let deleted = response.into_inner().deleted;
         if deleted {
@@ -2476,9 +2578,9 @@ async fn wait_for_lifecycle_phase(
         return Ok(sandbox);
     }
     if current == SandboxPhase::Error {
-        return Err(miette!(
-            "sandbox entered Error while waiting for {target:?}"
-        ));
+        let detail = ready_false_condition_message(sandbox.status.as_ref())
+            .unwrap_or_else(|| "sandbox entered Error".to_string());
+        return Err(miette!("{detail} while waiting for {target:?}"));
     }
 
     let timeout = Duration::from_secs(
@@ -3373,6 +3475,126 @@ fn missing_credentials_error(provider_type: &str) -> miette::Report {
     )
 }
 
+async fn provider_credential_from_oidc_token(
+    credentials: &[String],
+    profile: Option<&ProviderProfile>,
+    tls: &TlsOptions,
+) -> Result<(HashMap<String, String>, HashMap<String, i64>)> {
+    let credential_key = oidc_subject_credential_key(credentials, profile)?;
+
+    let gateway_name = tls.gateway_name().ok_or_else(|| {
+        miette::miette!("--from-oidc-token requires an active named OIDC gateway")
+    })?;
+    let bundle =
+        crate::oidc_auth::ensure_valid_oidc_token_bundle(gateway_name, tls.gateway_insecure)
+            .await
+            .map_err(|err| {
+                miette::miette!(
+                    "failed to load or refresh OIDC token for gateway '{gateway_name}' while preparing provider credential: {err}"
+                )
+            })?;
+
+    let mut credential_map = HashMap::new();
+    credential_map.insert(credential_key.clone(), bundle.access_token);
+
+    let mut credential_expires_at_ms = HashMap::new();
+    if let Some(expires_at) = bundle.expires_at {
+        let expires_at_ms = i64::try_from(expires_at)
+            .unwrap_or(i64::MAX / 1000)
+            .saturating_mul(1000);
+        credential_expires_at_ms.insert(credential_key, expires_at_ms);
+    }
+
+    Ok((credential_map, credential_expires_at_ms))
+}
+
+fn oidc_subject_credential_key(
+    credentials: &[String],
+    profile: Option<&ProviderProfile>,
+) -> Result<String> {
+    if credentials.len() > 1 {
+        return Err(miette::miette!(
+            "--from-oidc-token accepts at most one --credential KEY destination"
+        ));
+    }
+
+    if let Some(credential) = credentials.first() {
+        let credential = credential.trim();
+        if credential.is_empty() || credential.contains('=') {
+            return Err(miette::miette!(
+                "--from-oidc-token requires --credential KEY without an inline value"
+            ));
+        }
+        if let Some(profile) = profile {
+            ensure_profile_declares_subject_credential(profile, credential)?;
+        }
+        return Ok(credential.to_string());
+    }
+
+    let Some(profile) = profile else {
+        return Err(miette::miette!(
+            "--from-oidc-token requires --credential KEY when the provider profile is unavailable"
+        ));
+    };
+
+    infer_oidc_subject_credential_from_profile(profile)
+}
+
+fn ensure_profile_declares_subject_credential(
+    profile: &ProviderProfile,
+    credential: &str,
+) -> Result<()> {
+    let matches = token_exchange_subject_credentials(profile);
+    if matches.iter().any(|candidate| candidate == credential) {
+        return Ok(());
+    }
+    Err(miette::miette!(
+        "credential '{credential}' is not declared as a token-exchange subject credential in provider profile '{}'; expected one of: {}",
+        profile.id,
+        matches.join(", ")
+    ))
+}
+
+fn infer_oidc_subject_credential_from_profile(profile: &ProviderProfile) -> Result<String> {
+    let matches = token_exchange_subject_credentials(profile);
+    match matches.as_slice() {
+        [credential] => Ok(credential.clone()),
+        [] => Err(miette::miette!(
+            "provider profile '{}' does not declare a token-exchange subject credential; pass --credential KEY",
+            profile.id
+        )),
+        _ => Err(miette::miette!(
+            "provider profile '{}' declares multiple token-exchange subject credentials ({}); pass --credential KEY",
+            profile.id,
+            matches.join(", ")
+        )),
+    }
+}
+
+fn token_exchange_subject_credentials(profile: &ProviderProfile) -> Vec<String> {
+    let mut matches = Vec::new();
+    for credential in &profile.credentials {
+        let Some(token_grant) = credential.token_grant.as_ref() else {
+            continue;
+        };
+        if ProviderCredentialTokenGrantType::try_from(token_grant.grant_type).ok()
+            != Some(ProviderCredentialTokenGrantType::TokenExchange)
+        {
+            continue;
+        }
+        let Some(subject_token) = token_grant.subject_token.as_ref() else {
+            continue;
+        };
+        if subject_token.source != "provider_credential" || subject_token.credential.is_empty() {
+            continue;
+        }
+        if !matches.contains(&subject_token.credential) {
+            matches.push(subject_token.credential.clone());
+        }
+    }
+    matches
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn provider_create(
     server: &str,
@@ -3385,44 +3607,77 @@ pub async fn provider_create(
     workspace: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
-    provider_create_with_options(
+    let credential_source = match (from_existing, from_gcloud_adc) {
+        (true, true) => {
+            return Err(miette::miette!(
+                "--from-gcloud-adc cannot be combined with --from-existing, --from-oidc-token, or --credential; it also cannot be combined with --runtime-credentials"
+            ));
+        }
+        (true, false) => ProviderCreateCredentialSource::Existing,
+        (false, true) => ProviderCreateCredentialSource::GcloudAdc,
+        (false, false) => ProviderCreateCredentialSource::ExplicitCredentials,
+    };
+    provider_create_with_options(ProviderCreateOptions {
         server,
         name,
         provider_type,
-        from_existing,
         credentials,
-        from_gcloud_adc,
-        false,
+        credential_source,
         config,
         workspace,
-        workspace,
+        profile_workspace: workspace,
         tls,
-    )
+    })
     .await
 }
 
-#[allow(clippy::too_many_arguments)]
-pub async fn provider_create_with_options(
-    server: &str,
-    name: &str,
-    provider_type: &str,
-    from_existing: bool,
-    credentials: &[String],
-    from_gcloud_adc: bool,
-    runtime_credentials: bool,
-    config: &[String],
-    workspace: &str,
-    profile_workspace: &str,
-    tls: &TlsOptions,
-) -> Result<()> {
-    if from_gcloud_adc && (from_existing || !credentials.is_empty() || runtime_credentials) {
+pub struct ProviderCreateOptions<'a> {
+    pub server: &'a str,
+    pub name: &'a str,
+    pub provider_type: &'a str,
+    pub credentials: &'a [String],
+    pub credential_source: ProviderCreateCredentialSource,
+    pub config: &'a [String],
+    pub workspace: &'a str,
+    pub profile_workspace: &'a str,
+    pub tls: &'a TlsOptions,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderCreateCredentialSource {
+    ExplicitCredentials,
+    Existing,
+    GcloudAdc,
+    OidcToken,
+    Runtime,
+}
+
+pub async fn provider_create_with_options(options: ProviderCreateOptions<'_>) -> Result<()> {
+    let ProviderCreateOptions {
+        server,
+        name,
+        provider_type,
+        credentials,
+        credential_source,
+        config,
+        workspace,
+        profile_workspace,
+        tls,
+    } = options;
+
+    let from_existing = credential_source == ProviderCreateCredentialSource::Existing;
+    let from_gcloud_adc = credential_source == ProviderCreateCredentialSource::GcloudAdc;
+    let from_oidc_token = credential_source == ProviderCreateCredentialSource::OidcToken;
+    let runtime_credentials = credential_source == ProviderCreateCredentialSource::Runtime;
+
+    if from_gcloud_adc && !credentials.is_empty() {
         return Err(miette::miette!(
-            "--from-gcloud-adc cannot be combined with --from-existing, --credential, or --runtime-credentials"
+            "--from-gcloud-adc cannot be combined with --from-existing, --from-oidc-token, or --credential; it also cannot be combined with --runtime-credentials"
         ));
     }
-    if from_existing && (!credentials.is_empty() || runtime_credentials) {
+    if from_existing && !credentials.is_empty() {
         return Err(miette::miette!(
-            "--from-existing cannot be combined with --credential or --runtime-credentials"
+            "--from-existing cannot be combined with --credential"
         ));
     }
     if runtime_credentials && !credentials.is_empty() {
@@ -3492,7 +3747,17 @@ pub async fn provider_create_with_options(
         None
     };
 
-    let mut credential_map = parse_credential_pairs(credentials)?;
+    let oidc_profile = if from_oidc_token {
+        Some(fetch_provider_profile(&mut client, &provider_type, profile_workspace).await?)
+    } else {
+        None
+    };
+
+    let (mut credential_map, oidc_credential_expires_at_ms) = if from_oidc_token {
+        provider_credential_from_oidc_token(credentials, oidc_profile.as_ref(), tls).await?
+    } else {
+        (parse_credential_pairs(credentials)?, HashMap::new())
+    };
     let mut config_map = parse_key_value_pairs(config, "--config")?;
 
     if from_existing {
@@ -3566,7 +3831,7 @@ pub async fn provider_create_with_options(
                 r#type: provider_type.clone(),
                 credentials: credential_map,
                 config: config_map,
-                credential_expires_at_ms: HashMap::new(),
+                credential_expires_at_ms: oidc_credential_expires_at_ms,
                 profile_workspace: profile_workspace.to_string(),
                 credential_handles: HashMap::new(),
             }),
@@ -4174,14 +4439,16 @@ pub async fn provider_refresh_status(
 
 fn refresh_status_header() -> String {
     format!(
-        "{:<24}  {:<28}  {:<28}  {:<18}  {:<20}  {:<20}  {:<20}  {}",
+        "{:<24}  {:<28}  {:<28}  {:<24}  {:<18}  {:<20}  {:<20}  {:<20}  {:<44}  {}",
         "PROVIDER".bold(),
         "CREDENTIAL_KEY".bold(),
         "STRATEGY".bold(),
         "STATUS".bold(),
+        "RECOVERY".bold(),
         "EXPIRES_AT".bold(),
         "NEXT_REFRESH".bold(),
         "LAST_REFRESH".bold(),
+        "FAILURE_CODE".bold(),
         "LAST_ERROR".bold(),
     )
 }
@@ -4333,17 +4600,41 @@ fn print_refresh_status_row(status: &ProviderCredentialRefreshStatus) {
 fn refresh_status_row(status: &ProviderCredentialRefreshStatus) -> String {
     let strategy = ProviderCredentialRefreshStrategy::try_from(status.strategy)
         .unwrap_or(ProviderCredentialRefreshStrategy::Unspecified);
+    let recovery_action = ProviderCredentialRefreshRecoveryAction::try_from(status.recovery_action)
+        .unwrap_or(ProviderCredentialRefreshRecoveryAction::Unspecified);
     format!(
-        "{:<24}  {:<28}  {:<28}  {:<18}  {:<20}  {:<20}  {:<20}  {}",
+        "{:<24}  {:<28}  {:<28}  {:<24}  {:<18}  {:<20}  {:<20}  {:<20}  {:<44}  {}",
         status.provider_name,
         status.credential_key,
         provider_refresh_strategy_name(strategy),
         status.status,
+        provider_refresh_recovery_action_name(recovery_action),
         format_optional_epoch_ms(status.expires_at_ms),
-        format_optional_epoch_ms(status.next_refresh_at_ms),
+        format_refresh_next_at_ms(status.next_refresh_at_ms),
         format_optional_epoch_ms(status.last_refresh_at_ms),
+        status.failure_code,
         truncate_status_field(&status.last_error, 72),
     )
+}
+
+fn format_refresh_next_at_ms(next_refresh_at_ms: i64) -> String {
+    if next_refresh_at_ms == i64::MAX {
+        "-".to_string()
+    } else {
+        format_optional_epoch_ms(next_refresh_at_ms)
+    }
+}
+
+fn provider_refresh_recovery_action_name(
+    action: ProviderCredentialRefreshRecoveryAction,
+) -> &'static str {
+    match action {
+        ProviderCredentialRefreshRecoveryAction::Retry => "retry",
+        ProviderCredentialRefreshRecoveryAction::Reauthorize => "reauthorize",
+        ProviderCredentialRefreshRecoveryAction::FixConfiguration => "fix_configuration",
+        ProviderCredentialRefreshRecoveryAction::Investigate => "investigate",
+        ProviderCredentialRefreshRecoveryAction::Unspecified => "-",
+    }
 }
 
 fn provider_refresh_strategy_name(strategy: ProviderCredentialRefreshStrategy) -> &'static str {
@@ -4594,28 +4885,72 @@ fn print_provider_type_row(
     );
 }
 
-#[allow(clippy::too_many_arguments)]
-pub async fn provider_update(
-    server: &str,
-    name: &str,
-    from_existing: bool,
-    credentials: &[String],
-    config: &[String],
-    credential_expires_at: &[String],
-    workspace: &str,
-    tls: &TlsOptions,
-) -> Result<()> {
+pub struct ProviderUpdateOptions<'a> {
+    pub server: &'a str,
+    pub name: &'a str,
+    pub from_existing: bool,
+    pub from_oidc_token: bool,
+    pub credentials: &'a [String],
+    pub config: &'a [String],
+    pub credential_expires_at: &'a [String],
+    pub workspace: &'a str,
+    pub tls: &'a TlsOptions,
+}
+
+pub async fn provider_update(options: ProviderUpdateOptions<'_>) -> Result<()> {
+    let ProviderUpdateOptions {
+        server,
+        name,
+        from_existing,
+        from_oidc_token,
+        credentials,
+        config,
+        credential_expires_at,
+        workspace,
+        tls,
+    } = options;
+
     if from_existing && !credentials.is_empty() {
         return Err(miette::miette!(
             "--from-existing cannot be combined with --credential"
         ));
     }
+    if from_existing && from_oidc_token {
+        return Err(miette::miette!(
+            "--from-existing cannot be combined with --from-oidc-token"
+        ));
+    }
 
     let mut client = grpc_client(server, tls).await?;
+    let oidc_profile = if from_oidc_token {
+        let existing = client
+            .get_provider(GetProviderRequest {
+                name: name.to_string(),
+                workspace: workspace.to_string(),
+            })
+            .await
+            .into_diagnostic()?
+            .into_inner()
+            .provider
+            .ok_or_else(|| miette::miette!("provider '{name}' not found"))?;
+        let profile_workspace = if existing.profile_workspace.is_empty() {
+            workspace
+        } else {
+            &existing.profile_workspace
+        };
+        Some(fetch_provider_profile(&mut client, &existing.r#type, profile_workspace).await?)
+    } else {
+        None
+    };
 
-    let mut credential_map = parse_credential_pairs(credentials)?;
+    let (mut credential_map, oidc_credential_expires_at_ms) = if from_oidc_token {
+        provider_credential_from_oidc_token(credentials, oidc_profile.as_ref(), tls).await?
+    } else {
+        (parse_credential_pairs(credentials)?, HashMap::new())
+    };
     let mut config_map = parse_key_value_pairs(config, "--config")?;
-    let credential_expires_at_ms = parse_credential_expiry_pairs(credential_expires_at)?;
+    let mut credential_expires_at_ms = parse_credential_expiry_pairs(credential_expires_at)?;
+    credential_expires_at_ms.extend(oidc_credential_expires_at_ms);
 
     if from_existing {
         // Fetch the existing provider to discover its type for credential lookup.
@@ -7170,13 +7505,14 @@ mod tests {
     use super::{
         PolicyGetView, ProvisioningStep, build_sandbox_resource_limits,
         dockerfile_sources_supported_for_gateway, format_endpoint,
-        format_provider_attachment_table, git_sync_files, inferred_provider_type,
-        parse_cli_setting_value, parse_credential_expiry_cli_value, parse_credential_expiry_pairs,
-        parse_credential_pairs, parse_driver_config_json, parse_secret_material_env_pairs,
-        policy_revision_to_json, provider_profile_allows_empty_credentials,
-        provisioning_timeout_message, ready_false_condition_message, refresh_status_header,
-        refresh_status_row, resolve_from, sandbox_should_persist, sandbox_upload_plan,
-        service_expose_status_error, service_url_for_gateway,
+        format_provider_attachment_table, git_sync_files, has_main_process_result,
+        inferred_provider_type, parse_cli_setting_value, parse_credential_expiry_cli_value,
+        parse_credential_expiry_pairs, parse_credential_pairs, parse_driver_config_json,
+        parse_secret_material_env_pairs, policy_revision_to_json,
+        provider_profile_allows_empty_credentials, provisioning_timeout_message,
+        ready_false_condition_message, refresh_status_header, refresh_status_row, resolve_from,
+        sandbox_should_persist, sandbox_upload_plan, service_expose_status_error,
+        service_url_for_gateway,
     };
     use crate::TEST_ENV_LOCK;
     use crate::commands::common::progress_step_from_metadata;
@@ -7194,10 +7530,11 @@ mod tests {
     };
     use openshell_core::proto::{
         GetSandboxConfigResponse, GpuResourceRequirements, PolicySource, PolicyStatus, Provider,
-        ProviderCredentialRefresh, ProviderCredentialRefreshStatus,
-        ProviderCredentialRefreshStrategy, ProviderCredentialTokenGrant, ProviderProfile,
-        ProviderProfileCredential, ResourceRequirements, Sandbox, SandboxCondition, SandboxPhase,
-        SandboxPolicyRevision, SandboxStatus, datamodel::v1::ObjectMeta,
+        ProviderCredentialRefresh, ProviderCredentialRefreshRecoveryAction,
+        ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy,
+        ProviderCredentialTokenGrant, ProviderProfile, ProviderProfileCredential,
+        ResourceRequirements, Sandbox, SandboxCondition, SandboxPhase, SandboxPolicyRevision,
+        SandboxStatus, datamodel::v1::ObjectMeta,
     };
 
     #[test]
@@ -7436,6 +7773,8 @@ mod tests {
         let header = refresh_status_header();
         assert!(header.contains("NEXT_REFRESH"));
         assert!(header.contains("LAST_REFRESH"));
+        assert!(header.contains("RECOVERY"));
+        assert!(header.contains("FAILURE_CODE"));
         assert!(header.contains("LAST_ERROR"));
 
         let row = refresh_status_row(&ProviderCredentialRefreshStatus {
@@ -7445,17 +7784,24 @@ mod tests {
             strategy: ProviderCredentialRefreshStrategy::Oauth2ClientCredentials as i32,
             status: "error".to_string(),
             expires_at_ms: 1_767_225_600_000,
-            next_refresh_at_ms: 1_767_225_660_000,
+            next_refresh_at_ms: i64::MAX,
             last_refresh_at_ms: 1_767_225_000_000,
             last_error: "token endpoint returned a very long error message that should be truncated for table readability"
                 .to_string(),
+            recovery_action: ProviderCredentialRefreshRecoveryAction::Reauthorize as i32,
+            failure_code: "oauth_rotated_refresh_token_handle_missing".to_string(),
+            provider_error_subtype: "invalid_rapt".to_string(),
+            last_error_at_ms: 1_767_225_000_000,
         });
 
         assert!(row.contains("my-graph"));
         assert!(row.contains("MS_GRAPH_ACCESS_TOKEN"));
         assert!(row.contains("oauth2_client_credentials"));
         assert!(row.contains("error"));
+        assert!(row.contains("reauthorize"));
+        assert!(row.contains("oauth_rotated_refresh_token_handle_missing"));
         assert!(row.contains("2026-01-01 00:00:00"));
+        assert!(!row.contains("292278994"));
         assert!(row.contains("..."));
     }
 
@@ -7713,6 +8059,48 @@ mod tests {
     fn sandbox_should_persist_when_forward_is_requested() {
         let spec = openshell_core::forward::ForwardSpec::new(8080);
         assert!(sandbox_should_persist(false, Some(&spec)));
+    }
+
+    #[test]
+    fn infrastructure_error_with_observed_exit_is_not_a_main_process_result() {
+        let mut sandbox = Sandbox {
+            status: Some(SandboxStatus {
+                exit_code: Some(137),
+                conditions: vec![SandboxCondition {
+                    r#type: "Ready".to_string(),
+                    status: "False".to_string(),
+                    reason: "ComputeResourceMissing".to_string(),
+                    message: "sandbox runtime disappeared".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        sandbox.set_phase(SandboxPhase::Error as i32);
+
+        assert!(!has_main_process_result(&sandbox));
+    }
+
+    #[test]
+    fn main_process_failed_condition_identifies_command_result() {
+        let mut sandbox = Sandbox {
+            status: Some(SandboxStatus {
+                exit_code: Some(7),
+                conditions: vec![SandboxCondition {
+                    r#type: "Ready".to_string(),
+                    status: "False".to_string(),
+                    reason: "MainProcessFailed".to_string(),
+                    message: "canonical main process exited with status 7".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        sandbox.set_phase(SandboxPhase::Error as i32);
+
+        assert!(has_main_process_result(&sandbox));
     }
 
     #[test]

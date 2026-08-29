@@ -216,6 +216,7 @@ async fn handle_create_sandbox_inner(
 ) -> Result<Response<SandboxResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let request = request.into_inner();
+    let await_main_process_attachment = request.await_main_process_attachment;
     let mut spec = request
         .spec
         .ok_or_else(|| Status::invalid_argument("spec is required"))?;
@@ -365,7 +366,10 @@ async fn handle_create_sandbox_inner(
         None => None,
     };
 
-    let sandbox = state.compute.create_sandbox(sandbox, sandbox_token).await?;
+    let sandbox = state
+        .compute
+        .create_sandbox(sandbox, sandbox_token, await_main_process_attachment)
+        .await?;
 
     info!(
         sandbox_id = %id,
@@ -1032,7 +1036,7 @@ pub(super) async fn handle_watch_sandbox(
                     if stop_on_terminal {
                         let phase = SandboxPhase::try_from(sandbox.phase())
                             .unwrap_or(SandboxPhase::Unknown);
-                        if phase == SandboxPhase::Ready {
+                        if is_watch_terminal(phase) {
                             return;
                         }
                     }
@@ -1106,7 +1110,7 @@ pub(super) async fn handle_watch_sandbox(
                                         }
                                         if stop_on_terminal {
                                             let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
-                                            if phase == SandboxPhase::Ready {
+                                            if is_watch_terminal(phase) {
                                                 return;
                                             }
                                         }
@@ -1177,6 +1181,13 @@ pub(super) async fn handle_watch_sandbox(
     ));
 
     Ok(Response::new(WatchSandboxStream::new(rx, producer)))
+}
+
+fn is_watch_terminal(phase: SandboxPhase) -> bool {
+    matches!(
+        phase,
+        SandboxPhase::Ready | SandboxPhase::Completed | SandboxPhase::Stopped | SandboxPhase::Error
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1316,7 +1327,10 @@ pub(super) async fn handle_forward_tcp(
 
     let sandbox = fetch_and_authorize_sandbox(state, &principal, &init.sandbox_id).await?;
 
-    if SandboxPhase::try_from(sandbox.phase()).ok() != Some(SandboxPhase::Ready) {
+    // The main process may finish between minting the SSH token and opening
+    // its transport. Keep the relay reachable until terminal delivery is
+    // finalized so fast commands can attach without a readiness race.
+    if !sandbox_relay_reachable(state, &sandbox) {
         return Err(Status::failed_precondition("sandbox is not ready"));
     }
 
@@ -1697,6 +1711,16 @@ pub(super) async fn handle_exec_sandbox_interactive(
 // SSH session handlers
 // ---------------------------------------------------------------------------
 
+fn sandbox_relay_reachable(state: &ServerState, sandbox: &Sandbox) -> bool {
+    let phase = SandboxPhase::try_from(sandbox.phase()).ok();
+    matches!(phase, Some(SandboxPhase::Ready))
+        || (matches!(phase, Some(SandboxPhase::Completed | SandboxPhase::Error))
+            && state.supervisor_sessions.has_session(sandbox.object_id())
+            && !state
+                .supervisor_sessions
+                .terminal_delivery_finalized(sandbox.object_id()))
+}
+
 pub(super) async fn handle_create_ssh_session(
     state: &Arc<ServerState>,
     request: Request<CreateSshSessionRequest>,
@@ -1709,7 +1733,7 @@ pub(super) async fn handle_create_ssh_session(
 
     let sandbox = fetch_and_authorize_sandbox(state, &principal, &req.sandbox_id).await?;
 
-    if SandboxPhase::try_from(sandbox.phase()).ok() != Some(SandboxPhase::Ready) {
+    if !sandbox_relay_reachable(state, &sandbox) {
         return Err(Status::failed_precondition("sandbox is not ready"));
     }
 
@@ -2457,6 +2481,30 @@ mod tests {
     }
 
     // ---- shell_escape ----
+
+    #[test]
+    fn watch_terminal_phases_include_command_results_and_errors() {
+        for phase in [
+            SandboxPhase::Ready,
+            SandboxPhase::Completed,
+            SandboxPhase::Stopped,
+            SandboxPhase::Error,
+        ] {
+            assert!(is_watch_terminal(phase), "{phase:?} should stop the watch");
+        }
+        for phase in [
+            SandboxPhase::Provisioning,
+            SandboxPhase::Starting,
+            SandboxPhase::Stopping,
+            SandboxPhase::Deleting,
+            SandboxPhase::Unknown,
+        ] {
+            assert!(
+                !is_watch_terminal(phase),
+                "{phase:?} should keep the watch open"
+            );
+        }
+    }
 
     #[test]
     fn telemetry_compute_driver_uses_resolved_driver_kind() {
@@ -3361,6 +3409,7 @@ mod tests {
                 labels: HashMap::new(),
                 annotations: HashMap::new(),
                 workspace: String::new(),
+                await_main_process_attachment: false,
             }),
         )
         .await
@@ -3384,6 +3433,7 @@ mod tests {
                 labels: HashMap::new(),
                 annotations: HashMap::new(),
                 workspace: String::new(),
+                await_main_process_attachment: false,
             }),
         )
         .await
@@ -3419,6 +3469,7 @@ mod tests {
                 labels: HashMap::new(),
                 annotations: HashMap::new(),
                 workspace: String::new(),
+                await_main_process_attachment: false,
             }),
         )
         .await
@@ -3443,6 +3494,7 @@ mod tests {
                 labels: HashMap::new(),
                 annotations: HashMap::from([(annotation_key.clone(), annotation_value.clone())]),
                 workspace: String::new(),
+                await_main_process_attachment: false,
             }),
         )
         .await
@@ -3503,6 +3555,7 @@ mod tests {
                 labels: HashMap::new(),
                 annotations: HashMap::new(),
                 workspace: String::new(),
+                await_main_process_attachment: false,
             }),
         )
         .await
@@ -3568,6 +3621,7 @@ mod tests {
                 labels: HashMap::new(),
                 annotations: HashMap::new(),
                 workspace: String::new(),
+                await_main_process_attachment: false,
             }),
         )
         .await
@@ -3598,6 +3652,7 @@ mod tests {
                 labels: HashMap::from([("team".to_string(), "x".repeat(512))]),
                 annotations: HashMap::new(),
                 workspace: String::new(),
+                await_main_process_attachment: false,
             }),
         )
         .await
@@ -3630,6 +3685,7 @@ mod tests {
                     labels: HashMap::new(),
                     annotations: HashMap::new(),
                     workspace: String::new(),
+                    await_main_process_attachment: false,
                 }),
             )
             .await
@@ -3924,6 +3980,40 @@ mod tests {
             .unwrap();
         assert!(session1.is_some());
         assert!(session2.is_some());
+    }
+
+    #[tokio::test]
+    async fn create_ssh_session_allows_terminal_sandbox_while_supervisor_is_reachable() {
+        let state = test_server_state().await;
+        let mut sandbox = test_sandbox("work", Vec::new());
+        sandbox.set_phase(SandboxPhase::Completed as i32);
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let (tx, _rx) = mpsc::channel(1);
+        let (shutdown_tx, _shutdown_rx) = oneshot::channel();
+        let _ = state.supervisor_sessions.register(
+            "sandbox-work".to_string(),
+            "session-1".to_string(),
+            tx,
+            shutdown_tx,
+        );
+
+        let response = handle_create_ssh_session(
+            &state,
+            authed_request(CreateSshSessionRequest {
+                sandbox_id: "sandbox-work".to_string(),
+            }),
+        )
+        .await;
+
+        assert!(response.is_ok());
+
+        assert!(
+            state
+                .supervisor_sessions
+                .finalize_main_process_exit("sandbox-work")
+        );
+        assert!(!sandbox_relay_reachable(&state, &sandbox));
     }
 
     #[tokio::test]

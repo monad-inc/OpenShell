@@ -3092,7 +3092,28 @@ pub(super) async fn handle_get_sandbox_provider_environment(
         )
         .await?;
 
-    if !supports_static_credential_bindings {
+    if supports_static_credential_bindings {
+        let unbound_static_keys = provider_environment
+            .static_credential_keys
+            .iter()
+            .filter(|key| {
+                !provider_environment
+                    .static_credential_bindings
+                    .contains_key(*key)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in unbound_static_keys {
+            warn!(
+                sandbox_id = %sandbox_id,
+                key = %key,
+                "withholding unbound static provider credential from binding-capable supervisor"
+            );
+            provider_environment.environment.remove(&key);
+            provider_environment.credential_expires_at_ms.remove(&key);
+            provider_environment.static_credential_keys.remove(&key);
+        }
+    } else {
         for key in &provider_environment.static_credential_keys {
             provider_environment.environment.remove(key);
             provider_environment.credential_expires_at_ms.remove(key);
@@ -3128,6 +3149,20 @@ pub(super) async fn handle_get_sandbox_provider_environment(
 // ---------------------------------------------------------------------------
 // Update config handler (policy + settings mutations)
 // ---------------------------------------------------------------------------
+
+fn validate_live_policy_update_support(
+    driver_kind: Option<openshell_core::ComputeDriverKind>,
+    has_policy: bool,
+    has_merge_ops: bool,
+) -> Result<(), Status> {
+    if (has_policy || has_merge_ops) && driver_kind == Some(openshell_core::ComputeDriverKind::Mxc)
+    {
+        return Err(Status::failed_precondition(
+            "live policy updates are not supported for MXC sandboxes; recreate the sandbox so the new policy is mapped before launch",
+        ));
+    }
+    Ok(())
+}
 
 pub(super) async fn handle_update_config(
     state: &Arc<ServerState>,
@@ -3203,6 +3238,7 @@ async fn handle_update_config_inner(
             "one of policy, setting_key, or merge_operations must be provided",
         ));
     }
+    validate_live_policy_update_support(state.compute.driver_kind(), has_policy, has_merge_ops)?;
     if req.global {
         if !req.annotations.is_empty() {
             return Err(Status::invalid_argument(
@@ -6914,6 +6950,27 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tonic::Code;
 
+    #[test]
+    fn mxc_rejects_sandbox_policy_replacement_and_merge_updates() {
+        for (has_policy, has_merge_ops) in [(true, false), (false, true)] {
+            let error = validate_live_policy_update_support(
+                Some(openshell_core::ComputeDriverKind::Mxc),
+                has_policy,
+                has_merge_ops,
+            )
+            .expect_err("MXC must reject policy mutations after launch");
+            assert_eq!(error.code(), Code::FailedPrecondition);
+        }
+
+        let error = validate_live_policy_update_support(
+            Some(openshell_core::ComputeDriverKind::Mxc),
+            true,
+            false,
+        )
+        .expect_err("global policy replacement also changes desired state for live MXC sandboxes");
+        assert_eq!(error.code(), Code::FailedPrecondition);
+    }
+
     /// Wrap a request with a user `Principal` so handler scope guards treat
     /// the test caller as a CLI user. Most handler tests exercise
     /// user-facing behavior and should not trip sandbox equality checks.
@@ -9739,6 +9796,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_environment_withholds_unbound_static_credentials_independently() {
+        use openshell_core::proto::GetSandboxProviderEnvironmentRequest;
+
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+        let mut profileless_openai = test_provider("gateway-openai", "openai");
+        profileless_openai.credentials =
+            HashMap::from([("OPENAI_API_KEY".to_string(), "openai-secret".to_string())]);
+        state.store.put_message(&profileless_openai).await.unwrap();
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-unbound-provider-env",
+                "unbound-provider-env",
+                test_policy_with_rule("sandbox_only", "sandbox.example.com"),
+                vec!["work-github".to_string(), "gateway-openai".to_string()],
+            ))
+            .await
+            .unwrap();
+
+        let response = handle_get_sandbox_provider_environment(
+            &state,
+            with_user(Request::new(GetSandboxProviderEnvironmentRequest {
+                sandbox_id: "sb-unbound-provider-env".to_string(),
+                supports_static_credential_bindings: true,
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert!(!response.environment.contains_key("OPENAI_API_KEY"));
+        assert!(
+            !response
+                .static_credential_bindings
+                .contains_key("OPENAI_API_KEY")
+        );
+        assert_eq!(
+            response.environment.get("GITHUB_TOKEN"),
+            Some(&"ghp-test".to_string())
+        );
+        assert!(
+            response
+                .static_credential_bindings
+                .get("GITHUB_TOKEN")
+                .is_some_and(|binding| !binding.endpoints.is_empty())
+        );
+    }
+
+    #[tokio::test]
     async fn provider_environment_uses_policy_binding_for_endpointless_profile() {
         use openshell_core::proto::{
             GetSandboxConfigRequest, GetSandboxProviderEnvironmentRequest,
@@ -10031,19 +10142,141 @@ mod tests {
         .expect("mixed snapshot must be returned")
         .into_inner();
 
-        assert_eq!(
-            response.environment.get("INVALID_TOKEN"),
-            Some(&"static-secret".to_string())
+        assert!(
+            !response.environment.contains_key("INVALID_TOKEN"),
+            "an unbound static credential must be withheld before the supervisor snapshot"
         );
         assert!(
             !response
                 .static_credential_bindings
                 .contains_key("INVALID_TOKEN"),
-            "incomplete static metadata must reach the supervisor for fail-closed rejection"
+            "an unbound static credential must not emit incomplete binding metadata"
         );
         assert!(
             !response.dynamic_credentials.is_empty(),
             "valid dynamic credentials must survive an unrelated static binding failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_environment_withholds_token_exchange_subject_credential() {
+        use openshell_core::proto::{
+            GetSandboxProviderEnvironmentRequest, ProviderCredentialTokenGrant,
+            ProviderCredentialTokenGrantSubjectToken, ProviderCredentialTokenGrantType,
+            ProviderProfile, ProviderProfileCategory, ProviderProfileCredential,
+            StoredProviderProfile,
+        };
+
+        let state = test_server_state().await;
+        let profile = StoredProviderProfile {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "profile-token-exchange-subject".to_string(),
+                name: "token-exchange-subject".to_string(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
+                resource_version: 0,
+                annotations: HashMap::new(),
+                workspace: "default".to_string(),
+                deletion_timestamp_ms: 0,
+            }),
+            profile: Some(ProviderProfile {
+                id: "token-exchange-subject".to_string(),
+                display_name: "Token Exchange Subject".to_string(),
+                category: ProviderProfileCategory::Other as i32,
+                credentials: vec![
+                    ProviderProfileCredential {
+                        name: "subject_token".to_string(),
+                        ..Default::default()
+                    },
+                    ProviderProfileCredential {
+                        name: "access_token".to_string(),
+                        auth_style: "bearer".to_string(),
+                        header_name: "authorization".to_string(),
+                        token_grant: Some(ProviderCredentialTokenGrant {
+                            grant_type: ProviderCredentialTokenGrantType::TokenExchange as i32,
+                            token_endpoint: "https://auth.example.test/token".to_string(),
+                            audience: "api://exchange".to_string(),
+                            subject_token: Some(ProviderCredentialTokenGrantSubjectToken {
+                                source: "provider_credential".to_string(),
+                                credential: "subject_token".to_string(),
+                                subject_token_type: "urn:ietf:params:oauth:token-type:access_token"
+                                    .to_string(),
+                            }),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                ],
+                endpoints: vec![NetworkEndpoint {
+                    host: "api.exchange.example.test".to_string(),
+                    port: 443,
+                    protocol: "rest".to_string(),
+                    access: "full".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        };
+        state.store.put_message(&profile).await.unwrap();
+
+        let mut provider = test_provider("exchange-provider", "token-exchange-subject");
+        provider.credentials = HashMap::from([(
+            "subject_token".to_string(),
+            "raw-gateway-oidc-token".to_string(),
+        )]);
+        provider.credential_expires_at_ms =
+            HashMap::from([("subject_token".to_string(), current_time_ms() + 60_000)]);
+        state.store.put_message(&provider).await.unwrap();
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-token-exchange-subject",
+                "token-exchange-subject",
+                test_policy_with_rule("sandbox_only", "sandbox.example.com"),
+                vec!["exchange-provider".to_string()],
+            ))
+            .await
+            .unwrap();
+
+        let response = handle_get_sandbox_provider_environment(
+            &state,
+            with_user(Request::new(GetSandboxProviderEnvironmentRequest {
+                sandbox_id: "sb-token-exchange-subject".to_string(),
+                supports_static_credential_bindings: true,
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert!(
+            !response.environment.contains_key("subject_token"),
+            "token-exchange subject credentials must not enter sandbox environment material"
+        );
+        assert!(
+            !response
+                .static_credential_bindings
+                .contains_key("subject_token"),
+            "token-exchange subject credentials must not own workload placeholders"
+        );
+        assert!(
+            !response
+                .credential_expires_at_ms
+                .contains_key("subject_token"),
+            "withheld subject credentials must not emit sandbox expiry metadata"
+        );
+        let dynamic_access_token = response
+            .dynamic_credentials
+            .values()
+            .find(|credential| credential.name == "access_token")
+            .expect("dynamic access_token credential should remain available");
+        assert_eq!(
+            dynamic_access_token
+                .token_grant
+                .as_ref()
+                .and_then(|grant| grant.subject_token.as_ref())
+                .map(|subject| subject.credential.as_str()),
+            Some("subject_token")
         );
     }
 
