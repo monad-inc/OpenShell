@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+apiVersion: v2
+name: repo-watcher
+description: Deploys the repo-watcher OpenShell agent onto an existing OpenShell gateway
+type: application
+# Chart version tracks the chart. appVersion tracks the agent definition, which
+# is pinned by the launcher and sandbox image tags in values.yaml.
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - openshell
+  - agent
