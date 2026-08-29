@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: Apache-2.0
+
+# Declarative scope for the repo-watcher agent.
+#
+# This file is baked into the immutable agent payload at
+# /etc/openshell/agent-payload/watch-config.yaml. Changing what the agent
+# watches means editing this file and relaunching, which rebuilds the payload —
+# the running agent cannot widen its own scope at runtime.
+#
+# Keep this in sync with providers/github-watcher.yaml: the L7 policy there is
+# what actually enforces single-repo access. This file only tells the agent
+# what it is supposed to look at.
+
+version: 1
+
+github:
+  # The single repository this agent may read and open PRs against.
+  repo: monad-inc/OpenShell
+  # Branch PRs are opened against.
+  base_branch: main
+  # All agent-authored branches use this prefix, so its own work is
+  # identifiable across cycles without extra bookkeeping.
+  branch_prefix: watcher/
+  # Durable cross-cycle state lives in the body of this issue, in a fenced
+  # ```json openshell-watcher-state block. The supervisor gives each cycle a
+  # fresh process, so anything that must survive a cycle goes here.
+  state_issue: null
+
+slack:
+  # Channel IDs the agent may read. Read-only: the Slack provider profile
+  # grants no chat.postMessage surface.
+  channels: []
+  # Only messages at or after this many seconds before now are considered on a
+  # cold start with no recorded cursor.
+  cold_start_lookback_seconds: 86400
+  # A message is treated as an instruction to the agent when it matches this.
+  trigger_prefix: "watch this"
+
+limits:
+  # Refuse to open more than this many PRs in a single cycle. A runaway loop
+  # should stall, not flood the repo.
+  max_prs_per_cycle: 1
+  # Skip files larger than this when reading the repo, to bound cycle cost.
+  max_file_bytes: 400000
