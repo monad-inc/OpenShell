@@ -1,0 +1,89 @@
+{{- /* SPDX-License-Identifier: Apache-2.0 */ -}}
+{{- if not (or .Values.credentials.existingSecret .Values.credentials.create) }}
+{{- fail "set credentials.existingSecret, or credentials.create=true with inline values" }}
+{{- end }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "repo-watcher.fullname" . }}-deploy
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "repo-watcher.labels" . | nindent 4 }}
+  annotations:
+    # A hook, not a plain resource. Sandboxes have no declarative Kubernetes
+    # representation, so "deploying an agent" is an imperative API call against
+    # the gateway. Modelling that as a hook is honest about it and gives the
+    # release a natural place to converge on every install and upgrade.
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "0"
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  backoffLimit: {{ .Values.launcher.backoffLimit }}
+  ttlSecondsAfterFinished: {{ .Values.launcher.ttlSecondsAfterFinished }}
+  template:
+    metadata:
+      labels:
+        {{- include "repo-watcher.labels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "repo-watcher.serviceAccountName" . }}
+      restartPolicy: Never
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: launcher
+          image: {{ .Values.launcher.image | quote }}
+          imagePullPolicy: {{ .Values.launcher.imagePullPolicy }}
+          command: ["/bin/bash", "/work/scripts/deploy-agent.sh"]
+          env:
+            - name: OPENSHELL_GATEWAY_ENDPOINT
+              value: {{ .Values.gateway.endpoint | quote }}
+            - name: IMAGE_REF
+              value: {{ .Values.agent.image | quote }}
+            - name: SANDBOX_NAME
+              value: {{ .Values.agent.name | quote }}
+            - name: RUN_MODE
+              value: {{ .Values.agent.runMode | quote }}
+            - name: POLL_INTERVAL_SECONDS
+              value: {{ .Values.agent.pollIntervalSeconds | quote }}
+            - name: MAX_TRANSIENT_FAILURES
+              value: {{ .Values.agent.maxTransientFailures | quote }}
+            - name: CLAUDE_MODEL
+              value: {{ .Values.agent.model | quote }}
+            - name: RECREATE
+              value: {{ ternary "1" "0" .Values.agent.recreate | quote }}
+            # Agent definition is baked into the launcher image, so its version
+            # is pinned by launcher.image rather than by a mutable ConfigMap.
+            - name: AGENT_DIR
+              value: /work/agent
+            {{- if .Values.scope.verify }}
+            - name: EXPECTED_GITHUB_REPO
+              value: {{ .Values.scope.github.repo | quote }}
+            {{- end }}
+            # The CLI writes state under $HOME; the root filesystem is read-only.
+            - name: HOME
+              value: /tmp
+          envFrom:
+            - secretRef:
+                name: {{ include "repo-watcher.secretName" . }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            {{- toYaml .Values.launcher.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

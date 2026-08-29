@@ -25,9 +25,15 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EXPERIMENT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-AGENT_DIR="$EXPERIMENT_DIR/agent"
+AGENT_DIR="${AGENT_DIR:-$EXPERIMENT_DIR/agent}"
 
+# Two ways to address the gateway:
+#   OPENSHELL_GATEWAY_ENDPOINT -- a URL, used directly with no local
+#     registration. This is the in-cluster path: a Job has no ~/.config/openshell
+#     and cannot run `gateway add`.
+#   OPENSHELL_GATEWAY -- a registered gateway name, for workstation use.
 GATEWAY="${OPENSHELL_GATEWAY:-kind-experiments}"
+GATEWAY_ENDPOINT="${OPENSHELL_GATEWAY_ENDPOINT:-}"
 IMAGE_REF="${IMAGE_REF:-openshell-agents/repo-watcher:dev}"
 SANDBOX_NAME="${SANDBOX_NAME:-repo-watcher}"
 OPENSHELL_BIN="${OPENSHELL_BIN:-openshell}"
@@ -41,7 +47,15 @@ RECREATE="${RECREATE:-0}"
 fail() { echo "error: $*" >&2; exit 1; }
 log() { echo "==> $*" >&2; }
 
-osh() { "$OPENSHELL_BIN" --gateway "$GATEWAY" "$@"; }
+if [[ -n "$GATEWAY_ENDPOINT" ]]; then
+    GATEWAY_ARGS=(--gateway-endpoint "$GATEWAY_ENDPOINT")
+    GATEWAY_LABEL="$GATEWAY_ENDPOINT"
+else
+    GATEWAY_ARGS=(--gateway "$GATEWAY")
+    GATEWAY_LABEL="$GATEWAY"
+fi
+
+osh() { "$OPENSHELL_BIN" "${GATEWAY_ARGS[@]}" "$@"; }
 
 [[ -n "${GITHUB_TOKEN:-}" ]] || fail "GITHUB_TOKEN is required"
 [[ -n "${SLACK_BOT_TOKEN:-}" ]] || fail "SLACK_BOT_TOKEN is required"
@@ -110,8 +124,8 @@ upsert_provider() {
     fi
 }
 
-log "Gateway: $GATEWAY"
-osh status >/dev/null || fail "gateway $GATEWAY is not reachable"
+log "Gateway: $GATEWAY_LABEL"
+osh status >/dev/null || fail "gateway $GATEWAY_LABEL is not reachable"
 
 # Apply manifest-declared gateway settings before anything else, exactly as
 # run.sh does. This is not optional: with providers_v2_enabled unset, the
@@ -121,6 +135,18 @@ osh status >/dev/null || fail "gateway $GATEWAY is not reachable"
 # symptom looks like a broken policy rather than a missing setting.
 log "Applying gateway settings."
 osh settings set --global --key providers_v2_enabled --value true --yes >/dev/null
+
+# Scope assertion. The Helm chart passes what its values *claim* the agent's
+# scope is; the profile below is what actually gets enforced. If someone changes
+# the chart value without rebuilding the images, this turns a silent mismatch —
+# an agent quietly pinned to the wrong repository — into a failed release.
+if [[ -n "${EXPECTED_GITHUB_REPO:-}" ]]; then
+    if grep -q "/repos/${EXPECTED_GITHUB_REPO}" "$AGENT_DIR/providers/github-watcher.yaml"; then
+        log "Scope verified: github-watcher pins $EXPECTED_GITHUB_REPO"
+    else
+        fail "scope mismatch: expected '$EXPECTED_GITHUB_REPO', but the baked github-watcher profile does not pin it. Rebuild the launcher and sandbox images after changing the watched repository."
+    fi
+fi
 
 import_profile github-watcher "$AGENT_DIR/providers/github-watcher.yaml"
 import_profile slack-reader "$AGENT_DIR/providers/slack-reader.yaml"
@@ -149,7 +175,7 @@ log "Creating sandbox '$SANDBOX_NAME' from $IMAGE_REF"
 # In watch mode the supervisor loops
 # forever: bounded harness cycle, sentinel, sleep, repeat. Nothing outside the
 # sandbox needs to stay attached for that to continue.
-env -u OPENSHELL_SANDBOX_POLICY "$OPENSHELL_BIN" --gateway "$GATEWAY" sandbox create \
+env -u OPENSHELL_SANDBOX_POLICY "$OPENSHELL_BIN" "${GATEWAY_ARGS[@]}" sandbox create \
     --name "$SANDBOX_NAME" \
     --from "$IMAGE_REF" \
     --policy "$AGENT_DIR/policy.yaml" \
@@ -169,4 +195,4 @@ env -u OPENSHELL_SANDBOX_POLICY "$OPENSHELL_BIN" --gateway "$GATEWAY" sandbox cr
     bash "$PAYLOAD_IMAGE_DIR/runtime/entrypoint.sh"
 
 log "Deployed. Follow the agent with:"
-log "  openshell --gateway $GATEWAY sandbox logs $SANDBOX_NAME --follow"
+log "  openshell ${GATEWAY_ARGS[*]} logs $SANDBOX_NAME --tail"

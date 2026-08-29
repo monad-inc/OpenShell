@@ -22,6 +22,7 @@ OpenShell gives you most of this out of the box:
 | Codex harness | Shipped. |
 | **Claude Code harness** | **Added here** — `scripts/agents/runtime/harnesses/claude/`. |
 | **Deploying an agent to a K8s gateway** | **Added here** — see the gap below. |
+| Helm chart for the agent itself | Does not exist upstream. `experiments/k8s-agent/chart` is ours. |
 
 ### The gap: `run.sh` cannot deploy to a Kubernetes gateway
 
@@ -48,6 +49,31 @@ BUILD (CI, has Docker)              DEPLOY (Job, has cluster + secrets)
 Phase 1 is `scripts/build-agent-image.sh`, phase 2 is `scripts/deploy-agent.sh`.
 Making the supervisor the sandbox's **main process** rather than an exec target
 is what decouples the agent's lifetime from the launcher's.
+
+## There Is No Declarative Sandbox
+
+Worth stating plainly, because it shapes everything above: **the gateway API is
+the only way to create a sandbox.** There is no manifest, CRD, or idempotent
+apply for an agent.
+
+- The OpenShell chart is gateway-only — 21 templates, all gateway resources, no
+  `crds/` directory. The `server.sandbox*` values are *defaults* the gateway
+  applies to sandboxes created at runtime; setting them creates nothing.
+- Provider profiles cannot be seeded by Helm. The gateway's `user` profile
+  source reads `StoredProviderProfile` rows from its own store, populated
+  through `provider profile import`. A ConfigMap cannot supply them.
+- Hand-writing an Agent Sandbox `Sandbox` CR does not produce an OpenShell
+  agent. The Kubernetes driver only lists and watches CRs matching
+  `openshell_sandbox_label_selector()` plus its own gateway-id labels, which it
+  stamps on create. A chart-authored CR is invisible to the gateway and would
+  have no providers, no policy, and no credential proxy.
+- The verbs are `create`, `get`, `list`, `delete`, `stop`, `start`. There is no
+  `apply` and no upsert: creating an existing name fails with
+  `hint: delete it first with: openshell sandbox delete <name>`.
+
+So anything "declarative" here is necessarily a thin convergent wrapper that
+calls the API. That is exactly what the chart's Job is, and why it is modelled
+as a hook rather than as a resource that pretends to own the agent.
 
 ## Where Enforcement Actually Lives
 
@@ -118,14 +144,18 @@ experiments/k8s-agent/
       github-watcher.yaml    # one repo, read + push + PR
       slack-reader.yaml      # read-only Slack Web API
       claude-code-oauth.yaml # OAuth billing variant (API-key variant is builtin)
-  launcher/Dockerfile        # image for the deploy Job (CLI + ruby + jq)
+  launcher/Dockerfile        # deploy-Job image: CLI + ruby + jq + baked agent def
+  chart/                     # Helm chart that deploys the agent
+    Chart.yaml
+    values.yaml
+    templates/               # ServiceAccount, optional Secret, deploy Job hook
   manifests/
-    values-kind-experiments.yaml
+    values-kind-experiments.yaml   # values for the OpenShell gateway chart
     namespace.yaml
     secrets.example.yaml     # template; never holds real values
-    launcher-job.yaml
   scripts/
-    build-agent-image.sh
+    build-agent-image.sh     # sandbox image (payload baked in)
+    build-launcher-image.sh  # launcher image (agent def + deploy script baked in)
     deploy-agent.sh
 ```
 
@@ -279,36 +309,68 @@ shell.
 
 ### 7. Deploy the agent
 
-From a workstation, against the port-forward:
+Two images first — the sandbox image (step 5) and the launcher image, which
+bakes the agent definition and the deploy script:
 
 ```shell
-export GITHUB_TOKEN="$(gh auth token)"
-export SLACK_BOT_TOKEN=...
-export ANTHROPIC_API_KEY=...
+./experiments/k8s-agent/scripts/build-launcher-image.sh --tag dev
+```
+
+Then install the chart:
+
+```shell
+helm --kubeconfig ~/.kube/config --kube-context kind-kind \
+  upgrade --install repo-watcher experiments/k8s-agent/chart \
+  -n openshell-experiments \
+  --set credentials.existingSecret=repo-watcher-credentials \
+  --wait
+```
+
+Set `--set agent.recreate=true` to replace a running agent, which is required
+whenever `agent.image` changes, since the payload is baked into that image.
+
+To drive it from a workstation instead, without Helm:
+
+```shell
+export GITHUB_TOKEN="$(gh auth token)" SLACK_BOT_TOKEN=... ANTHROPIC_API_KEY=...
 OPENSHELL_BIN=./scripts/bin/openshell \
   ./experiments/k8s-agent/scripts/deploy-agent.sh
 ```
 
-Or in-cluster, which is the CI shape:
+#### What the chart does and does not own
 
-```shell
-kubectl --kubeconfig ~/.kube/config --context kind-kind \
-  -n openshell-experiments create configmap repo-watcher-scripts \
-  --from-file=experiments/k8s-agent/scripts/deploy-agent.sh --dry-run=client -o yaml \
-  | kubectl --kubeconfig ~/.kube/config --context kind-kind apply -f -
+The chart owns a ServiceAccount, optionally a Secret, and a Job. **It does not
+own the agent.** There is no Kubernetes object representing a sandbox, so the
+Job makes imperative gateway API calls and the resulting agent outlives the
+release. Consequences worth knowing:
 
-kubectl --kubeconfig ~/.kube/config --context kind-kind \
-  -n openshell-experiments create configmap repo-watcher-agent-def \
-  --from-file=experiments/k8s-agent/agent/policy.yaml \
-  --from-file=experiments/k8s-agent/agent/providers/ --dry-run=client -o yaml \
-  | kubectl --kubeconfig ~/.kube/config --context kind-kind apply -f -
+- `helm uninstall` does **not** delete the agent. Delete it explicitly with
+  `openshell sandbox delete`.
+- The Job is a `post-install,post-upgrade` hook, so every `helm upgrade`
+  reconverges: profiles are re-imported, providers upserted, and an existing
+  sandbox left alone unless `agent.recreate=true`. Re-running is safe.
+- `helm rollback` restores the chart's own objects, not the agent.
 
-kubectl --kubeconfig ~/.kube/config --context kind-kind \
-  apply -f experiments/k8s-agent/manifests/launcher-job.yaml
+#### The scope assertion
+
+`scope.github.repo` is not what the agent reads. `watch-config.yaml` is baked
+into the sandbox image on purpose, so a running agent's scope cannot be widened
+by editing Helm values. The chart passes the value to the Job, which checks it
+against the baked `github-watcher` profile and fails the release on a mismatch:
+
+```text
+==> Scope verified: github-watcher pins monad-inc/OpenShell
 ```
 
-The Job registers profiles and providers, creates the sandbox with the
-supervisor as its main process, and exits. The agent survives it.
+```text
+error: scope mismatch: expected 'someone-else/private-repo', but the baked
+github-watcher profile does not pin it. Rebuild the launcher and sandbox images
+after changing the watched repository.
+Error: UPGRADE FAILED: post-upgrade hooks failed
+```
+
+Changing the watched repository is therefore a rebuild, not a value edit. Set
+`scope.verify=false` only if you deliberately want that check off.
 
 ### 8. Observe
 
@@ -386,6 +448,13 @@ On `kind-kind` / `openshell-experiments`, all observed directly:
   `policy:_provider_claude_code_apikey`.
 - Agent image builds with the payload baked read-only at
   `/etc/openshell/agent-payload`.
+- **Helm-driven deploy works in-cluster**: `helm upgrade --install` runs the
+  launcher Job, which reaches the gateway over the cluster Service, imports
+  profiles, upserts providers, and creates the agent. Job completed in 10s.
+- **`helm upgrade` is safely re-runnable**: a second run reconverges providers
+  and leaves the running agent untouched.
+- **The scope assertion fails the release** on a mismatch between
+  `scope.github.repo` and the baked profile.
 - The deployed agent runs `supervisor.sh` as the sandbox's **main process**,
   which invokes `claude --print --output-format text --model claude-opus-5
   --dangerously-skip-permissions` per cycle and retries on failure — the
@@ -400,9 +469,6 @@ On `kind-kind` / `openshell-experiments`, all observed directly:
 - `github.state_issue` is unset in `watch-config.yaml`, so the agent will report
   `blocked` by design until a tracking issue exists.
 - `slack.channels` is empty — needs real channel IDs.
-- The launcher image and Job are written but not yet built or run in-cluster;
-  the deploy path has so far been driven from the workstation against the
-  port-forward.
 - The OAuth variant (`claude-code-oauth`) is defined and lints, but only the
   API-key variant has been deployed.
 
@@ -426,7 +492,11 @@ Found while doing this, all reproducible:
 4. **`provider profile update --file` rejects an extensionless filename** with
    "unsupported provider profile file format" — it dispatches on file
    extension. A `mktemp` file fails; `mktemp -d` plus `profile.yaml` works.
-5. **No agent launcher path for a Kubernetes gateway.** `run.sh` requires a
+5. **`install.sh` rejects `OPENSHELL_VERSION=latest`.** The variable is a
+   literal release tag, so the plausible-looking `latest` resolves to
+   `releases/download/latest/...` and 404s. Leaving it unset is what selects the
+   latest release. Worth either accepting `latest` or naming it in the error.
+6. **No agent launcher path for a Kubernetes gateway.** `run.sh` requires a
    local Docker daemon to bake the payload and stays attached to the agent.
    Both assumptions break in-cluster; the build/deploy split here is one answer
    and could reasonably be upstreamed.

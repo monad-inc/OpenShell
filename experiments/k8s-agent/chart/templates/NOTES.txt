@@ -1,0 +1,26 @@
+{{ include "repo-watcher.fullname" . }} deployed to namespace {{ .Release.Namespace }}.
+
+The agent itself is NOT a Kubernetes object owned by this release. This chart
+ran a Job that asked the gateway at
+  {{ .Values.gateway.endpoint }}
+to create sandbox "{{ .Values.agent.name }}" from {{ .Values.agent.image }}.
+
+Watch the deploy Job:
+  kubectl -n {{ .Release.Namespace }} logs job/{{ include "repo-watcher.fullname" . }}-deploy
+
+Confirm the agent is running:
+  kubectl -n {{ .Release.Namespace }} get sandboxes.agents.x-k8s.io
+  openshell --gateway-endpoint {{ .Values.gateway.endpoint }} sandbox list
+
+Follow a watch cycle:
+  openshell --gateway-endpoint {{ .Values.gateway.endpoint }} logs {{ .Values.agent.name }} --tail
+
+`helm uninstall` removes this release's Kubernetes objects but does NOT delete
+the sandbox, because the sandbox is gateway state, not a release resource:
+  openshell --gateway-endpoint {{ .Values.gateway.endpoint }} sandbox delete {{ .Values.agent.name }}
+{{- if not .Values.agent.recreate }}
+
+agent.recreate is false: if "{{ .Values.agent.name }}" already existed, the Job
+left it running untouched. Set agent.recreate=true to replace a running agent —
+needed whenever agent.image changes, since the payload is baked into the image.
+{{- end }}

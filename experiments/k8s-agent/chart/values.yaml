@@ -1,0 +1,82 @@
+# SPDX-License-Identifier: Apache-2.0
+
+# The gateway this agent is deployed onto. The chart does NOT install a
+# gateway — install the OpenShell chart first. This one only runs the API calls
+# that bring an agent into existence, because sandboxes have no declarative
+# Kubernetes representation of their own.
+gateway:
+  # In-cluster endpoint. A Job has no ~/.config/openshell, so it addresses the
+  # gateway by URL rather than by a registered name.
+  endpoint: http://openshell.openshell-experiments.svc.cluster.local:8080
+
+agent:
+  # Sandbox name on the gateway. Also the Helm-visible identity of the agent.
+  name: repo-watcher
+  # Sandbox image built by scripts/build-agent-image.sh. The baked payload —
+  # prompt, runtime, and watch-config.yaml — is pinned by this tag.
+  image: openshell-agents/repo-watcher:dev
+  # "watch" keeps the sandbox alive and self-polling; "once" runs one pass.
+  runMode: watch
+  pollIntervalSeconds: 900
+  maxTransientFailures: 5
+  model: claude-opus-5
+  # Replace a running agent on redeploy. Left false, an existing agent is kept
+  # and the Job is a no-op, so `helm upgrade` is safe to re-run.
+  recreate: false
+
+# Scope assertions. These are NOT what the agent reads — watch-config.yaml is
+# baked into the sandbox image on purpose, so a running agent's scope cannot be
+# widened by editing Helm values. Set these to what the image was built with and
+# the Job verifies they agree, turning a silent mismatch into a failed release.
+scope:
+  github:
+    repo: monad-inc/OpenShell
+  verify: true
+
+launcher:
+  image: openshell-agents/repo-watcher-launcher:dev
+  imagePullPolicy: IfNotPresent
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 3600
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      memory: 512Mi
+
+credentials:
+  # Preferred: reference a Secret managed by External Secrets or the 1Password
+  # operator, both already present on this cluster.
+  existingSecret: ""
+  # Development fallback: let the chart create the Secret from these values.
+  # Never commit real values; pass them with --set or a local values file that
+  # is gitignored.
+  create: false
+  githubToken: ""
+  slackBotToken: ""
+  # Exactly one of these. Both set is rejected by the launcher and again by the
+  # harness adapter, so billing attribution stays unambiguous.
+  anthropicApiKey: ""
+  claudeCodeOauthToken: ""
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
