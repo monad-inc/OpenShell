@@ -1,4 +1,4 @@
-{{ include "repo-watcher.fullname" . }} deployed to namespace {{ .Release.Namespace }}.
+{{ include "openshell-agent.fullname" . }} deployed to namespace {{ .Release.Namespace }}.
 
 The agent itself is NOT a Kubernetes object owned by this release. This chart
 ran a Job that asked the gateway at
@@ -6,7 +6,7 @@ ran a Job that asked the gateway at
 to create sandbox "{{ .Values.agent.name }}" from {{ .Values.agent.image }}.
 
 Watch the deploy Job:
-  kubectl -n {{ .Release.Namespace }} logs job/{{ include "repo-watcher.fullname" . }}-deploy
+  kubectl -n {{ .Release.Namespace }} logs job/{{ include "openshell-agent.fullname" . }}-deploy
 
 Confirm the agent is running:
   kubectl -n {{ .Release.Namespace }} get sandboxes.agents.x-k8s.io

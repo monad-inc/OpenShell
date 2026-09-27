@@ -35,7 +35,8 @@ REPO_ROOT="$(cd "$EXPERIMENT_DIR/../.." && pwd)"
 NAMESPACE="${NAMESPACE:-openshell-experiments}"
 KUBE_CONTEXT="${KUBE_CONTEXT:-kind-kind}"
 KUBECONFIG_PATH="${KUBECONFIG_PATH:-$HOME/.kube/config}"
-IMAGE_REPO="${IMAGE_REPO:-openshell-agents/repo-watcher}"
+AGENT_NAME="${AGENT_NAME:-repo-watcher}"
+IMAGE_REPO="${IMAGE_REPO:-}"
 CHART_DIR="$EXPERIMENT_DIR/chart"
 AGENTS=()
 ALL=0
@@ -50,6 +51,7 @@ helm_() { helm --kubeconfig "$KUBECONFIG_PATH" --kube-context "$KUBE_CONTEXT" "$
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --agent) [[ $# -ge 2 ]] || fail "--agent requires a value"; AGENTS+=("$2"); shift 2 ;;
+        --definition) [[ $# -ge 2 ]] || fail "--definition requires a value"; AGENT_NAME="$2"; shift 2 ;;
         --all) ALL=1; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
         --push) PUSH_ARGS=(--push); shift ;;
@@ -60,6 +62,13 @@ done
 
 [[ ${#AGENTS[@]} -gt 0 || "$ALL" == "1" ]] || fail "pass --agent <name> or --all"
 
+# --agent names Helm releases; --definition names the agent directory whose
+# skills are rebuilt. They match for a conventionally-named release.
+if [[ -z "$AGENT_NAME" || "$AGENT_NAME" == "repo-watcher" ]] && [[ ${#AGENTS[@]} -eq 1 ]]; then
+    AGENT_NAME="${AGENTS[0]}"
+fi
+IMAGE_REPO="${IMAGE_REPO:-openshell-agents/$AGENT_NAME}"
+
 # Tag by skills digest so the image reference itself names what changed. A
 # rebuild with unchanged skills produces the same tag and is a no-op roll.
 SKILLS_VERSION_FILE="$(mktemp)"
@@ -67,7 +76,7 @@ trap 'rm -f "$SKILLS_VERSION_FILE"' EXIT
 
 log "Building agent image with current skills."
 SKILLS_VERSION_FILE="$SKILLS_VERSION_FILE" \
-    "$SCRIPT_DIR/build-agent-image.sh" --tag "skills-pending" "${PUSH_ARGS[@]}" >&2
+    "$SCRIPT_DIR/build-agent-image.sh" --agent "$AGENT_NAME" --tag "skills-pending" "${PUSH_ARGS[@]}" >&2
 
 SKILLS_VERSION="$(cat "$SKILLS_VERSION_FILE")"
 [[ -n "$SKILLS_VERSION" ]] || fail "could not determine skills version"
@@ -88,7 +97,7 @@ fi
 
 if [[ "$ALL" == "1" ]]; then
     mapfile -t AGENTS < <(helm_ list -n "$NAMESPACE" -o json \
-        | ruby -rjson -e 'JSON.parse(STDIN.read).each { |r| puts r["name"] if r["chart"].to_s.start_with?("repo-watcher-") }')
+        | ruby -rjson -e 'JSON.parse(STDIN.read).each { |r| puts r["name"] if r["chart"].to_s.start_with?("openshell-agent-") }')
     [[ ${#AGENTS[@]} -gt 0 ]] || fail "no repo-watcher releases found in namespace $NAMESPACE"
     log "Rolling ${#AGENTS[@]} agent(s): ${AGENTS[*]}"
 fi

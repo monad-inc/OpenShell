@@ -7,8 +7,15 @@
 # is via `kubectl port-forward` from the operator's workstation only.
 
 image:
-  # Chart appVersion is 0.0.0 (dev placeholder); pin an actually-published tag.
-  tag: "latest"
+  # Chart appVersion is 0.0.0 (dev placeholder), so a tag must be given.
+  #
+  # PIN IT. `latest` is not a version: this deployment silently upgraded itself
+  # when the pod restarted and re-pulled, which removed the `providers_v2_enabled`
+  # setting and left the gateway a different build from the pinned CLI in the
+  # launcher image. The symptom was a corrupted workspace name on the wire
+  # ("workspace '\n\roncall-triage' not found") — a wire-format mismatch, not a
+  # workspace problem. Keep this tag and the launcher's OPENSHELL_VERSION equal.
+  tag: "0.1.1"
   pullPolicy: IfNotPresent
 
 workload:
@@ -23,6 +30,20 @@ supervisor:
 
 server:
   logLevel: info
+  # Version-suffixed database path.
+  #
+  # Provider profiles are stored as serialized protobuf. Across the 0.0.x -> 0.1.x
+  # boundary `NetworkEndpoint.enforcement` changed wire type, so profiles written
+  # by the older gateway make the newer one refuse to start:
+  #
+  #   provider policy composition startup preflight failed: ... invalid wire
+  #   type: LengthDelimited (expected Varint)
+  #
+  # The StatefulSet's PVC survives `helm uninstall`, so a reinstall alone does
+  # not clear it. Moving the database file gives the new gateway a clean store
+  # without deleting the volume. Bump the suffix on a future incompatible
+  # upgrade, or migrate deliberately.
+  dbUrl: "sqlite:/var/openshell/openshell-0.1.1.db"
   # Sandbox pods land in the release namespace.
   sandboxNamespace: ""
   # Local-only: plaintext gRPC over a port-forward.

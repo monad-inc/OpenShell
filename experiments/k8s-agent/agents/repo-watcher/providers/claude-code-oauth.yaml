@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: Apache-2.0
+
+# Claude Code via a subscription OAuth token.
+#
+# This is the second of the two credential shapes the claude harness adapter
+# accepts. The first is the builtin `claude-code` profile (ANTHROPIC_API_KEY,
+# x-api-key header, API billing); this one carries a Claude Code OAuth token as
+# a bearer credential instead. The adapter refuses to run with both attached, so
+# swapping billing modes is a one-line change to the manifest's provider list.
+id: claude-code-oauth
+display_name: Claude Code (OAuth token)
+description: Claude Code CLI authenticated with a long-lived Claude Code OAuth token
+category: agent
+inference_capable: true
+credentials:
+  - name: oauth_token
+    description: Claude Code OAuth token (`claude setup-token`)
+    env_vars: [CLAUDE_CODE_OAUTH_TOKEN]
+    required: true
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [oauth_token]
+endpoints:
+  - host: api.anthropic.com
+    port: 443
+    protocol: rest
+    access: read-write
+    enforcement: enforce
+# See claude-code-apikey.yaml: the npm global install's real executable is
+# claude.exe, and binary identity is judged on the resolved path.
+binaries:
+  - /usr/bin/claude
+  - /usr/local/bin/claude
+  - /usr/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe

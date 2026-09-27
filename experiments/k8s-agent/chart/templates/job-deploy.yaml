@@ -12,10 +12,10 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: {{ include "repo-watcher.fullname" . }}-deploy
+  name: {{ include "openshell-agent.fullname" . }}-deploy
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "repo-watcher.labels" . | nindent 4 }}
+    {{- include "openshell-agent.labels" . | nindent 4 }}
   annotations:
     # A hook, not a plain resource. Sandboxes have no declarative Kubernetes
     # representation, so "deploying an agent" is an imperative API call against
@@ -30,9 +30,9 @@ spec:
   template:
     metadata:
       labels:
-        {{- include "repo-watcher.labels" . | nindent 8 }}
+        {{- include "openshell-agent.labels" . | nindent 8 }}
     spec:
-      serviceAccountName: {{ include "repo-watcher.serviceAccountName" . }}
+      serviceAccountName: {{ include "openshell-agent.serviceAccountName" . }}
       restartPolicy: Never
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
@@ -48,6 +48,19 @@ spec:
               value: {{ .Values.agent.image | quote }}
             - name: SANDBOX_NAME
               value: {{ .Values.agent.name | quote }}
+            - name: AGENT_NAME
+              value: {{ .Values.agent.definition | quote }}
+            {{- if .Values.policyProbe.enabled }}
+            - name: POLICY_PROBE
+              value: "1"
+            {{- end }}
+            {{- if .Values.launcher.debug }}
+            # Dumps workspace bytes, gateway args, and the workspace list before
+            # provider import. Useful when a deploy fails inside the cluster,
+            # where the Job log is the only window.
+            - name: DEPLOY_DEBUG
+              value: "1"
+            {{- end }}
             - name: WORKSPACE
               value: {{ default .Values.agent.name .Values.agent.workspace | quote }}
             - name: GIT_SHA
@@ -71,7 +84,7 @@ spec:
             - name: AGENT_DIR
               value: /work/agent
             {{- if .Values.scope.verify }}
-            - name: EXPECTED_GITHUB_REPO
+            - name: EXPECTED_GITHUB_SCOPE
               value: {{ .Values.scope.github.repo | quote }}
             {{- end }}
             # The CLI writes state under $HOME; the root filesystem is read-only.
@@ -79,7 +92,7 @@ spec:
               value: /tmp
           envFrom:
             - secretRef:
-                name: {{ include "repo-watcher.secretName" . }}
+                name: {{ include "openshell-agent.secretName" . }}
           volumeMounts:
             - name: tmp
               mountPath: /tmp

@@ -10,10 +10,13 @@ gateway:
   endpoint: http://openshell.openshell-experiments.svc.cluster.local:8080
 
 agent:
+  # Which agent definition to deploy. Must match a directory under
+  # experiments/k8s-agent/agents/ and the launcher image built for it.
+  definition: repo-watcher
   # Sandbox name on the gateway. Also the Helm-visible identity of the agent.
   name: repo-watcher
   # Sandbox image built by scripts/build-agent-image.sh. The baked payload —
-  # prompt, runtime, and watch-config.yaml — is pinned by this tag.
+  # prompt, skills, runtime, and watch-config.yaml — is pinned by this tag.
   image: openshell-agents/repo-watcher:dev
   # "watch" keeps the sandbox alive and self-polling; "once" runs one pass.
   runMode: watch
@@ -48,10 +51,21 @@ provenance:
 # the Job verifies they agree, turning a silent mismatch into a failed release.
 scope:
   github:
+    # An owner, or an owner/repo. Checked against the GitHub provider profile
+    # baked into the launcher image; a mismatch fails the release.
     repo: monad-inc/OpenShell
   verify: true
 
+# After deploying, assert the policy behaves as the provider profiles claim.
+# Adds ~20s to a deploy and fails the release on a mismatch.
+policyProbe:
+  enabled: false
+
 launcher:
+  # Verbose deploy diagnostics in the Job log.
+  debug: false
+  # Built by scripts/build-launcher-image.sh --agent <definition>. Bakes that
+  # agent's manifest, policy, and provider profiles.
   image: openshell-agents/repo-watcher-launcher:dev
   imagePullPolicy: IfNotPresent
   backoffLimit: 2
@@ -73,6 +87,8 @@ credentials:
   create: false
   githubToken: ""
   slackBotToken: ""
+  # Only required by agents whose manifest declares a Grafana provider.
+  grafanaApiKey: ""
   # Exactly one of these. Both set is rejected by the launcher and again by the
   # harness adapter, so billing attribution stays unambiguous.
   anthropicApiKey: ""

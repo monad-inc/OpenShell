@@ -1,0 +1,77 @@
+# SPDX-License-Identifier: Apache-2.0
+
+# GitHub access for the on-call triage agent: read the org's code, and open a
+# pull request when a fix is evident. Nothing else.
+#
+# Scope is the `monad-inc` org rather than a single repository, because triage
+# cannot know in advance which service an alert implicates. Every rule is still
+# pinned to that org prefix, so a token with broader reach cannot use this
+# profile to touch another org.
+#
+# Deliberately absent, and therefore refused by the proxy:
+#   PUT  /repos/monad-inc/*/pulls/*/merge     merging its own PR
+#   POST /repos/monad-inc/*/issues            filing issues
+#   DELETE anything                           deleting refs, releases, repos
+#   Any /orgs/, /admin/, or /user/ mutation   membership and settings changes
+#
+# ---------------------------------------------------------------------------
+# KNOWN LIMIT — read this before trusting the "no writes" claim.
+#
+# Opening a PR requires pushing a branch, which requires git-receive-pack. The
+# proxy enforces at HTTP level and cannot inspect the contents of a git pack,
+# so it cannot distinguish "push to a new oncall/* branch" from "force-push to
+# main". The rule below permits git-receive-pack for the org, and that is as
+# narrow as L7 can express.
+#
+# The controls that actually constrain this are outside OpenShell:
+#   1. GitHub branch protection on the default branch of every repo in scope,
+#      including "block force pushes" and a required review.
+#   2. A fine-grained PAT limited to the intended repositories, with Contents
+#      write and Pull requests write and nothing else.
+# Treat both as required, not optional, before real credentials go in.
+# ---------------------------------------------------------------------------
+id: github-triage
+display_name: GitHub (on-call triage)
+description: Org-scoped read and clone, plus pull-request creation, for on-call triage
+category: source_control
+credentials:
+  - name: api_token
+    description: Fine-grained GitHub token scoped to the repositories in triage scope
+    env_vars: [GITHUB_TOKEN, GH_TOKEN]
+    required: true
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [api_token]
+endpoints:
+  - host: api.github.com
+    port: 443
+    protocol: rest
+    enforcement: enforce
+    rules:
+      # gh CLI auth preflight.
+      - allow: { method: GET, path: "/user" }
+      # Read any repository in the org. Both forms: `/**` needs at least one
+      # further segment, so the bare repo path must be listed separately.
+      - allow: { method: GET, path: "/repos/monad-inc/**" }
+      - allow: { method: HEAD, path: "/repos/monad-inc/**" }
+      # Search code and commits to locate a symptom's origin.
+      - allow: { method: GET, path: "/search/code" }
+      - allow: { method: GET, path: "/search/commits" }
+      - allow: { method: GET, path: "/search/issues" }
+      # Open a pull request, and create the branch it is opened from.
+      - allow: { method: POST, path: "/repos/monad-inc/*/pulls" }
+      - allow: { method: POST, path: "/repos/monad-inc/*/git/refs" }
+  - host: github.com
+    port: 443
+    protocol: rest
+    enforcement: enforce
+    rules:
+      - allow: { method: GET, path: "/monad-inc/**" }
+      - allow: { method: HEAD, path: "/monad-inc/**" }
+      - allow: { method: OPTIONS, path: "/monad-inc/**" }
+      # Clone and fetch.
+      - allow: { method: POST, path: "/monad-inc/*/git-upload-pack" }
+      # Push the PR branch. See the KNOWN LIMIT note above.
+      - allow: { method: POST, path: "/monad-inc/*/git-receive-pack" }
+binaries: [/usr/bin/gh, /usr/local/bin/gh, /usr/bin/git, /usr/local/bin/git]

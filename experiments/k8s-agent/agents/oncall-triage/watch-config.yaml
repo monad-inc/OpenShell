@@ -1,0 +1,62 @@
+# SPDX-License-Identifier: Apache-2.0
+
+# Declarative scope for the on-call triage agent.
+#
+# Baked into the immutable agent payload at
+# /etc/openshell/agent-payload/watch-config.yaml. Changing what this agent
+# watches means editing this file and rebuilding — the running agent cannot
+# widen its own scope.
+#
+# This file states INTENT. Enforcement lives in providers/*.yaml. Keep them in
+# agreement: pointing `github.org` at a different org here without changing
+# github-triage.yaml produces an agent that tries and is refused at the proxy.
+
+version: 1
+
+slack:
+  # Channel IDs carrying production alerts. Read-only.
+  channels: []
+  # Messages from these bot/app user IDs are treated as alerts. Left empty, the
+  # agent falls back to `alert_patterns` against the message text.
+  alert_bot_user_ids: []
+  alert_patterns:
+    - "FIRING"
+    - "\\[ALERT\\]"
+    - "PagerDuty"
+  # On a cold start with no recorded cursor, look back no further than this.
+  cold_start_lookback_seconds: 3600
+
+grafana:
+  # Base URL of the Grafana instance. Must match the host in
+  # providers/grafana-reader.yaml, which is what actually permits egress.
+  url: http://kube-prometheus-stack-grafana.grafana.svc.cluster.local
+  # Window queried around an alert's firing time.
+  lookback_seconds: 3600
+  # Datasource UIDs the agent should prefer. Empty means discover via /api/datasources.
+  datasource_uids: []
+
+github:
+  # Org the agent may read. Enforced by github-triage.yaml.
+  org: monad-inc
+  # Repositories in triage scope. The agent will not clone outside this list
+  # even though the profile permits the whole org, so that widening scope is a
+  # reviewable config change rather than an accident.
+  repos:
+    - monad-inc/OpenShell
+  base_branch: main
+  branch_prefix: oncall/
+  # Durable cross-cycle state: a fenced ```json openshell-oncall-state block in
+  # this issue's body. Each cycle is a fresh process, so anything that must
+  # survive lives here. Until set, the agent reports `blocked` by design.
+  state_issue: null
+
+triage:
+  # Investigations per cycle. Triage depth beats breadth: one alert understood
+  # is worth more than five skimmed.
+  max_investigations_per_cycle: 1
+  # A PR is only opened when the agent can point at a specific line or commit
+  # as the cause. Anything less is reported as findings, not code.
+  open_pr_only_with_identified_cause: true
+  max_prs_per_cycle: 1
+  # Alerts matching these are acknowledged as known-noisy and skipped.
+  suppress_patterns: []

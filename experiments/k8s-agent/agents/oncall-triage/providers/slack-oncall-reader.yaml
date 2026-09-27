@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: Apache-2.0
+
+# Read-only Slack access for the on-call triage agent.
+#
+# The agent watches an alerts channel and never speaks. No chat.postMessage,
+# chat.update, reactions, or file upload rule exists, so those calls are refused
+# at the proxy even if the token would permit them. Pair with a bot token
+# carrying only channels:history, groups:history, channels:read, users:read.
+id: slack-oncall-reader
+display_name: Slack (on-call, read-only)
+description: Read-only Slack Web API access for watching production alert channels
+category: messaging
+credentials:
+  - name: bot_token
+    description: Slack bot token (xoxb-) with read-only history scopes
+    env_vars: [SLACK_BOT_TOKEN]
+    required: true
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [bot_token]
+endpoints:
+  - host: slack.com
+    port: 443
+    protocol: rest
+    enforcement: enforce
+    rules:
+      - allow: { method: GET, path: "/api/auth.test" }
+      - allow: { method: POST, path: "/api/auth.test" }
+      - allow: { method: GET, path: "/api/conversations.list" }
+      - allow: { method: GET, path: "/api/conversations.info" }
+      - allow: { method: GET, path: "/api/conversations.history" }
+      - allow: { method: GET, path: "/api/conversations.replies" }
+      - allow: { method: GET, path: "/api/users.info" }
+binaries: [/usr/bin/curl, /usr/local/bin/curl]

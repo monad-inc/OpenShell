@@ -2,10 +2,15 @@
 
 # SPDX-License-Identifier: Apache-2.0
 
-# repo-watcher sandbox image.
+# Shared sandbox base image for every agent in this experiment.
 #
 # Mirrors scripts/agents/gator/Dockerfile, with the Claude Code CLI in place of
-# Codex and curl/jq present for the Slack Web API calls.
+# Codex, plus curl/jq for the REST APIs agents talk to (Slack, Grafana).
+#
+# Per-agent images are a thin payload layer on top of this (see
+# agents/<name>/Dockerfile), so adding an agent costs a seconds-long build
+# rather than reinstalling the whole toolchain. Everything here is
+# agent-agnostic: no prompt, no skills, no policy, no scope.
 
 FROM nvcr.io/nvidia/base/ubuntu:noble-20251013 AS system
 
@@ -75,7 +80,6 @@ FROM devtools AS final
 ENV PATH="/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin"
 
 RUN mkdir -p /etc/openshell
-COPY policy.yaml /etc/openshell/policy.yaml
 
 RUN printf 'export PATH="/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin"\nexport PS1="\\u@\\h:\\w\\$ "\n' \
         > /sandbox/.bashrc && \

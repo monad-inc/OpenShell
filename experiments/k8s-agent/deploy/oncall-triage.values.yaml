@@ -1,0 +1,46 @@
+# SPDX-License-Identifier: Apache-2.0
+
+# On-call triage agent — deployment values.
+#
+#   helm upgrade --install oncall-triage experiments/k8s-agent/chart \
+#     -n openshell-experiments \
+#     -f experiments/k8s-agent/deploy/oncall-triage.values.yaml \
+#     -f experiments/k8s-agent/deploy/oncall-triage.credentials.DUMMY.yaml
+#
+# This file is safe to commit. Credentials live in a separate values file or,
+# preferably, an existing Secret — see credentials.existingSecret below.
+
+gateway:
+  endpoint: http://openshell.openshell-experiments.svc.cluster.local:8080
+
+agent:
+  definition: oncall-triage
+  name: oncall-triage
+  image: openshell-agents/oncall-triage:dev
+  runMode: watch
+  # Alerts are time-sensitive in a way code review is not.
+  pollIntervalSeconds: 300
+  maxTransientFailures: 5
+  model: claude-opus-5
+  # Replace a running agent on redeploy. Required whenever agent.image changes,
+  # since prompt, skills, and watch-config are baked into that image.
+  recreate: false
+  # Own gateway workspace, so this agent's provider profiles cannot collide
+  # with another agent's. DNS-1123 label, max 19 characters.
+  workspace: oncall-triage
+
+launcher:
+  image: openshell-agents/oncall-triage-launcher:dev
+  imagePullPolicy: IfNotPresent
+
+# Asserted against the GitHub provider profile baked into the launcher image.
+# The triage agent is org-scoped because an alert can implicate any service.
+scope:
+  github:
+    repo: monad-inc
+  verify: true
+
+credentials:
+  # Preferred in a real deployment: a Secret managed by External Secrets or the
+  # 1Password operator, both already installed on this cluster.
+  existingSecret: ""
