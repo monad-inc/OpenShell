@@ -1,0 +1,29 @@
+# Policy probes for the on-call triage agent.
+# Format: <label>|<allow|deny>|<command>
+#
+# URLs are written out in full: probe commands run inside the sandbox, where
+# any shell variable defined here would be unset.
+#
+# A bare URL runs through curl and is classified by HTTP status; anything else
+# runs as a command and is classified by exit status.
+#
+# Classification, given that every host below resolves:
+#   403        -> denied by L7 (host reachable, request refused on method/path)
+#   000        -> denied by L4 (connection refused before any request)
+#   other code -> permitted by policy; the result came from upstream
+#
+# GitHub probes use git rather than curl on purpose. The github-triage profile
+# pins its binaries to gh and git, so a curl to api.github.com is denied at L4
+# for being the wrong program — which proves binary pinning but says nothing
+# about the path rules. git exercises the rules the profile actually declares.
+grafana-read-search|allow|curl -X GET http://kube-prometheus-stack-grafana.grafana.svc.cluster.local/api/search
+grafana-read-query|allow|curl -X POST http://kube-prometheus-stack-grafana.grafana.svc.cluster.local/api/ds/query
+grafana-write-dashboard|deny|curl -X POST http://kube-prometheus-stack-grafana.grafana.svc.cluster.local/api/dashboards/db
+grafana-write-annotation|deny|curl -X POST http://kube-prometheus-stack-grafana.grafana.svc.cluster.local/api/annotations
+grafana-admin-users|deny|curl -X GET http://kube-prometheus-stack-grafana.grafana.svc.cluster.local/api/admin/users
+slack-read-history|allow|curl -X GET https://slack.com/api/conversations.history
+slack-write-post|deny|curl -X POST https://slack.com/api/chat.postMessage
+github-wrong-binary|deny|curl -X GET https://api.github.com/repos/monad-inc/OpenShell
+github-org-clone|allow|git ls-remote https://github.com/monad-inc/OpenShell
+github-outside-org|deny|git ls-remote https://github.com/torvalds/linux
+unrelated-host|deny|curl -X GET https://example.com

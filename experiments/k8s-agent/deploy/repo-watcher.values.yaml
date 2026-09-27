@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: Apache-2.0
+
+# repo-watcher agent — deployment values. See oncall-triage.values.yaml for the
+# annotated version; the two differ only in scope and cadence.
+
+gateway:
+  endpoint: http://openshell.openshell-experiments.svc.cluster.local:8080
+
+agent:
+  definition: repo-watcher
+  name: repo-watcher
+  image: openshell-agents/repo-watcher:dev
+  runMode: watch
+  pollIntervalSeconds: 900
+  model: claude-opus-5
+  recreate: false
+  workspace: repo-watcher
+
+launcher:
+  image: openshell-agents/repo-watcher-launcher:dev
+
+scope:
+  github:
+    repo: monad-inc/OpenShell
+  verify: true
+
+credentials:
+  existingSecret: ""

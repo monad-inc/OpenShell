@@ -11,7 +11,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EXPERIMENT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-IMAGE_REPO="${IMAGE_REPO:-openshell-agents/repo-watcher-launcher}"
+AGENT_NAME="${AGENT_NAME:-repo-watcher}"
+IMAGE_REPO="${IMAGE_REPO:-}"
 IMAGE_TAG="dev"
 PUSH=0
 KIND_CLUSTER="${KIND_CLUSTER:-kind}"
@@ -21,6 +22,7 @@ log() { echo "==> $*" >&2; }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --agent) [[ $# -ge 2 ]] || fail "--agent requires a value"; AGENT_NAME="$2"; shift 2 ;;
         --tag) [[ $# -ge 2 ]] || fail "--tag requires a value"; IMAGE_TAG="$2"; shift 2 ;;
         --push) PUSH=1; shift ;;
         --kind-cluster) [[ $# -ge 2 ]] || fail "--kind-cluster requires a value"; KIND_CLUSTER="$2"; shift 2 ;;
@@ -29,10 +31,14 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+[[ -d "$EXPERIMENT_DIR/agents/$AGENT_NAME" ]] || fail "unknown agent '$AGENT_NAME'"
+IMAGE_REPO="${IMAGE_REPO:-openshell-agents/${AGENT_NAME}-launcher}"
 IMAGE_REF="${IMAGE_REPO}:${IMAGE_TAG}"
 
-log "Building $IMAGE_REF"
-docker build -f "$EXPERIMENT_DIR/launcher/Dockerfile" -t "$IMAGE_REF" "$EXPERIMENT_DIR"
+log "Building $IMAGE_REF (agent=$AGENT_NAME)"
+docker build -f "$EXPERIMENT_DIR/launcher/Dockerfile" \
+    --build-arg "AGENT_NAME=$AGENT_NAME" \
+    -t "$IMAGE_REF" "$EXPERIMENT_DIR"
 
 if [[ "$PUSH" == "1" ]]; then
     log "Pushing $IMAGE_REF"

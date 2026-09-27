@@ -134,32 +134,36 @@ open a PR. `github-watcher` is the narrowest profile that can.
 
 ```
 experiments/k8s-agent/
-  agent/
-    agent.yaml               # manifest: harness, watch mode, providers, resources
-    watch-config.yaml        # WHAT it watches — repo, channels, limits
-    policy.yaml              # filesystem + process policy
-    Dockerfile               # sandbox image (Claude Code CLI, gh, git, curl, jq)
-    prompts/watcher.md       # prompt template; renders to agent-prompt.md
-    skills/                  # refined frequently; baked, digest-versioned
-    providers/
-      github-watcher.yaml    # one repo, read + push + PR
-      slack-reader.yaml      # read-only Slack Web API
-      claude-code-oauth.yaml # OAuth billing variant (API-key variant is builtin)
-  launcher/Dockerfile        # deploy-Job image: CLI + ruby + jq + baked agent def
-  chart/                     # Helm chart that deploys the agent
-    Chart.yaml
-    values.yaml
-    templates/               # ServiceAccount, optional Secret, deploy Job hook
-  manifests/
-    values-kind-experiments.yaml   # values for the OpenShell gateway chart
-    namespace.yaml
-    secrets.example.yaml     # template; never holds real values
+  base/Dockerfile            # shared sandbox tooling (Claude Code, gh, git, curl, jq)
+  agents/
+    repo-watcher/            # watches Slack, opens PRs on one repo
+    oncall-triage/           # watches alert channels, investigates in Grafana
+      agent.yaml             # manifest: harness, watch mode, providers, skills
+      watch-config.yaml      # WHAT it watches — channels, Grafana, repos, limits
+      policy.yaml            # filesystem + process policy
+      Dockerfile             # thin payload layer over base
+      prompts/oncall.md      # prompt template
+      skills/                # alert-triage, grafana-investigation, root-cause-analysis
+      providers/             # grafana-reader, github-triage, slack-oncall-reader, claude-*
+      probes.txt             # policy assertions checked at deploy time
+  launcher/Dockerfile        # deploy-Job image; bakes one agent's definition
+  chart/                     # Helm chart, agent-agnostic
+  deploy/
+    oncall-triage.values.yaml
+    oncall-triage.credentials.DUMMY.yaml
+    repo-watcher.values.yaml
+    CREDENTIALS.md           # procedure for real credentials
   scripts/
-    build-agent-image.sh     # sandbox image (payload + skills baked in)
-    update-skills.sh         # rebuild skills and roll one agent or the fleet
-    build-launcher-image.sh  # launcher image (agent def + deploy script baked in)
-    deploy-agent.sh
+    build-agent-image.sh --agent <name>
+    build-launcher-image.sh --agent <name>
+    deploy-agent.sh          # manifest-driven; no agent hardcoded
+    update-skills.sh
 ```
+
+Adding an agent means adding a directory under `agents/` and a values file under
+`deploy/`. Nothing in the chart, the scripts, or the launcher is agent-specific:
+providers, credentials, settings, and scope all come from the agent's own
+`agent.yaml`.
 
 ## Runbook
 
@@ -415,6 +419,111 @@ fenced ```json openshell-watcher-state block in a tracking issue named by
 already acted on. Set `github.state_issue`, or the agent correctly reports
 `blocked`.
 
+## The On-Call Triage Agent
+
+Watches production alert channels in Slack, investigates alerts against Grafana,
+traces causes in the org's code, and opens a PR when — and only when — it can
+name a mechanism. Read-only everywhere except pull-request creation.
+
+Deploy it with two YAML files and one command:
+
+```shell
+helm upgrade --install oncall-triage experiments/k8s-agent/chart \
+  -n openshell-experiments \
+  -f experiments/k8s-agent/deploy/oncall-triage.values.yaml \
+  -f experiments/k8s-agent/deploy/oncall-triage.credentials.DUMMY.yaml \
+  --set policyProbe.enabled=true
+```
+
+Build its two images first:
+
+```shell
+docker build -f experiments/k8s-agent/base/Dockerfile -t openshell-agents/base:dev experiments/k8s-agent/base
+./experiments/k8s-agent/scripts/build-agent-image.sh    --agent oncall-triage --tag dev
+./experiments/k8s-agent/scripts/build-launcher-image.sh --agent oncall-triage --tag dev
+```
+
+For real credentials, see [deploy/CREDENTIALS.md](deploy/CREDENTIALS.md).
+
+### Pin the versions — all three of them
+
+The gateway image, the Helm chart, and the CLI inside the launcher must be the
+same release. This cost most of a session to learn:
+
+`image.tag: latest` on the gateway meant a pod restart silently re-pulled a
+newer build. That removed the `providers_v2_enabled` setting, and left the
+gateway on a different protocol revision from the CLI baked into the launcher.
+The symptom was not a version error. It was:
+
+```text
+workspace '\n\roncall-triage' not found
+```
+
+— a workspace that demonstrably existed, with a name whose bytes were clean.
+That is a protobuf field read at the wrong offset. The gateway said so plainly
+only once it was restarted against the older store:
+
+```text
+provider policy composition startup preflight failed:
+NetworkEndpoint.enforcement: invalid wire type: LengthDelimited (expected Varint)
+```
+
+Persisted provider profiles are serialized protobuf, and that field changed
+shape across 0.0.x → 0.1.x, so profiles written by one build stop the other from
+starting. `helm uninstall` does not clear it — the StatefulSet's PVC survives —
+so `server.dbUrl` carries a version suffix to give a new gateway a clean store
+without deleting the volume.
+
+Note the two spellings: the container tag is `0.1.1`, the git tag the CLI
+installer wants is `v0.1.1`.
+
+### Policy probes: assert, do not assume
+
+`probes.txt` states what the policy should do; `policyProbe.enabled=true` checks
+it at deploy time and fails the release on a mismatch. Every line below is
+measured output, not intent:
+
+```text
+PASS  grafana-read-search:      permitted; upstream said 401
+PASS  grafana-read-query:       permitted; upstream said 401
+PASS  grafana-write-dashboard:  denied by L7 (403)
+PASS  grafana-write-annotation: denied by L7 (403)
+PASS  grafana-admin-users:      denied by L4 (no connection)
+PASS  slack-read-history:       permitted; upstream said 200
+PASS  slack-write-post:         denied by L7 (403)
+PASS  github-wrong-binary:      denied by L4 (no connection)
+PASS  github-org-clone:         command succeeded
+PASS  github-outside-org:       command failed
+PASS  unrelated-host:           denied by L4 (no connection)
+```
+
+Three things in there are worth reading twice.
+
+**Read-only is a path allowlist, not a method rule.** Grafana's main read
+endpoint is `POST /api/ds/query` — the query travels in the body. Blocking POST
+would break reading. The profile permits that one POST and no mutating path, so
+`POST /api/dashboards/db` is refused while `POST /api/ds/query` is not.
+
+**`curl` to `api.github.com` is denied.** Not because of the path — because
+`github-triage` pins its binaries to `gh` and `git`. The same request from `git`
+succeeds. Policy is binary-aware, so a probe using the wrong program proves
+nothing about the path rules, which is why the GitHub probes use `git`.
+
+**Denials arrive at two layers.** 403 means the host was reachable and the
+request was refused on method or path. No connection at all means it was refused
+before any request. Both are correct denials and they are not interchangeable —
+a probe that treats "no connection" as success will pass against a host that
+merely fails to resolve, which is exactly the bug the first draft of these
+probes had.
+
+### Known limit, stated plainly
+
+Opening a PR requires pushing a branch, which requires `git-receive-pack`. The
+proxy enforces at HTTP level and cannot inspect a git pack, so it cannot
+distinguish a push to `oncall/*` from a force-push to `main`. Branch protection
+and a fine-grained token are required companion controls, not optional hardening.
+See `providers/github-triage.yaml` and `deploy/CREDENTIALS.md`.
+
 ## Running More Than One Agent
 
 Two properties matter once there is a second bot.
@@ -532,48 +641,37 @@ and is denied at the proxy.
 
 ## Verified So Far
 
-On `kind-kind` / `openshell-experiments`, all observed directly:
+On `kind-kind` / `openshell-experiments`, observed directly:
 
-- Agent Sandbox v1.0.0 controller and CRD installed; serves `v1beta1`.
-- Gateway healthy on the Kubernetes compute driver.
-- CLI registered over the port-forward; `status` reports Connected.
-- Sandboxes materialise as real `Sandbox` CRs and pods; `exec` works.
-- **Default-deny egress**: a sandbox with no providers reaches nothing —
-  `api.github.com`, `slack.com`, and `example.com` all fail to connect.
-- **Single-repo enforcement**: `git clone` of the watched repo succeeds while
-  `git clone` of `torvalds/linux` is refused with 403, same binary, same host.
-- **Read-only Slack**: `GET /api/auth.test` returns 200; `POST
-  /api/chat.postMessage`, which no rule allows, returns 403.
-- **Binary-aware policy**: `curl` to `api.github.com` is denied where `gh`
-  succeeds, because `github-watcher` pins `gh` and `git`.
-- **L7 path enforcement on the model API**: with the corrected profile,
-  `POST /v1/messages` and `GET /api/claude_code/settings` are allowed under
-  `policy:_provider_claude_code_apikey`.
-- Agent image builds with the payload baked read-only at
-  `/etc/openshell/agent-payload`.
-- **Helm-driven deploy works in-cluster**: `helm upgrade --install` runs the
-  launcher Job, which reaches the gateway over the cluster Service, imports
-  profiles, upserts providers, and creates the agent. Job completed in 10s.
-- **`helm upgrade` is safely re-runnable**: a second run reconverges providers
-  and leaves the running agent untouched.
-- **The scope assertion fails the release** on a mismatch between
-  `scope.github.repo` and the baked profile.
-- The deployed agent runs `supervisor.sh` as the sandbox's **main process**,
-  which invokes `claude --print --output-format text --model claude-opus-5
-  --dangerously-skip-permissions` per cycle and retries on failure — the
-  launcher's exit does not disturb it.
+- Gateway 0.1.1 healthy on the Kubernetes compute driver, chart and image matched.
+- The on-call triage agent deploys from two YAML files, runs as a `Sandbox` CR
+  and pod, and cycles on its watch interval.
+- Four providers registered from the agent manifest with no agent-specific code
+  in the deploy script.
+- **All 11 policy probes pass**, covering Grafana read/write, Slack read/write,
+  GitHub org scoping, binary pinning, and an unrelated host.
+- Credentials reach the sandbox as placeholders; the proxy substitutes them on
+  the wire.
+- Agents are isolated per gateway workspace, so profile names carrying enforced
+  scope cannot collide.
+- Both agents build from the shared base image; adding one is a directory plus
+  a values file.
 
 ## Still Open
 
-- **No cycle has completed with real credentials.** Slack and Anthropic were
-  exercised with placeholder tokens, which proves the network and policy path
-  but not a successful model call or a real PR. The retry loop observed is the
-  supervisor correctly handling an invalid key.
-- `github.state_issue` is unset in `watch-config.yaml`, so the agent will report
-  `blocked` by design until a tracking issue exists.
-- `slack.channels` is empty — needs real channel IDs.
-- The OAuth variant (`claude-code-oauth`) is defined and lints, but only the
-  API-key variant has been deployed.
+- **No cycle has completed with real credentials.** Everything runs on
+  placeholders, which proves wiring, policy, and the loop — not a real
+  investigation or a real PR. The agent currently fails each model call and
+  retries, which is the supervisor behaving correctly.
+- `github.state_issue` is unset, so the agent reports `blocked` by design until
+  a tracking issue exists.
+- `slack.channels` is empty — needs real alert channel IDs.
+- Grafana points at the in-cluster kube-prometheus-stack instance, which makes
+  probes meaningful locally but is not the production Grafana.
+- The repo-watcher agent builds after the restructure but has not been
+  redeployed; its values file is ready.
+- Skills are unproven in practice. They encode judgment that only survives
+  contact with real alerts.
 
 ## Upstream Issues Worth Filing
 
@@ -595,11 +693,15 @@ Found while doing this, all reproducible:
 4. **`provider profile update --file` rejects an extensionless filename** with
    "unsupported provider profile file format" — it dispatches on file
    extension. A `mktemp` file fails; `mktemp -d` plus `profile.yaml` works.
-5. **`install.sh` rejects `OPENSHELL_VERSION=latest`.** The variable is a
+5. **`provider profile import` rejects `category: observability`.** The
+   accepted set includes agent, data, inference, messaging, other, and
+   source_control. An observability tool is a natural profile to write and the
+   category list is not discoverable from the CLI.
+6. **`install.sh` rejects `OPENSHELL_VERSION=latest`.** The variable is a
    literal release tag, so the plausible-looking `latest` resolves to
    `releases/download/latest/...` and 404s. Leaving it unset is what selects the
    latest release. Worth either accepting `latest` or naming it in the error.
-6. **No agent launcher path for a Kubernetes gateway.** `run.sh` requires a
+7. **No agent launcher path for a Kubernetes gateway.** `run.sh` requires a
    local Docker daemon to bake the payload and stays attached to the agent.
    Both assumptions break in-cluster; the build/deploy split here is one answer
    and could reasonably be upstreamed.
