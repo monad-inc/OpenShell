@@ -10,9 +10,11 @@ nothing about MCP. Running it as a separate service puts MCP Streamable HTTP on
 the wire between the sandbox and the server, where `protocol: mcp` can inspect
 JSON-RPC and authorize individual tool names.
 
-It also moves the Grafana credential out of the agent entirely: the server holds
-it, the agent never sees it, and what the agent can reach through it is bounded
-by the tool allowlist in the sandbox policy.
+The server holds NO credential. Each caller supplies its own Grafana
+service-account token in a per-request header, which OpenShell injects for the
+agent exactly as it does for every other provider. So the credential stays tied
+to the agent rather than becoming ambient authority available to anything that
+can reach this Service, and an uncredentialed caller gets nothing.
 */ -}}
 apiVersion: apps/v1
 kind: Deployment
@@ -66,18 +68,18 @@ spec:
             - -log-level
             - {{ .Values.grafanaMcp.logLevel }}
           env:
+            # Default destination only, and not a security control: mcp-grafana
+            # lets a request override this with an X-Grafana-URL header, and the
+            # header wins. What actually confines the destination is the egress
+            # NetworkPolicy below, plus binary pinning on the agent side.
             - name: GRAFANA_URL
               value: {{ .Values.grafanaMcp.grafanaUrl | quote }}
             {{- with .Values.grafanaMcp.orgId }}
-            # Without this the server logs a warning and uses the default org.
             - name: GRAFANA_ORG_ID
               value: {{ . | quote }}
             {{- end }}
-          envFrom:
-            # Supplies GRAFANA_API_KEY. Same Secret the deploy Job reads, so
-            # there is one place credentials live.
-            - secretRef:
-                name: {{ include "openshell-agent.secretName" . }}
+          # No envFrom. This pod is deliberately credential-free; tokens arrive
+          # per request from the caller.
           ports:
             - name: mcp
               containerPort: {{ .Values.grafanaMcp.port }}

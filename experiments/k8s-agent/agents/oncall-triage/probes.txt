@@ -12,20 +12,22 @@
 #   000        -> denied by L4 (connection refused before any request)
 #   other code -> permitted by policy; the result came from upstream
 #
-# The Grafana probes are MCP JSON-RPC, not REST. What is being asserted is that
-# the proxy authorizes individual tool NAMES: list_datasources is permitted and
-# grafana_api_request is refused, on the same host, port, path, and method.
-# grafana_api_request matters most — it proxies an arbitrary Grafana API call,
-# so permitting it would make the entire tool allowlist meaningless.
 #
 # GitHub probes use git rather than curl on purpose. The github-triage profile
 # pins its binaries to gh and git, so a curl to api.github.com is denied at L4
 # for being the wrong program — which proves binary pinning but says nothing
 # about the path rules.
-mcp-initialize|allow|curl -X POST -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}}' http://grafana-mcp.openshell-experiments.svc.cluster.local:8000/mcp
-mcp-allowed-tool|allow|curl -X POST -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_datasources","arguments":{}}}' http://grafana-mcp.openshell-experiments.svc.cluster.local:8000/mcp
-mcp-denied-tool-api-escape|deny|curl -X POST -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"grafana_api_request","arguments":{}}}' http://grafana-mcp.openshell-experiments.svc.cluster.local:8000/mcp
-mcp-denied-tool-write|deny|curl -X POST -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' -d '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"update_dashboard","arguments":{}}}' http://grafana-mcp.openshell-experiments.svc.cluster.local:8000/mcp
+# Only the Claude Code binary may speak to the MCP endpoint. curl is absent
+# from that provider's `binaries`, so a hand-crafted request — which could set
+# an X-Grafana-URL header and redirect an injected token — cannot be made at
+# all. This is the control that works regardless of CNI.
+#
+# The cost is that the per-tool allow/deny rules can no longer be asserted with
+# curl from inside the sandbox: reaching the endpoint at all now requires being
+# Claude Code. Those rules are still enforced, and visible in the supervisor's
+# OCSF log as `engine:l7-mcp` decisions naming the method and tool. Security
+# beat test convenience here.
+mcp-wrong-binary|deny|curl -X POST -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' http://grafana-mcp.openshell-experiments.svc.cluster.local:8000/mcp
 grafana-direct-rest|deny|curl -X GET http://kube-prometheus-stack-grafana.grafana.svc.cluster.local/api/search
 slack-read-history|allow|curl -X GET https://slack.com/api/conversations.history
 slack-write-post|deny|curl -X POST https://slack.com/api/chat.postMessage

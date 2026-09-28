@@ -1,0 +1,62 @@
+{{- /* SPDX-License-Identifier: Apache-2.0 */ -}}
+{{- if and .Values.grafanaMcp.enabled .Values.grafanaMcp.networkPolicy.enabled }}
+{{- /*
+Confines the MCP server: it may be reached only by sandbox pods, and it may
+reach only Grafana and DNS.
+
+The egress half is the control that closes credential redirection. mcp-grafana
+honours an X-Grafana-URL request header over its own configured URL, so without
+this a caller able to craft a request could have the server forward an injected
+token to a host of its choosing. With it, the server cannot reach that host at
+all.
+
+IMPORTANT: this is enforced only by a CNI that implements NetworkPolicy. kind's
+default kindnetd does NOT — it accepts these objects and ignores them. On the
+local cluster the working control is the `binaries` allowlist in
+providers/grafana-mcp.yaml, which the OpenShell supervisor enforces regardless
+of CNI. Verify enforcement before relying on this in a real cluster.
+*/ -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "openshell-agent.grafanaMcpService" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "openshell-agent.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "openshell-agent.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: grafana-mcp
+  policyTypes: [Ingress, Egress]
+  ingress:
+    # Only OpenShell-managed sandbox workloads.
+    - from:
+        - podSelector:
+            matchLabels:
+              openshell.ai/boundary-role: workload
+      ports:
+        - protocol: TCP
+          port: {{ .Values.grafanaMcp.port }}
+  egress:
+    # DNS.
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Grafana, and nothing else.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.grafanaMcp.grafanaNamespace }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.grafanaMcp.grafanaPort }}
+{{- end }}
