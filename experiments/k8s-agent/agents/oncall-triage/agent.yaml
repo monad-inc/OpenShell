@@ -31,6 +31,9 @@ settings:
   - key: providers_v2_enabled
     value: true
 
+# No Grafana provider. Grafana is reached through the MCP server, which holds
+# the Grafana credential itself — so the agent has none to hold, and its reach
+# is bounded by the tool allowlist in policy.yaml rather than by a token.
 providers:
   - id: github-triage
     name: github-triage
@@ -52,17 +55,6 @@ providers:
         source:
           kind: host_command
           command: printenv SLACK_BOT_TOKEN
-        export: true
-
-  - id: grafana-reader
-    name: grafana-reader
-    profile: grafana-reader
-    credential_mode: explicit
-    credentials:
-      - env: GRAFANA_API_KEY
-        source:
-          kind: host_command
-          command: printenv GRAFANA_API_KEY
         export: true
 
   # Claude Code, API-key billing. Setting CLAUDE_CODE_OAUTH_TOKEN instead swaps
@@ -91,6 +83,12 @@ skills:
     destination: skills/root-cause-analysis/SKILL.md
 
 resources:
+  # MCP client config for the Claude Code harness. Baked into the read-only
+  # payload so the agent cannot repoint itself at a different MCP server.
+  - id: mcp-config
+    source: agent://mcp.json
+    destination: mcp.json
+
   - id: watch-config
     source: agent://watch-config.yaml
     destination: watch-config.yaml

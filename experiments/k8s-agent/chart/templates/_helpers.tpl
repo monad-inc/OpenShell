@@ -40,3 +40,27 @@ Secret; falls back to a chart-created one only when credentials.create is set.
 {{- printf "%s-credentials" (include "openshell-agent.fullname" .) -}}
 {{- end -}}
 {{- end -}}
+
+{{/*
+Grafana MCP service name and the host forms the server will accept. The sandbox
+reaches it by cluster DNS, so the FQDN is the name that must be allowed.
+*/}}
+{{/*
+Fixed, not release-derived: the sandbox policy that authorizes this host is
+baked into the agent image and cannot know a Helm release name. One shared MCP
+server per namespace — enable grafanaMcp on exactly one release.
+*/}}
+{{- define "openshell-agent.grafanaMcpService" -}}
+{{- .Values.grafanaMcp.serviceName -}}
+{{- end -}}
+
+{{- define "openshell-agent.grafanaMcpFqdn" -}}
+{{- printf "%s.%s.svc.cluster.local" (include "openshell-agent.grafanaMcpService" .) .Release.Namespace -}}
+{{- end -}}
+
+{{- define "openshell-agent.grafanaMcpAllowedHosts" -}}
+{{- $svc := include "openshell-agent.grafanaMcpService" . -}}
+{{- $fqdn := include "openshell-agent.grafanaMcpFqdn" . -}}
+{{- $port := .Values.grafanaMcp.port | toString -}}
+{{- printf "%s,%s:%s,%s,%s:%s" $fqdn $fqdn $port $svc $svc $port -}}
+{{- end -}}

@@ -445,6 +445,80 @@ docker build -f experiments/k8s-agent/base/Dockerfile -t openshell-agents/base:d
 
 For real credentials, see [deploy/CREDENTIALS.md](deploy/CREDENTIALS.md).
 
+### Grafana over MCP, with per-tool authorization
+
+Grafana is reached through the Grafana MCP server rather than REST, which
+upgrades the security boundary from "which URL paths" to "which tool names".
+
+**The server runs as its own Deployment, not as a stdio subprocess in the
+sandbox.** That placement is the entire point and it inverts the obvious
+instinct. A stdio MCP server would run *inside* the sandbox and make the Grafana
+calls itself, so OpenShell would see only plain REST to Grafana and could
+enforce nothing about MCP — same enforcement as before, more moving parts.
+Running it as a service puts MCP Streamable HTTP on the wire, where
+`protocol: mcp` inspects JSON-RPC and authorizes individual tools.
+
+It also removes the Grafana credential from the agent entirely. The server holds
+it; the agent calls tools. The agent cannot leak a token it never has, and what
+it can reach is bounded by the allowlist rather than by the token's scope.
+
+```yaml
+protocol: mcp
+mcp:
+  versions: ["2025-03-26", "2025-06-18", "2025-11-25"]
+rules:
+  - allow: { method: initialize }
+  - allow: { method: notifications/initialized }
+  - allow: { method: tools/list }
+  - allow:
+      method: tools/call
+      tool:
+        any: [search_dashboards, query_prometheus, query_loki_logs, ...]
+deny_rules:
+  - { method: tools/call, tool: grafana_api_request }
+  - { method: tools/call, tool: update_dashboard }
+```
+
+Measured, from a deploy-time probe run — same host, port, path, and HTTP method,
+differing only in tool name:
+
+```text
+PASS  mcp-initialize:             permitted; upstream said 200
+PASS  mcp-allowed-tool:           permitted (list_datasources)
+PASS  mcp-denied-tool-api-escape: denied by L7 (403)   (grafana_api_request)
+PASS  mcp-denied-tool-write:      denied by L7 (403)   (update_dashboard)
+PASS  grafana-direct-rest:        denied by L4 (no connection)
+```
+
+`grafana_api_request` is the rule that matters most. It proxies an arbitrary
+Grafana API call, so permitting it would make every other tool name in the
+allowlist decorative. It is in `deny_rules` even though the allowlist already
+excludes it, so that widening the allowlist later cannot quietly re-admit it.
+
+`grafana-direct-rest` being denied at L4 confirms the old path is gone: the
+agent has no route to Grafana except through the MCP server.
+
+Three layers hold independently: the server is started with `-disable-write` and
+a narrowed `-enabled-tools`, the sandbox policy allowlists tool names, and the
+service-account token is Viewer-only.
+
+**`mcp.versions` is not optional in practice.** MCP policy pins the protocol
+revision, and omitting the field uses a single pinned default that does not
+include `2025-03-26` — which is what an HTTP client implies when it sends no
+`MCP-Protocol-Version` header. Every `tools/call` is then refused with:
+
+```text
+MCP protocol version 2025-03-26 is not allowed by endpoint policy
+```
+
+which reads exactly like a broken tool matcher and is not one. The supported
+revisions in 0.1.1 are `2025-03-26`, `2025-06-18`, and `2025-11-25`.
+
+The harness loads the server list from the baked payload with `--mcp-config`
+plus `--strict-mcp-config`, so the set of MCP servers an agent can reach is
+fixed at build time and the policy independently decides which tools on them
+may be called.
+
 ### Pin the versions — all three of them
 
 The gateway image, the Helm chart, and the CLI inside the launcher must be the
@@ -648,8 +722,11 @@ On `kind-kind` / `openshell-experiments`, observed directly:
   and pod, and cycles on its watch interval.
 - Four providers registered from the agent manifest with no agent-specific code
   in the deploy script.
-- **All 11 policy probes pass**, covering Grafana read/write, Slack read/write,
-  GitHub org scoping, binary pinning, and an unrelated host.
+- **All 11 policy probes pass**, covering MCP per-tool authorization, Slack
+  read/write, GitHub org scoping, binary pinning, and an unrelated host.
+- Claude Code completes a full MCP handshake through policy — `initialize`,
+  `notifications/initialized`, `tools/list` all authorized — and the MCP server
+  reaches Grafana, failing only on the dummy credential.
 - Credentials reach the sandbox as placeholders; the proxy substitutes them on
   the wire.
 - Agents are isolated per gateway workspace, so profile names carrying enforced
@@ -668,6 +745,9 @@ On `kind-kind` / `openshell-experiments`, observed directly:
 - `slack.channels` is empty — needs real alert channel IDs.
 - Grafana points at the in-cluster kube-prometheus-stack instance, which makes
   probes meaningful locally but is not the production Grafana.
+- The MCP tool allowlist is written from the Grafana MCP tool catalogue, not
+  from watching a real investigation. Expect to narrow it once actual cycles
+  show which tools get used.
 - The repo-watcher agent builds after the restructure but has not been
   redeployed; its values file is ready.
 - Skills are unproven in practice. They encode judgment that only survives

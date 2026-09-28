@@ -1,26 +1,32 @@
 # Policy probes for the on-call triage agent.
 # Format: <label>|<allow|deny>|<command>
 #
-# URLs are written out in full: probe commands run inside the sandbox, where
-# any shell variable defined here would be unset.
+# URLs are written out in full: probe commands run inside the sandbox, where any
+# shell variable defined here would be unset.
 #
-# A bare URL runs through curl and is classified by HTTP status; anything else
-# runs as a command and is classified by exit status.
+# A command starting with curl is classified by HTTP status; anything else is
+# classified by exit status.
 #
 # Classification, given that every host below resolves:
-#   403        -> denied by L7 (host reachable, request refused on method/path)
+#   403        -> denied by L7 (host reachable, request refused)
 #   000        -> denied by L4 (connection refused before any request)
 #   other code -> permitted by policy; the result came from upstream
+#
+# The Grafana probes are MCP JSON-RPC, not REST. What is being asserted is that
+# the proxy authorizes individual tool NAMES: list_datasources is permitted and
+# grafana_api_request is refused, on the same host, port, path, and method.
+# grafana_api_request matters most — it proxies an arbitrary Grafana API call,
+# so permitting it would make the entire tool allowlist meaningless.
 #
 # GitHub probes use git rather than curl on purpose. The github-triage profile
 # pins its binaries to gh and git, so a curl to api.github.com is denied at L4
 # for being the wrong program — which proves binary pinning but says nothing
-# about the path rules. git exercises the rules the profile actually declares.
-grafana-read-search|allow|curl -X GET http://kube-prometheus-stack-grafana.grafana.svc.cluster.local/api/search
-grafana-read-query|allow|curl -X POST http://kube-prometheus-stack-grafana.grafana.svc.cluster.local/api/ds/query
-grafana-write-dashboard|deny|curl -X POST http://kube-prometheus-stack-grafana.grafana.svc.cluster.local/api/dashboards/db
-grafana-write-annotation|deny|curl -X POST http://kube-prometheus-stack-grafana.grafana.svc.cluster.local/api/annotations
-grafana-admin-users|deny|curl -X GET http://kube-prometheus-stack-grafana.grafana.svc.cluster.local/api/admin/users
+# about the path rules.
+mcp-initialize|allow|curl -X POST -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}}' http://grafana-mcp.openshell-experiments.svc.cluster.local:8000/mcp
+mcp-allowed-tool|allow|curl -X POST -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_datasources","arguments":{}}}' http://grafana-mcp.openshell-experiments.svc.cluster.local:8000/mcp
+mcp-denied-tool-api-escape|deny|curl -X POST -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"grafana_api_request","arguments":{}}}' http://grafana-mcp.openshell-experiments.svc.cluster.local:8000/mcp
+mcp-denied-tool-write|deny|curl -X POST -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' -d '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"update_dashboard","arguments":{}}}' http://grafana-mcp.openshell-experiments.svc.cluster.local:8000/mcp
+grafana-direct-rest|deny|curl -X GET http://kube-prometheus-stack-grafana.grafana.svc.cluster.local/api/search
 slack-read-history|allow|curl -X GET https://slack.com/api/conversations.history
 slack-write-post|deny|curl -X POST https://slack.com/api/chat.postMessage
 github-wrong-binary|deny|curl -X GET https://api.github.com/repos/monad-inc/OpenShell
