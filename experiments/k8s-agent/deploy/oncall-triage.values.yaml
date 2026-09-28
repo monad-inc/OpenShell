@@ -33,13 +33,6 @@ launcher:
   image: openshell-agents/oncall-triage-launcher:dev
   imagePullPolicy: IfNotPresent
 
-# Grafana is reached through MCP. The server runs as its own Deployment and
-# holds the Grafana credential; the agent holds none. Its reach is the tool
-# allowlist in agents/oncall-triage/policy.yaml.
-grafanaMcp:
-  enabled: true
-  grafanaUrl: http://kube-prometheus-stack-grafana.grafana.svc.cluster.local
-
 # Asserted against the GitHub provider profile baked into the launcher image.
 # The triage agent is org-scoped because an alert can implicate any service.
 scope:

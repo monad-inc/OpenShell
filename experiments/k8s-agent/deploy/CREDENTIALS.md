@@ -48,27 +48,25 @@ A bot token (`xoxb-`) from a Slack app installed in your workspace.
 A **service account token** with the **Viewer** role. Grafana's legacy API keys
 are deprecated; use a service account.
 
-**This is the agent's own credential.** Grafana is reached through the MCP
-server, but the server holds nothing: the token travels on each request in the
-`X-Grafana-Service-Account-Token` header, which OpenShell injects the same way
-it does for GitHub and Slack. So the usual guarantees hold — the agent receives
-a placeholder and cannot read the real token — and the credential stays scoped
-and attributable to this agent. Give each agent its own token; they will be
-distinguishable in Grafana's audit log.
+This is the agent's own credential and behaves like every other one here. The
+Grafana MCP server runs as a stdio subprocess *inside* the sandbox, so it reads
+this token from the sandbox environment — where it is an OpenShell placeholder —
+and sends it as `Authorization: Bearer <value>` to Grafana. The proxy
+substitutes the real token on the wire. The binary never holds it, and neither
+does the agent.
 
-Viewer is sufficient because every allowed tool reads. The tool allowlist in
-`providers/grafana-mcp.yaml` is a second, independent constraint, and the server
-additionally runs with `-disable-write` and a narrowed `-enabled-tools`.
+Give each agent its own token. They are scoped and attributable independently in
+Grafana's audit log.
 
-Point `grafanaMcp.grafanaUrl` at your instance and set `grafanaMcp.orgId` if you
-need a non-default org.
+Viewer is sufficient because every allowed path reads. `providers/grafana.yaml`
+is a second, independent constraint — a path allowlist with nothing mutating in
+it — and the MCP server additionally runs with `-disable-write` and a narrowed
+`-enabled-tools`.
 
-**Before using a real token, check your CNI.** mcp-grafana honours an
-`X-Grafana-URL` request header over its configured URL, so the egress
-NetworkPolicy confining the server to Grafana is what prevents an injected token
-being forwarded somewhere else. kind's kindnetd does not enforce NetworkPolicy;
-on such a cluster the protection is the `binaries` allowlist alone, which is why
-`curl` is excluded from that provider.
+Which Grafana it talks to is `GRAFANA_URL` in the `mcp_servers` block of
+`agents/oncall-triage/agent.yaml`; what it may reach there is the endpoint in
+`providers/grafana.yaml`. Change both together — the first states intent, the
+second is enforced.
 
 ### `ANTHROPIC_API_KEY`
 

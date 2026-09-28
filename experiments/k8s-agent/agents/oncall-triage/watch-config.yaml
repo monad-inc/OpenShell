@@ -27,10 +27,10 @@ slack:
   cold_start_lookback_seconds: 3600
 
 grafana:
-  # Reached through the Grafana MCP server, not directly. The agent holds no
-  # Grafana credential and never constructs a Grafana URL; it calls MCP tools.
-  # The server's own GRAFANA_URL (chart value grafanaMcp.grafanaUrl) is what
-  # points at the real instance.
+  # Reached through the `grafana` MCP server, which runs as a stdio subprocess
+  # inside this sandbox. Call its tools rather than constructing Grafana URLs.
+  # Which instance it points at is set by GRAFANA_URL in the mcp_servers block
+  # of agent.yaml; what may be reached is set by providers/grafana.yaml.
   via: mcp
   mcp_server: grafana
   # Window queried around an alert's firing time.

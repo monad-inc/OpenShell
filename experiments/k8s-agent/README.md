@@ -445,116 +445,133 @@ docker build -f experiments/k8s-agent/base/Dockerfile -t openshell-agents/base:d
 
 For real credentials, see [deploy/CREDENTIALS.md](deploy/CREDENTIALS.md).
 
-### Grafana over MCP — as an ordinary provider
+### MCP servers run inside the sandbox
 
-Grafana is reached through the Grafana MCP server rather than REST, which moves
-the boundary from "which URL paths" to "which tool names".
+Grafana is reached through the Grafana MCP server, which runs as a **stdio
+subprocess inside the agent's sandbox** — not as a separate service.
 
-**The server runs as its own Deployment and holds no credential.** Both halves
-matter, and the second was a correction.
+That placement is what keeps Grafana an ordinary OpenShell provider. MCP frames
+never cross the sandbox boundary, so what OpenShell sees and enforces is plain
+HTTPS to Grafana: a provider profile with a credential and a path allowlist,
+exactly like GitHub and Slack.
 
-Running it as a service rather than a stdio subprocess is what puts MCP on the
-wire at all: a stdio server would run *inside* the sandbox and make the Grafana
-calls itself, leaving only plain REST for OpenShell to see and nothing about MCP
-to enforce.
-
-Giving the server its own Grafana credential — the first version of this — was
-wrong. It made the token ambient authority for anything that could reach the
-Service: no NetworkPolicy guarded it, mcp-grafana has no caller authentication,
-and the tool allowlist only constrains traffic arriving through the OpenShell
-proxy, so it bounded the agent and nothing else. Credentials were no longer tied
-to a caller, and two agents would have been indistinguishable in Grafana's audit
-log.
-
-mcp-grafana accepts credentials **per request**, so Grafana is now an ordinary
-OpenShell provider like GitHub or Slack:
-
-```yaml
-credentials:
-  - name: service_account_token
-    env_vars: [GRAFANA_SERVICE_ACCOUNT_TOKEN]
-    auth_style: header
-    header_name: X-Grafana-Service-Account-Token
-endpoints:
-  - host: grafana-mcp.openshell-experiments.svc.cluster.local
-    port: 8000
-    path: /mcp
-    protocol: mcp
-    mcp:
-      versions: ["2025-03-26", "2025-06-18", "2025-11-25"]
-    rules:
-      - allow: { method: tools/call, tool: { any: [query_prometheus, ...] } }
-    deny_rules:
-      - { method: tools/call, tool: grafana_api_request }
-```
-
-The agent gets a placeholder, the proxy substitutes the real token on the wire,
-and the credential is scoped and attributable to that agent. An uncredentialed
-caller reaching the Service gets nothing, because there is nothing there to
-borrow. Verified: the Deployment's only env var is `GRAFANA_URL`, `envFrom` is
-empty, and the server's log shows it taking the per-request token to Grafana and
-getting `401 Invalid API key` from the dummy value.
-
-Agent traffic is now authorized under `policy:_provider_grafana_mcp` — a
-provider, not a bare network policy — so `network_policies` is back to `{}`.
-
-### Credential injection is only as safe as a fixed destination
-
-The nastiest thing found here, and it generalizes beyond Grafana.
-
-mcp-grafana lets a request override the server's configured Grafana URL with an
-`X-Grafana-URL` header, and **the header wins**. Verified directly: a server
-pinned to `GRAFANA_URL=http://pinned-by-env.invalid` dialed
-`attacker-supplied.invalid` when asked to.
-
-So an agent able to craft its own request to that endpoint could set
-`X-Grafana-URL` to a host it controls, and the proxy would faithfully inject the
-*real* token into a request the server then forwards there. Placeholder
-substitution stops an agent reading its own credential; it does nothing about an
-agent choosing where the credential gets sent. Any provider whose upstream lets
-the caller pick a forwarding target has this shape.
-
-Two controls, in order of what they are actually worth here:
-
-1. **Binary pinning.** `binaries` on the provider lists only the Claude Code
-   binary — `curl` is deliberately absent. Its MCP client config is baked
-   read-only into the payload and loaded with `--strict-mcp-config`, so it sends
-   exactly the declared headers. Enforced by the OpenShell supervisor, on any
-   cluster.
-2. **An egress NetworkPolicy** confining the MCP server to Grafana, which closes
-   the redirect outright — *on a cluster whose CNI enforces NetworkPolicy*.
-   **kind's default kindnetd does not.** It accepts the object and ignores it.
-   So on this cluster control 1 is doing all the work, and the same is true of
-   OpenShell's own `openshell-sandbox-*` NetworkPolicies in this namespace.
-   Check your CNI before counting on it.
-
-The cost of control 1 is honest: per-tool allow/deny can no longer be asserted
-with curl from inside the sandbox, because reaching the endpoint now requires
-being Claude Code. The rules are still enforced and visible in the supervisor's
-OCSF log as `engine:l7-mcp` decisions naming method and tool. Security beat test
-convenience.
-
-What the deploy probes assert now:
+`mcp-grafana` reads `GRAFANA_SERVICE_ACCOUNT_TOKEN` from its environment and
+sends it as `Authorization: Bearer <value>`. In the sandbox that value is an
+OpenShell placeholder and the proxy substitutes the real token on the wire —
+verified by capturing the header the binary emits:
 
 ```text
-PASS  mcp-wrong-binary:     denied by L4 (no connection)
-PASS  grafana-direct-rest:  denied by L4 (no connection)
-PASS  slack-read-history:   permitted; upstream said 200
-PASS  slack-write-post:     denied by L7 (403)
-PASS  github-wrong-binary:  denied by L4 (no connection)
-PASS  github-org-clone:     command succeeded
-PASS  github-outside-org:   command failed
-PASS  unrelated-host:       denied by L4 (no connection)
+HEADER Authorization: Bearer openshell:resolve:env:GRAFANA_SERVICE_ACCOUNT_TOKEN
 ```
 
-`grafana_api_request` stays in `deny_rules` even though the allowlist excludes
-it: it proxies an arbitrary Grafana API call, so permitting it would make every
-other tool name decorative, and naming it means a later widening cannot quietly
-re-admit it.
+Confirmed running, with the binary itself as the identified process:
 
-Two schema notes worth having: the provider-profile `mcp` block is narrower than
-the sandbox-policy one and rejects `max_body_bytes` as an unknown field; and
-`mcp.versions` is effectively mandatory — see below.
+```text
+ALLOWED /usr/local/bin/mcp-grafana(0) -> kube-prometheus-stack-grafana...:80
+        [policy:_provider_grafana engine:opa]
+```
+
+#### Declaring an MCP server
+
+An agent declares what it needs in `agent.yaml`. One block drives both the image
+build and the client config, so the binaries installed and the servers the agent
+can reach cannot drift apart:
+
+```yaml
+mcp_servers:
+  - id: grafana
+    install:
+      kind: oci_binary
+      image: mcp/grafana:latest
+      source_path: /app/mcp-grafana
+      dest_path: /usr/local/bin/mcp-grafana
+    command: /usr/local/bin/mcp-grafana
+    args: [-disable-write, -enabled-tools, "search,datasource,prometheus,loki,..."]
+    env:
+      GRAFANA_URL: http://kube-prometheus-stack-grafana.grafana.svc.cluster.local
+      GRAFANA_SERVICE_ACCOUNT_TOKEN: ${GRAFANA_SERVICE_ACCOUNT_TOKEN}
+```
+
+At build time `build-agent-image.sh` turns each entry into a multi-stage
+`COPY --from`, so the binary comes straight out of a published image with no
+download step or package manager:
+
+```dockerfile
+FROM mcp/grafana:latest AS mcpsrc0
+...
+COPY --from=mcpsrc0 /app/mcp-grafana /usr/local/bin/mcp-grafana
+```
+
+and generates `mcp.json` into the read-only payload. The harness loads it with
+`--mcp-config` plus `--strict-mcp-config`, so the servers an agent can run are
+fixed at build time. Install kinds are `oci_binary` and `npm`; adding an MCP
+server to an agent is this block and nothing else — no chart change, no service.
+
+Pinning `image` by digest would be better than a tag, and the digest resolves
+under `docker manifest inspect`, but a by-digest pull of this Docker Hub repo
+fails under BuildKit with `insufficient_scope: authorization failed` on an
+anonymous pull. Pin by digest once the image is mirrored somewhere you
+authenticate to.
+
+#### Why not run the MCP server as a service
+
+The first version did, giving it its own Grafana credential. That was wrong, in
+a way worth recording.
+
+It made the token ambient authority for anything that could reach the Service.
+Nothing guarded it — mcp-grafana has no caller authentication, and the tool
+allowlist only constrained traffic arriving through the OpenShell proxy, so it
+bounded the agent and nothing else. Credentials stopped being tied to a caller,
+and two agents would have been indistinguishable in Grafana's audit log.
+
+Moving to per-request credentials fixed the ambient part but exposed something
+sharper: **mcp-grafana honours an `X-Grafana-URL` request header over its
+configured URL, and the header wins.** Verified — a server pinned to
+`pinned-by-env.invalid` dialed `attacker-supplied.invalid` when asked. So an
+agent able to craft a request could have the proxy inject the *real* token into
+a request forwarded to a host it chose. Credential injection is only as safe as
+a fixed destination, and that generalizes to any provider whose upstream lets
+the caller pick a forwarding target.
+
+Closing that needed an egress NetworkPolicy on the server pod — which **kind's
+kindnetd does not enforce**. It accepts the object and ignores it, as it does
+OpenShell's own `openshell-sandbox-*` policies in this namespace.
+
+Running the server in-sandbox removes the whole problem. There is no second
+service, no exposed endpoint, no credential in transit to another pod, and no
+redirect primitive: the destination is the provider endpoint, enforced by
+OpenShell rather than by a CNI feature this cluster lacks.
+
+| | in-sandbox stdio | separate service |
+|---|---|---|
+| Credential | placeholder in env; real value only at the proxy | transmitted to another pod |
+| Destination control | OpenShell egress policy, always enforced | NetworkPolicy, CNI-dependent |
+| Added attack surface | none | a Service any pod can reach |
+| Granularity | HTTP method + path | MCP method + tool name |
+| Extra infra | none | Deployment + Service + NetworkPolicy |
+
+The one thing given up is tool-name granularity. It becomes `-disable-write` and
+`-enabled-tools` on the server invocation, baked into the read-only payload —
+immutable config rather than enforced policy, since a compromised agent could
+re-invoke the binary with other flags. The real boundary reverts to the path
+allowlist, which is directly probeable:
+
+```text
+PASS  grafana-read-search:      permitted; upstream said 401
+PASS  grafana-read-query:       permitted; upstream said 401   (POST /api/ds/query)
+PASS  grafana-write-dashboard:  denied by L7 (403)
+PASS  grafana-write-annotation: denied by L7 (403)
+PASS  grafana-admin-users:      denied by L7 (403)
+```
+
+Read-only is a path allowlist, not a method rule: Grafana's main read endpoint
+is `POST /api/ds/query`, because the query travels in the body.
+
+`curl` is an allowed binary on this provider alongside `mcp-grafana`, and that
+is safe here — both are confined to the same paths with the same injected
+credential, so curl grants no capability the MCP server lacks. It was excluded
+under the service model only because the redirect primitive made binary pinning
+load bearing.
 
 ### Pin the versions — all three of them
 
@@ -759,11 +776,12 @@ On `kind-kind` / `openshell-experiments`, observed directly:
   and pod, and cycles on its watch interval.
 - Four providers registered from the agent manifest with no agent-specific code
   in the deploy script.
-- **All 11 policy probes pass**, covering MCP per-tool authorization, Slack
+- **All 11 policy probes pass**, covering Grafana read/write paths, Slack
   read/write, GitHub org scoping, binary pinning, and an unrelated host.
-- Claude Code completes a full MCP handshake through policy — `initialize`,
-  `notifications/initialized`, `tools/list` all authorized — and the MCP server
-  reaches Grafana, failing only on the dummy credential.
+- The Grafana MCP server runs in-sandbox and its traffic is authorized as an
+  ordinary provider, with the binary named as the acting process.
+- The credential reaches Grafana as a proxy-substituted placeholder; the
+  binary never holds it.
 - Credentials reach the sandbox as placeholders; the proxy substitutes them on
   the wire.
 - Agents are isolated per gateway workspace, so profile names carrying enforced
@@ -782,9 +800,10 @@ On `kind-kind` / `openshell-experiments`, observed directly:
 - `slack.channels` is empty — needs real alert channel IDs.
 - Grafana points at the in-cluster kube-prometheus-stack instance, which makes
   probes meaningful locally but is not the production Grafana.
-- The MCP tool allowlist is written from the Grafana MCP tool catalogue, not
-  from watching a real investigation. Expect to narrow it once actual cycles
-  show which tools get used.
+- `-enabled-tools` is set from the Grafana MCP catalogue, not from watching a
+  real investigation. Expect to narrow it, and the path allowlist, once real
+  cycles show what is actually used.
+- `mcp_servers[].install.image` is pinned by tag, not digest — see above.
 - The repo-watcher agent builds after the restructure but has not been
   redeployed; its values file is ready.
 - Skills are unproven in practice. They encode judgment that only survives
