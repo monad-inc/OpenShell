@@ -43,30 +43,32 @@ A bot token (`xoxb-`) from a Slack app installed in your workspace.
   a channel it is not in.
 - Put the channel IDs (not names) in `slack.channels` in `watch-config.yaml`.
 
-### `GRAFANA_SERVICE_ACCOUNT_TOKEN` (or `GRAFANA_API_KEY`)
+### `GRAFANA_SERVICE_ACCOUNT_TOKEN`
 
 A **service account token** with the **Viewer** role. Grafana's legacy API keys
-are deprecated, and the MCP server warns if you use `GRAFANA_API_KEY`; both keys
-are accepted, prefer the service account one.
+are deprecated; use a service account.
 
-**This credential belongs to the Grafana MCP server, not the agent.** With MCP
-wired up, the agent holds no Grafana credential at all — it calls tools, and the
-server makes the Grafana calls. That changes the threat model in a way worth
-being explicit about:
+**This is the agent's own credential.** Grafana is reached through the MCP
+server, but the server holds nothing: the token travels on each request in the
+`X-Grafana-Service-Account-Token` header, which OpenShell injects the same way
+it does for GitHub and Slack. So the usual guarantees hold — the agent receives
+a placeholder and cannot read the real token — and the credential stays scoped
+and attributable to this agent. Give each agent its own token; they will be
+distinguishable in Grafana's audit log.
 
-- The agent cannot leak a Grafana token, because it never has one.
-- The MCP server becomes a confused deputy: anything the agent can ask it to do,
-  it does with full Viewer rights.
-- What bounds that is the **tool allowlist** in
-  `agents/oncall-triage/policy.yaml`, enforced by OpenShell on the wire, plus
-  `-disable-write` and `-enabled-tools` on the server itself.
+Viewer is sufficient because every allowed tool reads. The tool allowlist in
+`providers/grafana-mcp.yaml` is a second, independent constraint, and the server
+additionally runs with `-disable-write` and a narrowed `-enabled-tools`.
 
-Point `grafanaMcp.grafanaUrl` at your instance. Set `grafanaMcp.orgId` if you
-need a non-default org; otherwise the server logs a warning and uses the default.
+Point `grafanaMcp.grafanaUrl` at your instance and set `grafanaMcp.orgId` if you
+need a non-default org.
 
-Viewer is sufficient because every allowed tool reads. Verified: `list_datasources`
-is permitted while `grafana_api_request` and `update_dashboard` are refused with
-403 — same host, port, path, and HTTP method, different tool name.
+**Before using a real token, check your CNI.** mcp-grafana honours an
+`X-Grafana-URL` request header over its configured URL, so the egress
+NetworkPolicy confining the server to Grafana is what prevents an injected token
+being forwarded somewhere else. kind's kindnetd does not enforce NetworkPolicy;
+on such a cluster the protection is the `binaries` allowlist alone, which is why
+`curl` is excluded from that provider.
 
 ### `ANTHROPIC_API_KEY`
 
@@ -102,7 +104,7 @@ agent manifest declares:
 |---|---|
 | `GITHUB_TOKEN` | yes |
 | `SLACK_BOT_TOKEN` | yes |
-| `GRAFANA_SERVICE_ACCOUNT_TOKEN` or `GRAFANA_API_KEY` | yes — read by the MCP server, not the agent |
+| `GRAFANA_SERVICE_ACCOUNT_TOKEN` | yes — the agent's own, injected per request |
 | `ANTHROPIC_API_KEY` *or* `CLAUDE_CODE_OAUTH_TOKEN` | exactly one |
 
 ### Local testing: a values file kept out of git

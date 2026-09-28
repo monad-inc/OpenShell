@@ -75,6 +75,14 @@ grafanaMcp:
   logLevel: info
   # Optional: target a specific Grafana org instead of the default.
   orgId: ""
+  # Namespace and port of the Grafana the MCP server may reach. Used by the
+  # egress NetworkPolicy, which is what confines credential redirection.
+  grafanaNamespace: grafana
+  grafanaPort: 80
+  networkPolicy:
+    # Rendered by default. Note that kind's kindnetd does not enforce
+    # NetworkPolicy — see templates/grafana-mcp-netpol.yaml.
+    enabled: true
   resources:
     requests:
       cpu: 50m

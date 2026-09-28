@@ -4,14 +4,14 @@
 #
 # Division of responsibility:
 #   * filesystem_policy / process    — what the agent can touch locally.
-#   * provider profiles              — credentialed egress (GitHub, Slack, Claude).
-#   * network_policies below         — non-credentialed egress, which for this
-#                                      agent is the Grafana MCP server.
+#   * provider profiles              — all egress, because all of it is
+#                                      credentialed: GitHub, Slack, Claude, and
+#                                      Grafana-via-MCP.
 #
-# Grafana is reached through MCP rather than REST, and the agent holds no
-# Grafana credential: the MCP server holds it. So this endpoint needs no
-# provider, only a network policy — and because MCP is on the wire, the policy
-# can authorize individual tool names instead of URL paths.
+# Grafana is reached through MCP rather than REST. The MCP server holds no
+# credential; this agent's own service-account token is injected into each
+# request by the proxy, exactly as for every other provider. Because MCP is on
+# the wire, the profile authorizes individual tool names rather than URL paths.
 version: 1
 
 filesystem_policy:
@@ -29,96 +29,8 @@ process:
   run_as_user: sandbox
   run_as_group: sandbox
 
-network_policies:
-  grafana_mcp:
-    name: grafana_mcp
-    endpoints:
-      - host: grafana-mcp.openshell-experiments.svc.cluster.local
-        port: 8000
-        path: /mcp
-        protocol: mcp
-        enforcement: enforce
-        # Private cluster IP: an in-namespace Service resolves to RFC 1918
-        # space, which policy otherwise treats as an SSRF risk.
-        allowed_ips: ["10.0.0.0/8"]
-        mcp:
-          # Loki and Prometheus results are large; the default 64 KiB buffer is
-          # for request bodies, but tool arguments with long queries can grow.
-          max_body_bytes: 131072
-          # MCP policy pins the protocol revision, and omitting this uses a
-          # single pinned default that does NOT include 2025-03-26 — which is
-          # what an HTTP client implies when it sends no MCP-Protocol-Version
-          # header. Every tools/call is then refused with:
-          #   MCP protocol version 2025-03-26 is not allowed by endpoint policy
-          # which reads like a tool-matcher problem and is not one.
-          #
-          # These are the revisions 0.1.1 supports. Narrow this to the single
-          # revision your client actually negotiates once you have confirmed it.
-          versions: ["2025-03-26", "2025-06-18", "2025-11-25"]
-        rules:
-          # MCP handshake. The client sends these before any tool call.
-          - allow: { method: initialize }
-          - allow: { method: notifications/initialized }
-          # Tool discovery: the harness asks what exists before calling.
-          - allow: { method: tools/list }
-          # The read surface an on-call investigation actually needs.
-          - allow:
-              method: tools/call
-              tool:
-                any:
-                  # Dashboards: find what humans already built for a service,
-                  # and read the queries they considered meaningful.
-                  - search_dashboards
-                  - get_dashboard_by_uid
-                  - get_dashboard_panel_queries
-                  - get_dashboard_summary
-                  - get_dashboard_property
-                  # Datasource discovery.
-                  - list_datasources
-                  - get_datasource
-                  # Metrics.
-                  - query_prometheus
-                  - list_prometheus_metric_names
-                  - list_prometheus_metric_metadata
-                  - list_prometheus_label_names
-                  - list_prometheus_label_values
-                  # Logs.
-                  - query_loki_logs
-                  - query_loki_stats
-                  - query_loki_patterns
-                  - list_loki_label_names
-                  - list_loki_label_values
-                  # Alert state and the rules behind it.
-                  - list_alert_groups
-                  - get_alert_group
-                  # Deploy markers and incident context recorded by humans.
-                  - get_annotations
-                  - get_annotation_tags
-                  - list_incidents
-                  - get_incident
-                  - get_current_oncall_users
-                  # Sift: Grafana's own investigation helpers.
-                  - find_error_pattern_logs
-                  - find_slow_requests
-        deny_rules:
-          # Redundant against the allowlist above, and kept deliberately.
-          #
-          # grafana_api_request is an escape hatch: it proxies an arbitrary
-          # Grafana API call, which would bypass every tool name listed above.
-          # Naming it explicitly means widening the allowlist later cannot
-          # quietly re-admit it.
-          - method: tools/call
-            tool: grafana_api_request
-          - method: tools/call
-            tool: update_dashboard
-    binaries:
-      # Claude Code's MCP client runs inside the node process. An npm global
-      # install resolves /usr/bin/claude to this path, and binary identity is
-      # judged on the resolved executable.
-      - { path: /usr/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe }
-      - { path: /usr/bin/claude }
-      - { path: /usr/local/bin/claude }
-      # curl is here for the deploy-time policy probes, which assert that an
-      # allowed tool is permitted and a denied one is refused.
-      - { path: /usr/bin/curl }
-      - { path: /usr/local/bin/curl }
+# Empty on purpose: every egress this agent has is credentialed, so it belongs
+# to a provider profile. Grafana included — it is reached through the MCP server
+# with this agent's own token injected per request, which makes it an ordinary
+# provider rather than a special case.
+network_policies: {}

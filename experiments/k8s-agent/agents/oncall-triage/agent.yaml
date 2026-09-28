@@ -31,9 +31,6 @@ settings:
   - key: providers_v2_enabled
     value: true
 
-# No Grafana provider. Grafana is reached through the MCP server, which holds
-# the Grafana credential itself — so the agent has none to hold, and its reach
-# is bounded by the tool allowlist in policy.yaml rather than by a token.
 providers:
   - id: github-triage
     name: github-triage
@@ -44,6 +41,19 @@ providers:
         source:
           kind: host_command
           command: printenv GITHUB_TOKEN
+        export: true
+
+  # Grafana through MCP. The MCP server holds no credential; this token is
+  # injected per request, so it is scoped and attributable to this agent.
+  - id: grafana-mcp
+    name: grafana-mcp
+    profile: grafana-mcp
+    credential_mode: explicit
+    credentials:
+      - env: GRAFANA_SERVICE_ACCOUNT_TOKEN
+        source:
+          kind: host_command
+          command: printenv GRAFANA_SERVICE_ACCOUNT_TOKEN
         export: true
 
   - id: slack-oncall-reader
