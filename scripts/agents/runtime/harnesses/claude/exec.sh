@@ -108,6 +108,19 @@ CLAUDE_ARGS=(
     --dangerously-skip-permissions
 )
 
+# MCP servers, when the agent payload declares them.
+#
+# --strict-mcp-config is deliberate: it confines the harness to exactly the
+# servers in the baked payload and ignores any other MCP config that happens to
+# be discoverable. The payload is mounted read-only, so the set of MCP servers
+# an agent can reach is fixed at build time — and the sandbox policy
+# independently authorizes which tools on those servers may be called.
+MCP_CONFIG="$PAYLOAD_DIR/mcp.json"
+if [[ -f "$MCP_CONFIG" ]]; then
+    echo "openshell-agent: loading MCP config from $MCP_CONFIG" >&2
+    CLAUDE_ARGS+=(--mcp-config "$MCP_CONFIG" --strict-mcp-config)
+fi
+
 echo "openshell-agent: invoking Claude Code bounded cycle" >&2
 
 exec "$CLAUDE_BIN" "${CLAUDE_ARGS[@]}" < "$PROMPT_FILE"

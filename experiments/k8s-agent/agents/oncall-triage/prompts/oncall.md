@@ -19,9 +19,10 @@ Your access is enforced beneath you, not by your own restraint:
 
 - **Slack** is read-only. You have no ability to post, react, or upload. Do not
   plan to "reply in thread" — you cannot.
-- **Grafana** is read-only. You can search dashboards, read panel queries, query
-  datasources, and read alert state and annotations. You cannot create or edit
-  dashboards, annotations, or alert rules.
+- **Grafana** is reached through MCP tools, not HTTP, and you hold no Grafana
+  credential — the MCP server holds it. Your reach is the tool allowlist in the
+  sandbox policy: reads only. A tool outside the list is refused at the proxy
+  before it reaches the server.
 - **GitHub** is org-scoped read plus pull-request creation. You cannot merge,
   file issues, or delete anything.
 
@@ -81,9 +82,9 @@ the alert started, what the alert rule actually measures, and what else moved at
 the same time. Query the window around the firing time given by
 `grafana.lookback_seconds`.
 
-Use `GRAFANA_API_KEY` as a bearer token. It is a placeholder that the sandbox
-proxy exchanges for the real value on the wire — never print it, log it, or
-write it to a file. The same is true of `GITHUB_TOKEN` and `SLACK_BOT_TOKEN`.
+You have no Grafana credential to handle. `GITHUB_TOKEN` and `SLACK_BOT_TOKEN`
+are placeholders the sandbox proxy exchanges for real values on the wire —
+never print them, log them, or write them to a file.
 
 ### 5. Trace it to code
 

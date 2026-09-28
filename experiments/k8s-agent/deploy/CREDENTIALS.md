@@ -43,20 +43,30 @@ A bot token (`xoxb-`) from a Slack app installed in your workspace.
   a channel it is not in.
 - Put the channel IDs (not names) in `slack.channels` in `watch-config.yaml`.
 
-### `GRAFANA_API_KEY`
+### `GRAFANA_SERVICE_ACCOUNT_TOKEN` (or `GRAFANA_API_KEY`)
 
 A **service account token** with the **Viewer** role. Grafana's legacy API keys
-are deprecated; use a service account.
+are deprecated, and the MCP server warns if you use `GRAFANA_API_KEY`; both keys
+are accepted, prefer the service account one.
 
-Viewer is sufficient because the agent only reads. `providers/grafana-reader.yaml`
-independently allows only observing endpoints — verified: `POST /api/ds/query`
-is permitted (Grafana's read path takes a POST body) while
-`POST /api/dashboards/db` and `POST /api/annotations` are refused with 403.
+**This credential belongs to the Grafana MCP server, not the agent.** With MCP
+wired up, the agent holds no Grafana credential at all — it calls tools, and the
+server makes the Grafana calls. That changes the threat model in a way worth
+being explicit about:
 
-Point `grafana.url` in `watch-config.yaml` and the `host`/`port` in
-`providers/grafana-reader.yaml` at your instance. **Both.** The config states
-intent; the profile is what permits egress, and a mismatch produces an agent
-that tries and is refused.
+- The agent cannot leak a Grafana token, because it never has one.
+- The MCP server becomes a confused deputy: anything the agent can ask it to do,
+  it does with full Viewer rights.
+- What bounds that is the **tool allowlist** in
+  `agents/oncall-triage/policy.yaml`, enforced by OpenShell on the wire, plus
+  `-disable-write` and `-enabled-tools` on the server itself.
+
+Point `grafanaMcp.grafanaUrl` at your instance. Set `grafanaMcp.orgId` if you
+need a non-default org; otherwise the server logs a warning and uses the default.
+
+Viewer is sufficient because every allowed tool reads. Verified: `list_datasources`
+is permitted while `grafana_api_request` and `update_dashboard` are refused with
+403 — same host, port, path, and HTTP method, different tool name.
 
 ### `ANTHROPIC_API_KEY`
 
@@ -92,7 +102,7 @@ agent manifest declares:
 |---|---|
 | `GITHUB_TOKEN` | yes |
 | `SLACK_BOT_TOKEN` | yes |
-| `GRAFANA_API_KEY` | yes for this agent |
+| `GRAFANA_SERVICE_ACCOUNT_TOKEN` or `GRAFANA_API_KEY` | yes — read by the MCP server, not the agent |
 | `ANTHROPIC_API_KEY` *or* `CLAUDE_CODE_OAUTH_TOKEN` | exactly one |
 
 ### Local testing: a values file kept out of git

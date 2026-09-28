@@ -1,0 +1,110 @@
+{{- /* SPDX-License-Identifier: Apache-2.0 */ -}}
+{{- if .Values.grafanaMcp.enabled }}
+{{- /*
+The Grafana MCP server runs as its own Deployment, NOT as a stdio subprocess
+inside the sandbox. That placement is the whole point.
+
+A stdio MCP server would run inside the sandbox and make the Grafana HTTP calls
+itself, so OpenShell would see only plain REST to Grafana and could enforce
+nothing about MCP. Running it as a separate service puts MCP Streamable HTTP on
+the wire between the sandbox and the server, where `protocol: mcp` can inspect
+JSON-RPC and authorize individual tool names.
+
+It also moves the Grafana credential out of the agent entirely: the server holds
+it, the agent never sees it, and what the agent can reach through it is bounded
+by the tool allowlist in the sandbox policy.
+*/ -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "openshell-agent.fullname" . }}-grafana-mcp
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "openshell-agent.labels" . | nindent 4 }}
+    app.kubernetes.io/component: grafana-mcp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "openshell-agent.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: grafana-mcp
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "openshell-agent.name" . }}
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: grafana-mcp
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: grafana-mcp
+          image: {{ .Values.grafanaMcp.image | quote }}
+          imagePullPolicy: {{ .Values.grafanaMcp.imagePullPolicy }}
+          args:
+            - -t
+            - streamable-http
+            - -address
+            - 0.0.0.0:{{ .Values.grafanaMcp.port }}
+            - -endpoint-path
+            - {{ .Values.grafanaMcp.endpointPath | quote }}
+            # The server validates the Host header. The sandbox proxy forwards
+            # the service DNS name, so list the forms it can arrive as rather
+            # than disabling validation with "*".
+            - -allowed-hosts
+            - {{ include "openshell-agent.grafanaMcpAllowedHosts" . | quote }}
+            # Defense in depth. The sandbox policy already allows only read
+            # tools; this makes the server itself refuse to expose write tools
+            # at all, so a policy mistake cannot turn into a Grafana mutation.
+            - -disable-write
+            - -enabled-tools
+            - {{ .Values.grafanaMcp.enabledTools | quote }}
+            - -log-level
+            - {{ .Values.grafanaMcp.logLevel }}
+          env:
+            - name: GRAFANA_URL
+              value: {{ .Values.grafanaMcp.grafanaUrl | quote }}
+            {{- with .Values.grafanaMcp.orgId }}
+            # Without this the server logs a warning and uses the default org.
+            - name: GRAFANA_ORG_ID
+              value: {{ . | quote }}
+            {{- end }}
+          envFrom:
+            # Supplies GRAFANA_API_KEY. Same Secret the deploy Job reads, so
+            # there is one place credentials live.
+            - secretRef:
+                name: {{ include "openshell-agent.secretName" . }}
+          ports:
+            - name: mcp
+              containerPort: {{ .Values.grafanaMcp.port }}
+          resources:
+            {{- toYaml .Values.grafanaMcp.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "openshell-agent.grafanaMcpService" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "openshell-agent.labels" . | nindent 4 }}
+    app.kubernetes.io/component: grafana-mcp
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: {{ include "openshell-agent.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: grafana-mcp
+  ports:
+    - name: mcp
+      port: {{ .Values.grafanaMcp.port }}
+      targetPort: mcp
+{{- end }}

@@ -27,9 +27,12 @@ slack:
   cold_start_lookback_seconds: 3600
 
 grafana:
-  # Base URL of the Grafana instance. Must match the host in
-  # providers/grafana-reader.yaml, which is what actually permits egress.
-  url: http://kube-prometheus-stack-grafana.grafana.svc.cluster.local
+  # Reached through the Grafana MCP server, not directly. The agent holds no
+  # Grafana credential and never constructs a Grafana URL; it calls MCP tools.
+  # The server's own GRAFANA_URL (chart value grafanaMcp.grafanaUrl) is what
+  # points at the real instance.
+  via: mcp
+  mcp_server: grafana
   # Window queried around an alert's firing time.
   lookback_seconds: 3600
   # Datasource UIDs the agent should prefer. Empty means discover via /api/datasources.

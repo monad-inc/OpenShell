@@ -56,6 +56,32 @@ scope:
     repo: monad-inc/OpenShell
   verify: true
 
+# Grafana MCP server, deployed as its own service rather than as a stdio
+# subprocess in the sandbox. See templates/grafana-mcp.yaml for why that
+# placement is what makes per-tool policy possible at all.
+grafanaMcp:
+  enabled: false
+  # Fixed name: the agent's baked policy authorizes this exact host.
+  serviceName: grafana-mcp
+  image: mcp/grafana:latest
+  imagePullPolicy: IfNotPresent
+  port: 8000
+  endpointPath: /mcp
+  # Grafana this server talks to. It holds the credential; the agent does not.
+  grafanaUrl: http://kube-prometheus-stack-grafana.grafana.svc.cluster.local
+  # Tool categories the server exposes at all. Narrower than the default set:
+  # an on-call agent has no use for plugin installation or provisioning.
+  enabledTools: search,datasource,prometheus,loki,alerting,dashboard,incident,oncall,annotations,sift
+  logLevel: info
+  # Optional: target a specific Grafana org instead of the default.
+  orgId: ""
+  resources:
+    requests:
+      cpu: 50m
+      memory: 96Mi
+    limits:
+      memory: 256Mi
+
 # After deploying, assert the policy behaves as the provider profiles claim.
 # Adds ~20s to a deploy and fails the release on a mismatch.
 policyProbe:
@@ -87,7 +113,13 @@ credentials:
   create: false
   githubToken: ""
   slackBotToken: ""
-  # Only required by agents whose manifest declares a Grafana provider.
+  # Consumed by the Grafana MCP server, not by the agent. With MCP the agent
+  # holds no Grafana credential at all.
+  #
+  # Prefer grafanaServiceAccountToken: mcp/grafana warns that GRAFANA_API_KEY is
+  # deprecated in favour of GRAFANA_SERVICE_ACCOUNT_TOKEN, and Grafana's own API
+  # keys are deprecated in favour of service accounts.
+  grafanaServiceAccountToken: ""
   grafanaApiKey: ""
   # Exactly one of these. Both set is rejected by the launcher and again by the
   # harness adapter, so billing attribution stays unambiguous.
