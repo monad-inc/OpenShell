@@ -113,9 +113,26 @@ require "fileutils"
   end
 end
 
+# MCP client config, generated from the manifest rather than hand-maintained,
+# so the servers an agent can reach and the binaries installed for it cannot
+# drift apart.
+mcp_servers = manifest["mcp_servers"] || []
+unless mcp_servers.empty?
+  require "json"
+  config = { "mcpServers" => {} }
+  mcp_servers.each do |server|
+    entry = { "command" => server.fetch("command") }
+    entry["args"] = server["args"] if server["args"]
+    entry["env"] = server["env"] if server["env"]
+    config["mcpServers"][server.fetch("id")] = entry
+  end
+  File.write(File.join(payload_dir, "mcp.json"), JSON.pretty_generate(config) + "\n")
+end
+
 skill_ids = (manifest["skills"] || []).map { |e| e.fetch("id") }
 puts "harness=#{harness} run_mode=#{run_mode} poll=#{poll_interval}s payload_version=#{payload_version}"
 puts "skills=#{skill_ids.empty? ? '(none)' : skill_ids.join(',')}"
+puts "mcp_servers=#{mcp_servers.empty? ? '(none)' : mcp_servers.map { |m| m.fetch('id') }.join(',')}"
 RUBY
 
 # Content digest over the staged skills. This is the version identity for the
@@ -136,6 +153,55 @@ tar -C "$AGENT_DIR" --exclude './logs' -cf - . | tar -C "$STAGE" -xf -
 
 # Same payload-immutability treatment run.sh applies: root-owned, world
 # readable, and stripped of write bits so the agent cannot edit its own guts.
+# Install declared MCP server binaries into the image. `oci_binary` copies a
+# binary straight out of a published image with a multi-stage COPY --from, so
+# no download step and no package manager is involved, and pinning the source
+# image by digest makes the build reproducible.
+ruby -ryaml - "$AGENT_DIR/agent.yaml" "$STAGE/Dockerfile" <<'RUBY'
+manifest_path, dockerfile_path = ARGV
+manifest = YAML.load_file(manifest_path) || {}
+servers = manifest["mcp_servers"] || []
+exit 0 if servers.empty?
+
+lines = File.readlines(dockerfile_path)
+final_from = lines.rindex { |line| line.strip.start_with?("FROM ") } or abort "no FROM in Dockerfile"
+final_user = lines[final_from..].reverse.find { |line| line.strip.start_with?("USER ") }&.strip
+
+stages = []
+copies = []
+servers.each_with_index do |server, index|
+  install = server["install"] or next
+  case install.fetch("kind")
+  when "oci_binary"
+    stage = "mcpsrc#{index}"
+    stages << "FROM #{install.fetch("image")} AS #{stage}"
+    copies << "COPY --from=#{stage} #{install.fetch("source_path")} #{install.fetch("dest_path")}"
+    copies << "RUN chmod 0755 #{install.fetch("dest_path")}"
+  when "npm"
+    copies << "RUN npm install -g #{install.fetch("package")} && (npm cache clean --force >/dev/null 2>&1 || true)"
+  else
+    abort "unsupported mcp_servers install kind: #{install.fetch("kind")}"
+  end
+end
+
+# Source stages must precede the final FROM that copies from them.
+unless stages.empty?
+  lines.insert(final_from, *stages.map { |stage| stage + "\n" })
+end
+
+trailer = []
+trailer << "\n"
+trailer << "# MCP server binaries declared in agent.yaml\n"
+trailer << "USER root\n"
+copies.each { |copy| trailer << copy + "\n" }
+trailer << final_user + "\n" if final_user
+
+# Write the whole file: the inserted FROM stages live in `lines`, so appending
+# alone would silently drop them and leave COPY --from pointing at a stage that
+# does not exist — which BuildKit then tries to pull as an image name.
+File.write(dockerfile_path, (lines + trailer).join)
+RUBY
+
 ruby - "$STAGE/Dockerfile" "$PAYLOAD_IMAGE_DIR" <<'RUBY'
 dockerfile_path, payload_image_dir = ARGV
 lines = File.readlines(dockerfile_path)

@@ -17,18 +17,15 @@
 # pins its binaries to gh and git, so a curl to api.github.com is denied at L4
 # for being the wrong program — which proves binary pinning but says nothing
 # about the path rules.
-# Only the Claude Code binary may speak to the MCP endpoint. curl is absent
-# from that provider's `binaries`, so a hand-crafted request — which could set
-# an X-Grafana-URL header and redirect an injected token — cannot be made at
-# all. This is the control that works regardless of CNI.
-#
-# The cost is that the per-tool allow/deny rules can no longer be asserted with
-# curl from inside the sandbox: reaching the endpoint at all now requires being
-# Claude Code. Those rules are still enforced, and visible in the supervisor's
-# OCSF log as `engine:l7-mcp` decisions naming the method and tool. Security
-# beat test convenience here.
-mcp-wrong-binary|deny|curl -X POST -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' http://grafana-mcp.openshell-experiments.svc.cluster.local:8000/mcp
-grafana-direct-rest|deny|curl -X GET http://kube-prometheus-stack-grafana.grafana.svc.cluster.local/api/search
+# Grafana is reached by an in-sandbox MCP server over stdio, so what crosses
+# the boundary is ordinary HTTPS and the path allowlist is directly probeable.
+# curl is an allowed binary for this provider and grants nothing mcp-grafana
+# lacks — both are confined to the same paths with the same injected credential.
+grafana-read-search|allow|curl -X GET http://kube-prometheus-stack-grafana.grafana.svc.cluster.local/api/search
+grafana-read-query|allow|curl -X POST http://kube-prometheus-stack-grafana.grafana.svc.cluster.local/api/ds/query
+grafana-write-dashboard|deny|curl -X POST http://kube-prometheus-stack-grafana.grafana.svc.cluster.local/api/dashboards/db
+grafana-write-annotation|deny|curl -X POST http://kube-prometheus-stack-grafana.grafana.svc.cluster.local/api/annotations
+grafana-admin-users|deny|curl -X GET http://kube-prometheus-stack-grafana.grafana.svc.cluster.local/api/admin/users
 slack-read-history|allow|curl -X GET https://slack.com/api/conversations.history
 slack-write-post|deny|curl -X POST https://slack.com/api/chat.postMessage
 github-wrong-binary|deny|curl -X GET https://api.github.com/repos/monad-inc/OpenShell

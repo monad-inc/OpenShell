@@ -43,11 +43,12 @@ providers:
           command: printenv GITHUB_TOKEN
         export: true
 
-  # Grafana through MCP. The MCP server holds no credential; this token is
-  # injected per request, so it is scoped and attributable to this agent.
-  - id: grafana-mcp
-    name: grafana-mcp
-    profile: grafana-mcp
+  # Grafana. The MCP server runs as a stdio subprocess inside this sandbox
+  # (see mcp_servers below), so what crosses the sandbox boundary is ordinary
+  # HTTPS to Grafana — which makes this an ordinary provider.
+  - id: grafana
+    name: grafana
+    profile: grafana
     credential_mode: explicit
     credentials:
       - env: GRAFANA_SERVICE_ACCOUNT_TOKEN
@@ -81,6 +82,47 @@ providers:
           command: printenv ANTHROPIC_API_KEY
         export: true
 
+# MCP servers available to this agent.
+#
+# Each entry does two things: it tells the image build how to get the server's
+# binary into the sandbox, and it generates the Claude Code MCP client config
+# baked into the read-only payload. Adding an MCP server to an agent is this
+# block and nothing else — no chart change, no extra service.
+#
+# These run over stdio inside the sandbox, so MCP frames never cross the
+# sandbox boundary. What OpenShell sees and enforces is the HTTP the server
+# makes to its upstream, governed by that upstream's provider profile. The
+# credential reaches the server as a placeholder in its environment and is
+# substituted by the proxy on the wire, so the binary never holds it.
+mcp_servers:
+  - id: grafana
+    install:
+      # Copies a binary out of a published image at build time via a
+      # multi-stage COPY --from: no download step, no package manager.
+      #
+      # A digest would be better than a tag for reproducibility, and the digest
+      # resolves fine with `docker manifest inspect`, but a by-digest pull of
+      # this Docker Hub repo fails under BuildKit with
+      # "insufficient_scope: authorization failed" on an anonymous pull. Pin by
+      # digest once the image is mirrored to a registry you authenticate to.
+      kind: oci_binary
+      image: mcp/grafana:latest
+      source_path: /app/mcp-grafana
+      dest_path: /usr/local/bin/mcp-grafana
+    command: /usr/local/bin/mcp-grafana
+    args:
+      # Narrow the surface at the server too, not only in policy.
+      - -disable-write
+      - -enabled-tools
+      - search,datasource,prometheus,loki,alerting,dashboard,incident,oncall,annotations,sift
+    env:
+      GRAFANA_URL: http://kube-prometheus-stack-grafana.grafana.svc.cluster.local
+      # Resolved by Claude Code from the sandbox environment, where it is an
+      # OpenShell placeholder. mcp-grafana forwards it as
+      # `Authorization: Bearer <value>` and the proxy substitutes the real
+      # token — verified.
+      GRAFANA_SERVICE_ACCOUNT_TOKEN: ${GRAFANA_SERVICE_ACCOUNT_TOKEN}
+
 skills:
   - id: alert-triage
     source: agent://skills/alert-triage/SKILL.md
@@ -93,12 +135,6 @@ skills:
     destination: skills/root-cause-analysis/SKILL.md
 
 resources:
-  # MCP client config for the Claude Code harness. Baked into the read-only
-  # payload so the agent cannot repoint itself at a different MCP server.
-  - id: mcp-config
-    source: agent://mcp.json
-    destination: mcp.json
-
   - id: watch-config
     source: agent://watch-config.yaml
     destination: watch-config.yaml

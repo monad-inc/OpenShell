@@ -1,0 +1,88 @@
+# SPDX-License-Identifier: Apache-2.0
+
+# Grafana, read-only.
+#
+# The Grafana MCP server runs as a stdio subprocess inside the sandbox (declared
+# in agent.yaml under mcp_servers), so MCP frames never leave the sandbox. What
+# crosses the boundary is ordinary HTTPS to Grafana, which makes this an
+# ordinary provider — no second service, nothing exposed, and the credential
+# never leaves OpenShell's trust boundary.
+#
+# mcp-grafana reads GRAFANA_SERVICE_ACCOUNT_TOKEN from its environment and sends
+# it as `Authorization: Bearer <value>`. In the sandbox that value is an
+# OpenShell placeholder, and the proxy substitutes the real token on the wire —
+# verified by capturing the header the binary emits.
+#
+# Read-only cannot be expressed as "deny POST": Grafana's main read endpoint is
+# POST /api/ds/query, because the query travels in the body. What makes this
+# read-only is the path allowlist. Nothing mutating is listed, so dashboard
+# writes, annotation creation, alert-rule edits, datasource changes, user and
+# org administration, and every DELETE are refused by the proxy.
+#
+# Note on `binaries`: curl is included alongside mcp-grafana, and that is safe
+# here. Both can reach only the paths below with the injected credential, so
+# curl grants no capability mcp-grafana lacks. This differs from the
+# MCP-over-HTTP arrangement, where a caller could redirect the credential with
+# an X-Grafana-URL header and binary pinning was load bearing. With the server
+# in-process there is no redirect primitive: the destination is this endpoint,
+# enforced by OpenShell. Keeping curl means the policy stays probeable.
+id: grafana
+display_name: Grafana (read-only)
+description: Read-only Grafana access for alert investigation, used by the in-sandbox Grafana MCP server
+category: data
+credentials:
+  - name: service_account_token
+    description: Grafana service account token (Viewer) belonging to this agent
+    env_vars: [GRAFANA_SERVICE_ACCOUNT_TOKEN, GRAFANA_API_KEY]
+    required: true
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [service_account_token]
+endpoints:
+  - host: kube-prometheus-stack-grafana.grafana.svc.cluster.local
+    port: 80
+    protocol: rest
+    enforcement: enforce
+    # An in-cluster Service resolves into RFC 1918 space, which policy
+    # otherwise treats as an SSRF risk.
+    allowed_ips: ["10.0.0.0/8"]
+    rules:
+      # Identity and reachability preflight. mcp-grafana calls these on startup.
+      - allow: { method: GET, path: "/api/health" }
+      - allow: { method: GET, path: "/api/org" }
+      - allow: { method: GET, path: "/api/user" }
+      - allow: { method: GET, path: "/api/frontend/settings" }
+
+      # Dashboards: find what humans already built, and read their queries.
+      - allow: { method: GET, path: "/api/search" }
+      - allow: { method: GET, path: "/api/dashboards/uid/**" }
+      - allow: { method: GET, path: "/api/folders" }
+      - allow: { method: GET, path: "/api/folders/**" }
+
+      # Datasource discovery.
+      - allow: { method: GET, path: "/api/datasources" }
+      - allow: { method: GET, path: "/api/datasources/uid/**" }
+
+      # The main read path. POST by API shape, not by intent.
+      - allow: { method: POST, path: "/api/ds/query" }
+
+      # Datasource proxy — how Loki and Prometheus are actually queried.
+      - allow: { method: GET, path: "/api/datasources/proxy/**" }
+      - allow: { method: POST, path: "/api/datasources/proxy/**" }
+
+      # Alert state and the rules behind it.
+      - allow: { method: GET, path: "/api/alertmanager/grafana/api/v2/alerts" }
+      - allow: { method: GET, path: "/api/alertmanager/grafana/api/v2/alerts/groups" }
+      - allow: { method: GET, path: "/api/v1/rules" }
+      - allow: { method: GET, path: "/api/ruler/grafana/api/v1/rules" }
+      - allow: { method: GET, path: "/api/v1/provisioning/alert-rules" }
+      - allow: { method: GET, path: "/api/v1/provisioning/alert-rules/**" }
+
+      # Deploy markers and incident context recorded by humans. GET only.
+      - allow: { method: GET, path: "/api/annotations" }
+      - allow: { method: GET, path: "/api/annotations/tags" }
+binaries:
+  - /usr/local/bin/mcp-grafana
+  - /usr/bin/curl
+  - /usr/local/bin/curl
