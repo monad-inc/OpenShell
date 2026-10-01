@@ -31,6 +31,7 @@ use prost::Message;
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::future::Future;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -240,7 +241,7 @@ impl MultiplexService {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        self.serve_with_peer_identity(stream, None).await
+        self.serve_with_peer_identity_from(stream, None, None).await
     }
 
     /// Serve a TLS connection with an optional mTLS peer identity.
@@ -248,6 +249,22 @@ impl MultiplexService {
         &self,
         stream: S,
         peer_identity: Option<Identity>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        self.serve_with_peer_identity_from(stream, peer_identity, None)
+            .await
+    }
+
+    /// Like [`Self::serve_with_peer_identity`], additionally carrying the
+    /// connection's remote address for authentication audit `src_endpoint`.
+    /// The WebSocket tunnel passes the tunneled client's address here.
+    pub async fn serve_with_peer_identity_from<S>(
+        &self,
+        stream: S,
+        peer_identity: Option<Identity>,
+        peer_addr: Option<SocketAddr>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -277,10 +294,11 @@ impl MultiplexService {
                 .flatten(),
             self.state.config.mtls_auth.enabled,
             self.state.config.auth.allow_unauthenticated_users,
-        );
+        )
+        .with_audit(self.state.config.audit.clone(), peer_addr);
         let grpc_service =
             GrpcRateLimitService::new(grpc_service, self.state.grpc_rate_limiter.clone());
-        let http_service = http_router(self.state.clone());
+        let http_service = http_router(self.state.clone(), peer_addr);
 
         let grpc_service = request_id_middleware!(grpc_service);
         let http_service = request_id_middleware!(http_service);
@@ -410,6 +428,44 @@ where
                 Ok(intercepted) => intercepted,
                 Err(status) => return Ok(status.into_http()),
             };
+
+            // An interceptor rewrote the request before dispatch: leave a
+            // companion audit record so the downstream handler's event
+            // (which sees only post-patch values under the caller's
+            // principal) is distinguishable from an unmodified mutation.
+            // Correlate via `request_id`.
+            if !intercepted.modified_by.is_empty()
+                && let Some(state) = state.as_ref()
+            {
+                let principal = principal.clone().unwrap_or(Principal::Anonymous);
+                let request_id = parts
+                    .headers
+                    .get("x-request-id")
+                    .and_then(|v| v.to_str().ok())
+                    .map(ToString::to_string);
+                crate::audit::emit_config_outcome(
+                    &state.config.audit,
+                    true,
+                    crate::audit::ConfigOutcome {
+                        state_label: "request_modified",
+                        sandbox: None,
+                        principal: &principal,
+                        request_id: request_id.as_deref(),
+                        success_message: format!(
+                            "gateway interceptor(s) {} modified {path}",
+                            intercepted.modified_by.join(",")
+                        ),
+                        failure_message: String::new(),
+                        unmapped: vec![
+                            ("path", serde_json::Value::from(path.clone())),
+                            (
+                                "interceptors",
+                                serde_json::Value::from(intercepted.modified_by.clone()),
+                            ),
+                        ],
+                    },
+                );
+            }
 
             parts
                 .extensions
@@ -945,6 +1001,10 @@ pub struct AuthGrpcRouter<S> {
     peer_identity: Option<Identity>,
     mtls_auth_enabled: bool,
     allow_unauthenticated_users: bool,
+    /// Audit toggles for Authentication \[3002\] boundary events.
+    audit: openshell_core::GatewayAuditConfig,
+    /// Remote socket address of the connection, for audit `src_endpoint`.
+    peer_addr: Option<SocketAddr>,
 }
 
 impl<S> AuthGrpcRouter<S> {
@@ -972,7 +1032,21 @@ impl<S> AuthGrpcRouter<S> {
             peer_identity,
             mtls_auth_enabled,
             allow_unauthenticated_users,
+            audit: openshell_core::GatewayAuditConfig::default(),
+            peer_addr: None,
         }
+    }
+
+    /// Attach the audit toggles and connection peer address for
+    /// Authentication \[3002\] boundary events.
+    fn with_audit(
+        mut self,
+        audit: openshell_core::GatewayAuditConfig,
+        peer_addr: Option<SocketAddr>,
+    ) -> Self {
+        self.audit = audit;
+        self.peer_addr = peer_addr;
+        self
     }
 }
 
@@ -1013,6 +1087,8 @@ where
         let peer_identity = self.peer_identity.clone();
         let mtls_auth_enabled = self.mtls_auth_enabled;
         let allow_unauthenticated_users = self.allow_unauthenticated_users;
+        let audit = self.audit.clone();
+        let peer_addr = self.peer_addr;
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
@@ -1025,34 +1101,89 @@ where
                 return inner.ready().await?.call(req).await;
             }
 
-            let principal = if let Some(chain) = chain {
+            // Audit facts for Authentication [3002] boundary events. The
+            // mechanism reflects what the request presented; token material
+            // never leaves the headers.
+            let mechanism = if req.headers().contains_key(http::header::AUTHORIZATION) {
+                "bearer"
+            } else if mtls_auth_enabled && peer_identity.is_some() {
+                "mtls"
+            } else {
+                "none"
+            };
+            let request_id = req
+                .headers()
+                .get("x-request-id")
+                .and_then(|v| v.to_str().ok())
+                .map(ToString::to_string);
+            let authn_failure = |reason: &str, detail: &str| {
+                crate::audit::emit_authn_failure(
+                    &audit,
+                    &crate::audit::AuthnOutcome {
+                        mechanism,
+                        reason: Some(reason),
+                        detail: Some(detail),
+                        principal: None,
+                        peer_addr,
+                        path: &path,
+                        request_id: request_id.as_deref(),
+                    },
+                );
+            };
+
+            // Failure events carry `mechanism` — what the request presented.
+            // Success events carry what actually authenticated the request,
+            // so a dev-mode principal audits as `local_dev` rather than
+            // implying a stray Authorization header was validated.
+            let (principal, authn_mechanism) = if let Some(chain) = chain {
                 match chain.authenticate(req.headers(), &path).await {
-                    Ok(Some(p)) => p,
+                    Ok(Some(p)) => (p, mechanism),
                     Ok(None) => match (mtls_auth_enabled, peer_identity) {
-                        (true, Some(identity)) => Principal::User(UserPrincipal { identity }),
-                        _ if allow_unauthenticated_users => unauthenticated_dev_user_principal(),
+                        (true, Some(identity)) => {
+                            (Principal::User(UserPrincipal { identity }), "mtls")
+                        }
+                        _ if allow_unauthenticated_users => {
+                            (unauthenticated_dev_user_principal(), "local_dev")
+                        }
                         _ => {
+                            authn_failure("missing_credentials", "missing authorization header");
                             return Ok(status_response(tonic::Status::unauthenticated(
                                 "missing authorization header",
                             )));
                         }
                     },
-                    Err(status) => return Ok(status_response(status)),
+                    Err(status) => {
+                        // An authenticator applied and rejected the caller.
+                        // The status message is gateway-authored; the
+                        // presented credential never is. Infrastructure
+                        // failures (JWKS refresh down, TokenReview
+                        // unreachable) are not credential rejections.
+                        let reason = if matches!(
+                            status.code(),
+                            tonic::Code::Internal | tonic::Code::Unavailable
+                        ) {
+                            "authenticator_error"
+                        } else {
+                            "rejected_credential"
+                        };
+                        authn_failure(reason, status.message());
+                        return Ok(status_response(status));
+                    }
                 }
             } else if mtls_auth_enabled {
                 let Some(identity) = peer_identity else {
+                    authn_failure("missing_client_certificate", "missing client certificate");
                     return Ok(status_response(tonic::Status::unauthenticated(
                         "missing client certificate",
                     )));
                 };
-                Principal::User(UserPrincipal { identity })
-            } else if allow_unauthenticated_users {
-                unauthenticated_dev_user_principal()
+                (Principal::User(UserPrincipal { identity }), "mtls")
             } else {
-                // No auth configured — dev / fronting-proxy deployments.
-                // Inject a local-dev principal so downstream handlers that
-                // call extract_principal() always find one.
-                unauthenticated_dev_user_principal()
+                // `allow_unauthenticated_users`, or no auth configured (dev /
+                // fronting-proxy deployments): inject a local-dev principal so
+                // downstream handlers that call extract_principal() always
+                // find one.
+                (unauthenticated_dev_user_principal(), "local_dev")
             };
 
             match principal {
@@ -1068,8 +1199,15 @@ where
                         return Ok(status_response(status));
                     }
                 }
-                Principal::Sandbox(_) => {
+                Principal::Sandbox(ref sandbox) => {
                     if !crate::auth::sandbox_methods::is_sandbox_callable(&path) {
+                        // A sandbox principal reaching for a user/admin API
+                        // is a suspicious pattern, not a routine denial.
+                        crate::audit::emit_sandbox_admin_attempt_finding(
+                            &audit,
+                            &sandbox.sandbox_id,
+                            &path,
+                        );
                         return Ok(status_response(tonic::Status::permission_denied(
                             "sandbox principals may not call this method",
                         )));
@@ -1083,11 +1221,28 @@ where
                     }
                 }
                 Principal::Anonymous => {
+                    authn_failure(
+                        "anonymous",
+                        "anonymous callers may not call authenticated methods",
+                    );
                     return Ok(status_response(tonic::Status::unauthenticated(
                         "anonymous callers may not call authenticated methods",
                     )));
                 }
             }
+
+            crate::audit::emit_authn_success(
+                &audit,
+                &crate::audit::AuthnOutcome {
+                    mechanism: authn_mechanism,
+                    reason: None,
+                    detail: None,
+                    principal: Some(&principal),
+                    peer_addr,
+                    path: &path,
+                    request_id: request_id.as_deref(),
+                },
+            );
 
             req.extensions_mut().insert(principal);
             inner.ready().await?.call(req).await
@@ -1439,7 +1594,7 @@ mod tests {
         )
     }
 
-    async fn start_http_server_with_middleware() -> std::net::SocketAddr {
+    async fn start_http_server_with_middleware() -> SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -1466,7 +1621,7 @@ mod tests {
     }
 
     async fn http1_request(
-        addr: std::net::SocketAddr,
+        addr: SocketAddr,
         method: &str,
         path: &str,
         headers: &[(&str, &str)],
@@ -1491,7 +1646,7 @@ mod tests {
     }
 
     async fn http1_get(
-        addr: std::net::SocketAddr,
+        addr: SocketAddr,
         path: &str,
         headers: &[(&str, &str)],
     ) -> Response<Incoming> {
@@ -2758,6 +2913,163 @@ mod tests {
                     .expect("signing key"),
             )
             .expect("legacy token")
+        }
+
+        fn audited_router(
+            outcome: Result<Option<Principal>, tonic::Status>,
+            audit: openshell_core::GatewayAuditConfig,
+            peer: Option<SocketAddr>,
+        ) -> AuthGrpcRouter<PrincipalRecorder> {
+            let chain =
+                AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(outcome))]);
+            let (recorder, _) = PrincipalRecorder::new();
+            AuthGrpcRouter::with_peer_identity(recorder, Some(chain), None, None, false, false)
+                .with_audit(audit, peer)
+        }
+
+        /// The authenticator boundary leaves an Authentication [3002] trail:
+        /// a rejected credential emits a Medium failure carrying mechanism,
+        /// reason category and peer address — never the token; successes
+        /// emit only behind `auth_success_events`; a sandbox principal
+        /// reaching a user API dual-emits a High Detection Finding [2004].
+        #[tokio::test]
+        async fn auth_boundary_emits_authn_events_and_findings() {
+            let audit_cfg = openshell_core::GatewayAuditConfig {
+                auth_success_events: true,
+                ..Default::default()
+            };
+            let peer: SocketAddr = "203.0.113.9:52011".parse().unwrap();
+
+            let (captured, guard) = crate::audit::test_capture::install();
+            // 1) Rejected bearer credential.
+            let mut router = audited_router(
+                Err(tonic::Status::unauthenticated("token expired")),
+                audit_cfg.clone(),
+                Some(peer),
+            );
+            let mut req = empty_request("/openshell.v1.OpenShell/ListSandboxes");
+            req.headers_mut().insert(
+                http::header::AUTHORIZATION,
+                "Bearer sk-secret-bearer-token".parse().unwrap(),
+            );
+            router.call(req).await.unwrap();
+
+            // 2) Authenticated request — success ledger enabled.
+            let mut router = audited_router(
+                Ok(Some(user_principal("alice"))),
+                audit_cfg.clone(),
+                Some(peer),
+            );
+            router
+                .call(empty_request("/openshell.v1.OpenShell/ListSandboxes"))
+                .await
+                .unwrap();
+
+            // 3) Sandbox principal reaching a user-only API — finding.
+            let mut router =
+                audited_router(Ok(Some(sandbox_principal())), audit_cfg.clone(), Some(peer));
+            let res = router
+                .call(empty_request("/openshell.v1.OpenShell/CreateWorkspace"))
+                .await
+                .unwrap();
+            assert_eq!(grpc_status(&res).as_deref(), Some("7"), "permission denied");
+
+            // 4) Infrastructure failure is not a credential rejection.
+            let mut router = audited_router(
+                Err(tonic::Status::unavailable("jwks refresh failed")),
+                audit_cfg.clone(),
+                None,
+            );
+            router
+                .call(empty_request("/openshell.v1.OpenShell/ListSandboxes"))
+                .await
+                .unwrap();
+            drop(guard);
+
+            let records = captured.json();
+            assert_eq!(records.len(), 4, "{records:?}");
+
+            let failure = &records[0];
+            assert_eq!(failure["class_uid"], 3002);
+            assert_eq!(failure["status"], "Failure");
+            assert_eq!(failure["severity_id"], 3, "failures are Medium");
+            assert_eq!(failure["unmapped"]["mechanism"], "bearer");
+            assert_eq!(failure["unmapped"]["reason"], "rejected_credential");
+            assert_eq!(failure["src_endpoint"]["ip"], "203.0.113.9");
+            assert_eq!(failure["user"]["name"], "unknown");
+            assert_eq!(failure["service"]["name"], "openshell-gateway");
+            for (record, event) in records.iter().zip(captured.events()) {
+                assert!(
+                    !record.to_string().contains("sk-secret-bearer-token")
+                        && !event.format_shorthand().contains("sk-secret-bearer-token"),
+                    "the presented credential must never enter the audit record"
+                );
+            }
+
+            let success = &records[1];
+            assert_eq!(success["class_uid"], 3002);
+            assert_eq!(success["status"], "Success");
+            assert_eq!(success["user"]["uid"], "alice");
+
+            let admin_attempt = &records[2];
+            assert_eq!(admin_attempt["class_uid"], 2004);
+            assert_eq!(admin_attempt["severity_id"], 4, "findings are High");
+            assert_eq!(
+                admin_attempt["finding_info"]["title"],
+                "Sandbox principal attempted admin operation"
+            );
+            assert_eq!(admin_attempt["container"]["uid"], "sandbox-a");
+
+            assert_eq!(records[3]["unmapped"]["reason"], "authenticator_error");
+        }
+
+        /// Without `auth_success_events`, authenticated requests emit no
+        /// per-request ledger record; failures still emit while the master
+        /// toggle is on, and nothing emits when it is off.
+        #[tokio::test]
+        async fn authn_success_ledger_is_opt_in_and_master_toggle_wins() {
+            let disabled = openshell_core::GatewayAuditConfig {
+                enabled: false,
+                auth_success_events: true,
+                ..Default::default()
+            };
+
+            let (captured, guard) = crate::audit::test_capture::install();
+            audited_router(
+                Ok(Some(user_principal("alice"))),
+                openshell_core::GatewayAuditConfig::default(),
+                None,
+            )
+            .call(empty_request("/openshell.v1.OpenShell/ListSandboxes"))
+            .await
+            .unwrap();
+            audited_router(
+                Err(tonic::Status::unauthenticated("nope")),
+                disabled.clone(),
+                None,
+            )
+            .call(empty_request("/openshell.v1.OpenShell/ListSandboxes"))
+            .await
+            .unwrap();
+            audited_router(Ok(Some(sandbox_principal())), disabled, None)
+                .call(empty_request("/openshell.v1.OpenShell/CreateWorkspace"))
+                .await
+                .unwrap();
+            // Control: rejection with the master toggle on — the only record
+            // this test may produce.
+            audited_router(
+                Err(tonic::Status::unauthenticated("nope")),
+                openshell_core::GatewayAuditConfig::default(),
+                None,
+            )
+            .call(empty_request("/openshell.v1.OpenShell/ListSandboxes"))
+            .await
+            .unwrap();
+            drop(guard);
+
+            let records = captured.json();
+            assert_eq!(records.len(), 1, "{records:?}");
+            assert_eq!(records[0]["status"], "Failure");
         }
 
         #[tokio::test]

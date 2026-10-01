@@ -2442,6 +2442,10 @@ use openshell_providers::{
 use std::sync::{Arc, LazyLock, RwLock};
 use tonic::{Request, Response};
 
+use crate::audit;
+use openshell_ocsf::{EntityActivityId, ManagedEntity};
+
+use super::workspace::audit_workspace_name;
 use crate::auth::principal::Principal;
 use crate::auth::workspace_authz::{
     AuthorizedWorkspaceScope, MinWorkspaceRole, authorize_list_workspace_selector,
@@ -2558,6 +2562,46 @@ async fn authorize_and_resolve_profile_workspace(
     }
 }
 
+/// The store id of the provider a `ProviderResponse` carries, for the audit
+/// event's entity uid. `None` on failures.
+fn provider_response_uid(result: &Result<Response<ProviderResponse>, Status>) -> Option<String> {
+    result
+        .as_ref()
+        .ok()
+        .and_then(|response| response.get_ref().provider.as_ref())
+        .and_then(|p| p.metadata.as_ref())
+        .map(|m| m.id.clone())
+}
+
+/// Name and type of the provider a create/update request carries.
+fn provider_request_identity(provider: Option<&Provider>) -> (String, String) {
+    let name = provider
+        .and_then(|p| p.metadata.as_ref())
+        .map(|m| m.name.clone())
+        .unwrap_or_default();
+    let provider_type = provider.map(|p| p.r#type.clone()).unwrap_or_default();
+    (name, provider_type)
+}
+
+/// The `unmapped` bundle for a provider-profile audit event. Profiles may be
+/// platform-scoped (no workspace) — the workspace entry is added only when
+/// one is named.
+fn profile_audit_unmapped(workspace: &str) -> Vec<(&'static str, serde_json::Value)> {
+    if workspace.is_empty() {
+        vec![("scope", serde_json::Value::from("platform"))]
+    } else {
+        vec![
+            ("scope", serde_json::Value::from("workspace")),
+            ("workspace", serde_json::Value::from(workspace)),
+        ]
+    }
+}
+
+/// `{provider}/{credential_key}` identity of a refresh or credential.
+fn credential_audit_entity(kind: &str, provider: &str, credential_key: &str) -> ManagedEntity {
+    ManagedEntity::new(kind, format!("{provider}/{credential_key}"))
+}
+
 fn selected_profile_workspace(
     workspace_scope: Option<&openshell_core::proto::WorkspaceSelector>,
 ) -> Result<&str, Status> {
@@ -2567,6 +2611,42 @@ fn selected_profile_workspace(
 }
 
 pub(super) async fn handle_create_provider(
+    state: &Arc<ServerState>,
+    request: Request<CreateProviderRequest>,
+) -> Result<Response<ProviderResponse>, Status> {
+    let principal = audit::principal(&request);
+    let request_id = audit::request_id(&request);
+    let req = request.get_ref();
+    let workspace = audit_workspace_name(req.workspace_scope.as_ref());
+    let (name, provider_type) = provider_request_identity(req.provider.as_ref());
+
+    let result = handle_create_provider_inner(state, request).await;
+
+    audit::emit_entity_outcome(
+        &state.config.audit,
+        &result,
+        audit::EntityOutcome {
+            activity: EntityActivityId::Create,
+            entity: audit::entity(
+                "provider",
+                provider_response_uid(&result),
+                Some(name.clone()),
+            ),
+            sandbox: None,
+            principal: &principal,
+            request_id: request_id.as_deref(),
+            success_message: format!("provider {name} created in workspace {workspace}"),
+            failure_message: format!("provider {name} create in workspace {workspace} failed"),
+            unmapped: vec![
+                ("workspace", serde_json::Value::from(workspace)),
+                ("provider_type", serde_json::Value::from(provider_type)),
+            ],
+        },
+    );
+    result
+}
+
+async fn handle_create_provider_inner(
     state: &Arc<ServerState>,
     request: Request<CreateProviderRequest>,
 ) -> Result<Response<ProviderResponse>, Status> {
@@ -2816,6 +2896,60 @@ pub(super) async fn handle_import_provider_profiles(
     state: &Arc<ServerState>,
     request: Request<ImportProviderProfilesRequest>,
 ) -> Result<Response<ImportProviderProfilesResponse>, Status> {
+    let principal = audit::principal(&request);
+    let request_id = audit::request_id(&request);
+    let req = request.get_ref();
+    let workspace = audit_workspace_name(req.workspace_scope.as_ref());
+    let profile_ids: Vec<String> = req
+        .profiles
+        .iter()
+        .filter_map(|item| item.profile.as_ref())
+        .map(|profile| profile.id.clone())
+        .collect();
+    let count = profile_ids.len();
+
+    let mut committed_profiles = Vec::new();
+    let result =
+        handle_import_provider_profiles_inner(state, request, &mut committed_profiles).await;
+
+    let mut unmapped = profile_audit_unmapped(&workspace);
+    unmapped.push(("profile_count", serde_json::Value::from(count)));
+    unmapped.push(("profiles", serde_json::Value::from(profile_ids.clone())));
+    // A mid-batch failure leaves earlier profiles durably created; the
+    // failure event must name them or those creations vanish from the trail.
+    if result.is_err() && !committed_profiles.is_empty() {
+        unmapped.push((
+            "imported_before_failure",
+            serde_json::Value::from(committed_profiles.clone()),
+        ));
+    }
+    audit::emit_entity_outcome_judged(
+        &state.config.audit,
+        &result,
+        |response| response.imported,
+        audit::EntityOutcome {
+            activity: EntityActivityId::Create,
+            entity: audit::entity(
+                "provider_profile",
+                None,
+                (count == 1).then(|| profile_ids[0].clone()),
+            ),
+            sandbox: None,
+            principal: &principal,
+            request_id: request_id.as_deref(),
+            success_message: format!("{count} provider profile(s) imported"),
+            failure_message: format!("{count} provider profile(s) import failed"),
+            unmapped,
+        },
+    );
+    result
+}
+
+async fn handle_import_provider_profiles_inner(
+    state: &Arc<ServerState>,
+    request: Request<ImportProviderProfilesRequest>,
+    committed_profiles: &mut Vec<String>,
+) -> Result<Response<ImportProviderProfilesResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let replay_facts = super::mutation_replay::ordinary::Facts::from_request(&request);
     let request = request.into_inner();
@@ -2887,6 +3021,7 @@ pub(super) async fn handle_import_provider_profiles(
             )
             .await
             .map_err(|e| Status::internal(format!("persist provider profile failed: {e}")))?;
+        committed_profiles.push(stored.object_id().to_string());
         if let Some(metadata) = stored.metadata.as_mut() {
             metadata.resource_version = result.resource_version;
         }
@@ -2906,6 +3041,36 @@ pub(super) async fn handle_import_provider_profiles(
 }
 
 pub(super) async fn handle_update_provider_profiles(
+    state: &Arc<ServerState>,
+    request: Request<UpdateProviderProfilesRequest>,
+) -> Result<Response<UpdateProviderProfilesResponse>, Status> {
+    let principal = audit::principal(&request);
+    let request_id = audit::request_id(&request);
+    let req = request.get_ref();
+    let workspace = audit_workspace_name(req.workspace_scope.as_ref());
+    let target_id = req.id.trim().to_string();
+
+    let result = handle_update_provider_profiles_inner(state, request).await;
+
+    audit::emit_entity_outcome_judged(
+        &state.config.audit,
+        &result,
+        |response| response.updated,
+        audit::EntityOutcome {
+            activity: EntityActivityId::Update,
+            entity: audit::entity("provider_profile", Some(target_id.clone()), None),
+            sandbox: None,
+            principal: &principal,
+            request_id: request_id.as_deref(),
+            success_message: format!("provider profile {target_id} updated"),
+            failure_message: format!("provider profile {target_id} update failed"),
+            unmapped: profile_audit_unmapped(&workspace),
+        },
+    );
+    result
+}
+
+async fn handle_update_provider_profiles_inner(
     state: &Arc<ServerState>,
     request: Request<UpdateProviderProfilesRequest>,
 ) -> Result<Response<UpdateProviderProfilesResponse>, Status> {
@@ -3072,6 +3237,37 @@ pub(super) async fn handle_lint_provider_profiles(
 }
 
 pub(super) async fn handle_delete_provider_profile(
+    state: &Arc<ServerState>,
+    request: Request<DeleteProviderProfileRequest>,
+) -> Result<Response<DeleteProviderProfileResponse>, Status> {
+    let principal = audit::principal(&request);
+    let request_id = audit::request_id(&request);
+    let req = request.get_ref();
+    let workspace = audit_workspace_name(req.workspace_scope.as_ref());
+    let id = req.id.trim().to_string();
+
+    let result = handle_delete_provider_profile_inner(state, request).await;
+
+    // An `allow_missing` no-op delete is not a state change.
+    audit::emit_entity_outcome_judged(
+        &state.config.audit,
+        &result,
+        |response| audit::deletion_changed_state(response.outcome),
+        audit::EntityOutcome {
+            activity: EntityActivityId::Delete,
+            entity: audit::entity("provider_profile", Some(id.clone()), None),
+            sandbox: None,
+            principal: &principal,
+            request_id: request_id.as_deref(),
+            success_message: format!("provider profile {id} deleted"),
+            failure_message: format!("provider profile {id} delete failed"),
+            unmapped: profile_audit_unmapped(&workspace),
+        },
+    );
+    result
+}
+
+async fn handle_delete_provider_profile_inner(
     state: &Arc<ServerState>,
     request: Request<DeleteProviderProfileRequest>,
 ) -> Result<Response<DeleteProviderProfileResponse>, Status> {
@@ -3898,6 +4094,42 @@ pub(super) async fn handle_update_provider(
     state: &Arc<ServerState>,
     request: Request<UpdateProviderRequest>,
 ) -> Result<Response<ProviderResponse>, Status> {
+    let principal = audit::principal(&request);
+    let request_id = audit::request_id(&request);
+    let req = request.get_ref();
+    let workspace = audit_workspace_name(req.workspace_scope.as_ref());
+    let (name, provider_type) = provider_request_identity(req.provider.as_ref());
+
+    let result = handle_update_provider_inner(state, request).await;
+
+    audit::emit_entity_outcome(
+        &state.config.audit,
+        &result,
+        audit::EntityOutcome {
+            activity: EntityActivityId::Update,
+            entity: audit::entity(
+                "provider",
+                provider_response_uid(&result),
+                Some(name.clone()),
+            ),
+            sandbox: None,
+            principal: &principal,
+            request_id: request_id.as_deref(),
+            success_message: format!("provider {name} updated in workspace {workspace}"),
+            failure_message: format!("provider {name} update in workspace {workspace} failed"),
+            unmapped: vec![
+                ("workspace", serde_json::Value::from(workspace)),
+                ("provider_type", serde_json::Value::from(provider_type)),
+            ],
+        },
+    );
+    result
+}
+
+async fn handle_update_provider_inner(
+    state: &Arc<ServerState>,
+    request: Request<UpdateProviderRequest>,
+) -> Result<Response<ProviderResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
     let authz = authorize_workspace(
@@ -4538,6 +4770,54 @@ pub(super) async fn handle_configure_provider_refresh(
     state: &Arc<ServerState>,
     request: Request<ConfigureProviderRefreshRequest>,
 ) -> Result<Response<ConfigureProviderRefreshResponse>, Status> {
+    let principal = audit::principal(&request);
+    let request_id = audit::request_id(&request);
+    let req = request.get_ref();
+    let workspace = audit_workspace_name(req.workspace_scope.as_ref());
+    let provider = req.provider.trim().to_string();
+    let credential_key = req.credential_key.trim().to_string();
+    let strategy = crate::provider_refresh::refresh_strategy_name(req.strategy);
+
+    let mut committed = false;
+    let result = handle_configure_provider_refresh_inner(state, request, &mut committed).await;
+
+    // Identity fields only — refresh material and secret key names never
+    // enter the audit record.
+    let outcome = audit::EntityOutcome {
+        activity: EntityActivityId::Update,
+        entity: credential_audit_entity("provider_refresh", &provider, &credential_key),
+        sandbox: None,
+        principal: &principal,
+        request_id: request_id.as_deref(),
+        success_message: format!("provider refresh configured for {provider}/{credential_key}"),
+        failure_message: format!(
+            "provider refresh configure for {provider}/{credential_key} failed"
+        ),
+        unmapped: vec![
+            ("workspace", serde_json::Value::from(workspace)),
+            ("provider", serde_json::Value::from(provider.clone())),
+            (
+                "credential_key",
+                serde_json::Value::from(credential_key.clone()),
+            ),
+            ("strategy", serde_json::Value::from(strategy)),
+        ],
+    };
+    if committed && result.is_err() {
+        // The refresh state was durably written before a later step failed —
+        // the audit trail records the state change, not the RPC status.
+        audit::emit_entity(&state.config.audit, true, outcome);
+    } else {
+        audit::emit_entity_outcome(&state.config.audit, &result, outcome);
+    }
+    result
+}
+
+async fn handle_configure_provider_refresh_inner(
+    state: &Arc<ServerState>,
+    request: Request<ConfigureProviderRefreshRequest>,
+    committed: &mut bool,
+) -> Result<Response<ConfigureProviderRefreshResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let replay_facts = super::mutation_replay::ordinary::Facts::from_request(&request);
     let request = request.into_inner();
@@ -4913,6 +5193,9 @@ pub(super) async fn handle_configure_provider_refresh(
         }
         return Err(err);
     }
+    // The refresh configuration is durable from here; the audit event must
+    // record it even if the expiry propagation below fails.
+    *committed = true;
 
     if let Some(expires_at_ms) = requested_expiration_ms {
         let updated = Provider {
@@ -4950,6 +5233,46 @@ pub(super) async fn handle_configure_provider_refresh(
 }
 
 pub(super) async fn handle_rotate_provider_credential(
+    state: &Arc<ServerState>,
+    request: Request<RotateProviderCredentialRequest>,
+) -> Result<Response<RotateProviderCredentialResponse>, Status> {
+    let principal = audit::principal(&request);
+    let request_id = audit::request_id(&request);
+    let req = request.get_ref();
+    let workspace = audit_workspace_name(req.workspace_scope.as_ref());
+    let provider = req.provider.trim().to_string();
+    let credential_key = req.credential_key.trim().to_string();
+
+    let result = handle_rotate_provider_credential_inner(state, request).await;
+
+    // Identity fields only — the minted credential never enters the audit
+    // record.
+    audit::emit_entity_outcome(
+        &state.config.audit,
+        &result,
+        audit::EntityOutcome {
+            activity: EntityActivityId::Update,
+            entity: credential_audit_entity("credential", &provider, &credential_key),
+            sandbox: None,
+            principal: &principal,
+            request_id: request_id.as_deref(),
+            success_message: format!("credential rotated for {provider}/{credential_key}"),
+            failure_message: format!("credential rotate for {provider}/{credential_key} failed"),
+            unmapped: vec![
+                ("operation", serde_json::Value::from("rotate")),
+                ("workspace", serde_json::Value::from(workspace)),
+                ("provider", serde_json::Value::from(provider.clone())),
+                (
+                    "credential_key",
+                    serde_json::Value::from(credential_key.clone()),
+                ),
+            ],
+        },
+    );
+    result
+}
+
+async fn handle_rotate_provider_credential_inner(
     state: &Arc<ServerState>,
     request: Request<RotateProviderCredentialRequest>,
 ) -> Result<Response<RotateProviderCredentialResponse>, Status> {
@@ -5023,6 +5346,54 @@ pub(super) async fn handle_delete_provider_refresh(
     state: &Arc<ServerState>,
     request: Request<DeleteProviderRefreshRequest>,
 ) -> Result<Response<DeleteProviderRefreshResponse>, Status> {
+    let principal = audit::principal(&request);
+    let request_id = audit::request_id(&request);
+    let req = request.get_ref();
+    let workspace = audit_workspace_name(req.workspace_scope.as_ref());
+    let provider = req.provider.trim().to_string();
+    let credential_key = req.credential_key.trim().to_string();
+
+    let mut committed = false;
+    let result = handle_delete_provider_refresh_inner(state, request, &mut committed).await;
+
+    let outcome = audit::EntityOutcome {
+        activity: EntityActivityId::Delete,
+        entity: credential_audit_entity("provider_refresh", &provider, &credential_key),
+        sandbox: None,
+        principal: &principal,
+        request_id: request_id.as_deref(),
+        success_message: format!("provider refresh deleted for {provider}/{credential_key}"),
+        failure_message: format!("provider refresh delete for {provider}/{credential_key} failed"),
+        unmapped: vec![
+            ("workspace", serde_json::Value::from(workspace)),
+            ("provider", serde_json::Value::from(provider.clone())),
+            (
+                "credential_key",
+                serde_json::Value::from(credential_key.clone()),
+            ),
+        ],
+    };
+    if committed && result.is_err() {
+        // The refresh state was durably deleted before a later step failed —
+        // the audit trail records the state change, not the RPC status.
+        audit::emit_entity(&state.config.audit, true, outcome);
+    } else {
+        // An `allow_missing` no-op delete is not a state change.
+        audit::emit_entity_outcome_judged(
+            &state.config.audit,
+            &result,
+            |response| audit::deletion_changed_state(response.outcome),
+            outcome,
+        );
+    }
+    result
+}
+
+async fn handle_delete_provider_refresh_inner(
+    state: &Arc<ServerState>,
+    request: Request<DeleteProviderRefreshRequest>,
+    committed: &mut bool,
+) -> Result<Response<DeleteProviderRefreshResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let request = request.into_inner();
     let authz = authorize_workspace(
@@ -5072,6 +5443,9 @@ pub(super) async fn handle_delete_provider_refresh(
         refresh_state.clone(),
     )
     .await?;
+    // The primary state change is durable from here; the audit event must
+    // record it even if the expiry cleanup below fails.
+    *committed = true;
 
     // A refresh co-manages the expiry of its primary credential and every pinned
     // additional output. Clear each expiry this refresh still owns, leaving
@@ -5103,6 +5477,37 @@ pub(super) async fn handle_delete_provider_refresh(
 }
 
 pub(super) async fn handle_delete_provider(
+    state: &Arc<ServerState>,
+    request: Request<DeleteProviderRequest>,
+) -> Result<Response<DeleteProviderResponse>, Status> {
+    let principal = audit::principal(&request);
+    let request_id = audit::request_id(&request);
+    let req = request.get_ref();
+    let workspace = audit_workspace_name(req.workspace_scope.as_ref());
+    let name = req.name.clone();
+
+    let result = handle_delete_provider_inner(state, request).await;
+
+    // An `allow_missing` no-op delete is not a state change.
+    audit::emit_entity_outcome_judged(
+        &state.config.audit,
+        &result,
+        |response| audit::deletion_changed_state(response.outcome),
+        audit::EntityOutcome {
+            activity: EntityActivityId::Delete,
+            entity: audit::entity("provider", None, Some(name.clone())),
+            sandbox: None,
+            principal: &principal,
+            request_id: request_id.as_deref(),
+            success_message: format!("provider {name} deleted from workspace {workspace}"),
+            failure_message: format!("provider {name} delete from workspace {workspace} failed"),
+            unmapped: vec![("workspace", serde_json::Value::from(workspace))],
+        },
+    );
+    result
+}
+
+async fn handle_delete_provider_inner(
     state: &Arc<ServerState>,
     request: Request<DeleteProviderRequest>,
 ) -> Result<Response<DeleteProviderResponse>, Status> {
@@ -9341,6 +9746,129 @@ mod tests {
             resolved.get("OPENAI_API_KEY").map(String::as_str),
             Some("sk-winner")
         );
+    }
+
+    /// Provider-family mutations leave a 3004 audit trail, and credential
+    /// material never appears in it: create carries identity fields only, a
+    /// failed refresh configure drops its material, rotation records
+    /// `operation=rotate`, and a rejected profile import (diagnostics inside
+    /// an `Ok` response) audits as a failed mutation.
+    #[tokio::test]
+    async fn provider_mutations_emit_entity_audit_events_without_key_material() {
+        let state = test_server_state().await;
+        let (captured, guard) = audit::test_capture::install();
+
+        handle_create_provider(
+            &state,
+            authed_request(CreateProviderRequest {
+                request_id: String::new(),
+                provider: Some(provider_with_credential_value(
+                    "openai-audit",
+                    "openai",
+                    "OPENAI_API_KEY",
+                    "sk-super-secret",
+                )),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let error = handle_configure_provider_refresh(
+            &state,
+            authed_request(ConfigureProviderRefreshRequest {
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                provider: "openai-audit".to_string(),
+                credential_key: "OPENAI_API_KEY".to_string(),
+                material: HashMap::from([(
+                    "client_secret".to_string(),
+                    "hunter2-material".to_string(),
+                )]),
+                ..ConfigureProviderRefreshRequest::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), Code::InvalidArgument);
+
+        handle_rotate_provider_credential(
+            &state,
+            authed_request(RotateProviderCredentialRequest {
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                provider: "openai-audit".to_string(),
+                credential_key: "OPENAI_API_KEY".to_string(),
+                ..RotateProviderCredentialRequest::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        // Empty profile set: rejected via diagnostics inside Ok.
+        let response = handle_import_provider_profiles(
+            &state,
+            authed_request(ImportProviderProfilesRequest {
+                profiles: Vec::new(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                ..ImportProviderProfilesRequest::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(!response.imported);
+        drop(guard);
+
+        let records = captured.json();
+        assert_eq!(records.len(), 4, "{records:?}");
+
+        let create = &records[0];
+        assert_eq!(create["class_uid"], 3004);
+        assert_eq!(create["activity_id"], 1);
+        assert_eq!(create["entity"]["type"], "provider");
+        assert_eq!(create["entity"]["name"], "openai-audit");
+        assert!(
+            create["entity"]["uid"]
+                .as_str()
+                .is_some_and(|uid| !uid.is_empty()),
+            "created entity carries its store id"
+        );
+        assert_eq!(create["unmapped"]["workspace"], "default");
+        assert_eq!(create["unmapped"]["provider_type"], "openai");
+        assert_eq!(create["actor"]["user"]["uid"], "dev-user");
+
+        let refresh = &records[1];
+        assert_eq!(refresh["entity"]["type"], "provider_refresh");
+        assert_eq!(refresh["entity"]["uid"], "openai-audit/OPENAI_API_KEY");
+        assert_eq!(refresh["status"], "Failure");
+
+        let rotate = &records[2];
+        assert_eq!(rotate["entity"]["type"], "credential");
+        assert_eq!(rotate["unmapped"]["operation"], "rotate");
+        assert_eq!(rotate["status"], "Failure");
+
+        let import = &records[3];
+        assert_eq!(import["entity"]["type"], "provider_profile");
+        assert_eq!(import["status"], "Failure");
+        assert_eq!(import["unmapped"]["profile_count"], 0);
+        assert_eq!(import["unmapped"]["scope"], "workspace");
+
+        for (record, event) in records.iter().zip(captured.events()) {
+            for secret in ["sk-super-secret", "hunter2-material"] {
+                assert!(
+                    !record.to_string().contains(secret),
+                    "credential material must never appear in audit events"
+                );
+                assert!(!event.format_shorthand().contains(secret));
+            }
+        }
     }
 
     #[tokio::test]

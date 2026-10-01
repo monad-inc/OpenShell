@@ -178,15 +178,24 @@ async fn render_metrics(State(handle): State<PrometheusHandle>) -> impl IntoResp
 }
 
 /// Create the HTTP router served on the multiplexed gateway port.
-pub fn http_router(state: Arc<crate::ServerState>) -> Router {
+///
+/// `peer_addr` is the serving connection's remote address; the WebSocket
+/// tunnel forwards it so requests inside the tunnel keep a `src_endpoint`
+/// in authentication audit events.
+pub fn http_router(
+    state: Arc<crate::ServerState>,
+    peer_addr: Option<std::net::SocketAddr>,
+) -> Router {
     let mut router = crate::auth::router(state.clone());
     if state.config.enable_websocket_tunnel {
         router = router.merge(crate::ws_tunnel::router(state.clone()));
     }
-    router.layer(middleware::from_fn_with_state(
-        state,
-        sandbox_service_routing_first,
-    ))
+    router
+        .layer(middleware::from_fn_with_state(
+            state,
+            sandbox_service_routing_first,
+        ))
+        .layer(axum::Extension(crate::ws_tunnel::TunnelPeerAddr(peer_addr)))
 }
 
 /// Create the plaintext loopback-only router for browser service endpoints.

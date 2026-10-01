@@ -2497,6 +2497,16 @@ impl ComputeRuntime {
             .await
         {
             Ok(true) => {
+                emit_reconcile_audit(
+                    openshell_ocsf::EntityActivityId::Delete,
+                    sandbox_id,
+                    sandbox.object_name(),
+                    format!(
+                        "sandbox {} removed after its compute resource was released",
+                        sandbox.object_name()
+                    ),
+                    vec![("operation", serde_json::Value::from("reconcile_delete"))],
+                );
                 self.cleanup_removed_sandbox_state(sandbox_id);
                 Ok(true)
             }
@@ -3374,6 +3384,19 @@ impl ComputeRuntime {
             .await
         {
             Ok(updated) => {
+                emit_reconcile_audit(
+                    openshell_ocsf::EntityActivityId::Update,
+                    &sandbox_id,
+                    updated.object_name(),
+                    format!(
+                        "sandbox {} marked Error by reconciliation: {reason}",
+                        updated.object_name()
+                    ),
+                    vec![
+                        ("operation", serde_json::Value::from("mark_error")),
+                        ("reason", serde_json::Value::from(reason.clone())),
+                    ],
+                );
                 self.sandbox_index.update_from_sandbox(&updated);
                 self.sandbox_watch_bus.notify(&sandbox_id);
             }
@@ -4814,11 +4837,24 @@ impl ComputeRuntime {
             self.cleanup_sandbox_owned_records(sandbox).await?;
         }
 
-        let _ = self
+        let deleted = self
             .store
             .delete(Sandbox::object_type(), sandbox_id)
             .await
             .map_err(|e| e.to_string())?;
+        if deleted {
+            let sandbox_name = sandbox
+                .as_ref()
+                .map(|s| s.object_name().to_string())
+                .unwrap_or_default();
+            emit_reconcile_audit(
+                openshell_ocsf::EntityActivityId::Delete,
+                sandbox_id,
+                &sandbox_name,
+                format!("sandbox {sandbox_name} removed after backend deletion"),
+                vec![("operation", serde_json::Value::from("reconcile_delete"))],
+            );
+        }
         self.cleanup_removed_sandbox_state(sandbox_id);
         Ok(())
     }
@@ -5222,6 +5258,16 @@ impl ComputeRuntime {
                 sandbox_name = %sandbox_name,
                 phase = ?phase,
                 "Retained sandbox resource disappeared from the compute driver"
+            );
+            emit_reconcile_audit(
+                openshell_ocsf::EntityActivityId::Update,
+                &sandbox_id,
+                &sandbox_name,
+                format!("sandbox {sandbox_name} marked Error: backend resource missing"),
+                vec![
+                    ("operation", serde_json::Value::from("mark_error")),
+                    ("reason", serde_json::Value::from("ComputeResourceMissing")),
+                ],
             );
             self.sandbox_index.update_from_sandbox(&updated);
             self.sandbox_watch_bus.notify(&sandbox_id);
@@ -6519,6 +6565,36 @@ fn sandbox_phase_should_be_running(phase: SandboxPhase) -> bool {
             | SandboxPhase::Starting
             | SandboxPhase::Unknown
     )
+}
+
+/// Audit a reconciliation-driven sandbox mutation (backend divergence,
+/// startup recovery, deletion finalization) under the
+/// `system:compute-reconcile` actor — an out-of-band deletion or error phase
+/// must be as visible as a request-driven one.
+fn emit_reconcile_audit(
+    activity: openshell_ocsf::EntityActivityId,
+    sandbox_id: &str,
+    sandbox_name: &str,
+    message: String,
+    unmapped: Vec<(&'static str, serde_json::Value)>,
+) {
+    crate::audit::emit_system_entity(
+        crate::audit::global_config(),
+        true,
+        crate::audit::SystemEntityOutcome {
+            activity,
+            entity: crate::audit::entity(
+                "sandbox",
+                Some(sandbox_id.to_string()),
+                Some(sandbox_name.to_string()),
+            ),
+            sandbox: Some((sandbox_id, sandbox_name)),
+            component: "compute-reconcile",
+            success_message: message,
+            failure_message: String::new(),
+            unmapped,
+        },
+    );
 }
 
 /// Error-phase sandboxes are only eligible for startup recovery when their

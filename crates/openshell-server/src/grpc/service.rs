@@ -54,6 +54,7 @@ pub(super) async fn handle_expose_service(
         validate_service_exposure_request(&req.name, req.target_port, req.authorization_mode)?;
     expose_service_endpoint(
         state,
+        &principal,
         &workspace,
         &sandbox,
         &req.name,
@@ -85,6 +86,7 @@ pub(super) fn validate_service_exposure_request(
 
 pub(super) async fn expose_service_endpoint(
     state: &Arc<ServerState>,
+    principal: &crate::auth::principal::Principal,
     workspace: &str,
     sandbox: &Sandbox,
     service: &str,
@@ -177,7 +179,9 @@ pub(super) async fn expose_service_endpoint(
 
     let url = service_routing::endpoint_url(&state.config, workspace, sandbox_name, service)
         .unwrap_or_default();
-    service_routing::emit_service_endpoint_config_event(&endpoint, &url, created);
+    if state.config.audit.enabled {
+        service_routing::emit_service_endpoint_config_event(principal, &endpoint, &url, created);
+    }
 
     Ok(Response::new(ServiceEndpointResponse {
         endpoint: Some(endpoint),
@@ -340,8 +344,8 @@ pub(super) async fn handle_delete_service(
         .await
         .map_err(|e| super::persistence_error_to_status(e, "delete endpoint"))?;
 
-    if deleted {
-        service_routing::emit_service_endpoint_delete_event(&endpoint);
+    if deleted && state.config.audit.enabled {
+        service_routing::emit_service_endpoint_delete_event(&principal, &endpoint);
     }
 
     Ok(Response::new(DeleteServiceResponse {

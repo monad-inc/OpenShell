@@ -13,6 +13,7 @@
 //! startup. Runtime selection only consults that registry or a configured
 //! external endpoint; it does not switch on driver names.
 
+pub(crate) mod audit;
 mod auth;
 pub mod certgen;
 pub mod cli;
@@ -1166,7 +1167,11 @@ fn spawn_gateway_connection(
                         Ok(tls_stream) => {
                             let peer_identity = multiplex::extract_peer_identity(&tls_stream);
                             if let Err(e) = service
-                                .serve_with_peer_identity(tls_stream, peer_identity)
+                                .serve_with_peer_identity_from(
+                                    tls_stream,
+                                    peer_identity,
+                                    Some(addr),
+                                )
                                 .await
                             {
                                 if is_benign_connection_close(e.as_ref()) {
@@ -1192,7 +1197,10 @@ fn spawn_gateway_connection(
         });
     } else {
         tokio::spawn(async move {
-            if let Err(e) = service.serve(stream).await {
+            if let Err(e) = service
+                .serve_with_peer_identity_from(stream, None, Some(addr))
+                .await
+            {
                 if is_benign_connection_close(e.as_ref()) {
                     debug!(error = %e, client = %addr, "Connection closed");
                 } else {
@@ -1858,6 +1866,27 @@ pub(crate) async fn ensure_default_workspace(store: &Store) -> Result<()> {
     {
         Ok(_) => {
             info!("Created default workspace");
+            // A workspace coming into existence belongs on the audit trail
+            // even when startup, not a request, created it.
+            audit::emit_system_entity(
+                audit::global_config(),
+                true,
+                audit::SystemEntityOutcome {
+                    activity: openshell_ocsf::EntityActivityId::Create,
+                    entity: audit::entity(
+                        WORKSPACE_OBJECT_TYPE,
+                        Some(id.clone()),
+                        Some(DEFAULT_WORKSPACE_NAME.to_string()),
+                    ),
+                    sandbox: None,
+                    component: "gateway-startup",
+                    success_message: format!(
+                        "default workspace {DEFAULT_WORKSPACE_NAME} created at startup"
+                    ),
+                    failure_message: String::new(),
+                    unmapped: Vec::new(),
+                },
+            );
             Ok(())
         }
         Err(persistence::PersistenceError::UniqueViolation { .. }) => {
@@ -2163,7 +2192,7 @@ mod tests {
     #[tokio::test]
     async fn websocket_tunnel_is_mounted_only_when_enabled() {
         let state = test_state("127.0.0.1:17670".parse().unwrap(), true).await;
-        let response = super::http_router(state.clone())
+        let response = super::http_router(state.clone(), None)
             .oneshot(Request::get("/_ws_tunnel").body(Body::empty()).unwrap())
             .await
             .unwrap();
@@ -2174,7 +2203,7 @@ mod tests {
             .unwrap()
             .config
             .enable_websocket_tunnel = true;
-        let response = super::http_router(enabled)
+        let response = super::http_router(enabled, None)
             .oneshot(Request::get("/_ws_tunnel").body(Body::empty()).unwrap())
             .await
             .unwrap();

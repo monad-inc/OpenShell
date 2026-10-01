@@ -223,9 +223,19 @@ pub fn require_platform_admin(admin_role: &str, principal: &Principal) -> Result
         Principal::User(_) => Err(Status::permission_denied(
             "platform admin role required for cross-workspace operations",
         )),
-        Principal::Sandbox(_) => Err(Status::permission_denied(
-            "sandbox principals cannot perform cross-workspace operations",
-        )),
+        // Routine user RBAC denials above stay plain status records; a
+        // sandbox principal reaching for a platform-admin operation is a
+        // suspicious pattern, so the denial dual-emits a finding.
+        Principal::Sandbox(sandbox) => {
+            crate::audit::emit_sandbox_admin_attempt_finding(
+                crate::audit::global_config(),
+                &sandbox.sandbox_id,
+                "platform_admin",
+            );
+            Err(Status::permission_denied(
+                "sandbox principals cannot perform cross-workspace operations",
+            ))
+        }
         Principal::Peer(_) => Err(Status::permission_denied(
             "gateway peer principals cannot perform cross-workspace operations",
         )),

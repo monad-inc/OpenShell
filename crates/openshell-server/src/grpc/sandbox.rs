@@ -10,6 +10,8 @@
 #![allow(clippy::cast_possible_wrap)] // Intentional u32->i32 conversions for proto compat
 
 use crate::ServerState;
+use crate::audit;
+use crate::auth::principal::Principal;
 use crate::auth::workspace_authz::{
     AuthorizedWorkspaceScope, MinWorkspaceRole, authorize_list_workspace_selector,
     authorize_sandbox_workspace, authorize_workspace,
@@ -46,6 +48,7 @@ use openshell_core::telemetry::{
     LifecycleOperation, LifecycleResource, SandboxTemplateSource, TelemetryOutcome,
 };
 use openshell_core::{GetResourceVersion, ObjectId, ObjectName, ObjectWorkspace};
+use openshell_ocsf::EntityActivityId;
 use prost::Message;
 use prost_types::{Struct, Value, value::Kind};
 use std::collections::{HashMap, HashSet};
@@ -163,7 +166,7 @@ impl Drop for WatchSandboxStream {
 /// cannot be used as an existence oracle.
 pub(super) async fn resolve_and_authorize_sandbox_name(
     state: &ServerState,
-    principal: &crate::auth::principal::Principal,
+    principal: &Principal,
     sandbox_name: &str,
     workspace: &str,
     min_role: MinWorkspaceRole,
@@ -171,7 +174,7 @@ pub(super) async fn resolve_and_authorize_sandbox_name(
     if sandbox_name.is_empty() {
         return Err(Status::invalid_argument("sandbox is required"));
     }
-    let crate::auth::principal::Principal::Sandbox(sandbox_principal) = principal else {
+    let Principal::Sandbox(sandbox_principal) = principal else {
         authorize_sandbox_workspace(
             &state.store,
             &state.admin_role,
@@ -256,11 +259,109 @@ fn generate_routable_name() -> String {
 // Sandbox lifecycle handlers
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Audit helpers
+// ---------------------------------------------------------------------------
+
+/// The command-line value for exec audit events. Full argv by default;
+/// `[openshell.gateway.audit] exec_args = false` reduces it to the binary
+/// name for deployments whose command lines may carry secrets. Environment
+/// variables and stdin never enter audit events.
+fn exec_audit_command(state: &ServerState, command: &[String]) -> serde_json::Value {
+    if state.config.audit.exec_args {
+        serde_json::Value::from(command.to_vec())
+    } else {
+        serde_json::Value::from(command.first().cloned().unwrap_or_default())
+    }
+}
+
+/// The resolved (id, name) of the sandbox a response carries.
+fn response_sandbox_identity(sandbox: Option<&Sandbox>) -> Option<(String, String)> {
+    sandbox
+        .and_then(|s| s.metadata.as_ref())
+        .map(|m| (m.id.clone(), m.name.clone()))
+}
+
+fn sandbox_entity(
+    identity: Option<&(String, String)>,
+    name: &str,
+) -> openshell_ocsf::ManagedEntity {
+    audit::entity(
+        "sandbox",
+        identity.map(|(id, _)| id.clone()),
+        Some(identity.map_or(name, |(_, name)| name.as_str()).to_string()),
+    )
+}
+
+fn identity_ref((id, name): &(String, String)) -> (&str, &str) {
+    (id.as_str(), name.as_str())
+}
+
+/// Audit facts of one sandbox request, captured before the handler consumes
+/// the request.
+struct SandboxAuditFacts {
+    principal: Principal,
+    request_id: Option<String>,
+    name: String,
+    workspace: String,
+}
+
+impl SandboxAuditFacts {
+    fn capture<T>(
+        request: &Request<T>,
+        name: &str,
+        selector: Option<&openshell_core::proto::WorkspaceSelector>,
+    ) -> Self {
+        Self {
+            principal: audit::principal(request),
+            request_id: audit::request_id(request),
+            name: name.to_string(),
+            workspace: super::workspace::audit_workspace_name(selector),
+        }
+    }
+
+    /// Emit a 3004 Update on the sandbox for a lifecycle operation.
+    #[allow(clippy::too_many_arguments)]
+    fn emit<T>(
+        &self,
+        state: &ServerState,
+        activity: EntityActivityId,
+        result: &Result<Response<T>, Status>,
+        changed: impl FnOnce(&T) -> bool,
+        identity: Option<&(String, String)>,
+        success_message: String,
+        failure_message: String,
+        mut unmapped: Vec<(&'static str, serde_json::Value)>,
+    ) {
+        unmapped.push(("workspace", serde_json::Value::from(self.workspace.clone())));
+        audit::emit_entity_outcome_judged(
+            &state.config.audit,
+            result,
+            changed,
+            audit::EntityOutcome {
+                activity,
+                entity: sandbox_entity(identity, &self.name),
+                sandbox: identity.map(identity_ref),
+                principal: &self.principal,
+                request_id: self.request_id.as_deref(),
+                success_message,
+                failure_message,
+                unmapped,
+            },
+        );
+    }
+}
+
 pub(super) async fn handle_create_sandbox(
     state: &Arc<ServerState>,
     request: Request<CreateSandboxRequest>,
 ) -> Result<Response<SandboxResponse>, Status> {
     let create_request = request.get_ref().clone();
+    let facts = SandboxAuditFacts::capture(
+        &request,
+        &create_request.name,
+        create_request.workspace_scope.as_ref(),
+    );
     // Sandbox creation retains large configuration values across awaits.
     // Box the inner future to keep this wrapper small for every caller.
     let result = Box::pin(handle_create_sandbox_inner(state, request)).await;
@@ -273,6 +374,24 @@ pub(super) async fn handle_create_sandbox(
         &create_request,
         created_sandbox,
         TelemetryOutcome::from_success(result.is_ok()),
+    );
+    // The requested name may be empty (server-generated); the response
+    // carries the authoritative one.
+    let identity = response_sandbox_identity(created_sandbox);
+    let name = identity
+        .as_ref()
+        .map_or(facts.name.as_str(), |(_, name)| name.as_str())
+        .to_string();
+    let workspace = facts.workspace.clone();
+    facts.emit(
+        state,
+        EntityActivityId::Create,
+        &result,
+        |_| true,
+        identity.as_ref(),
+        format!("sandbox {name} created in workspace {workspace}"),
+        format!("sandbox {name} create in workspace {workspace} failed"),
+        Vec::new(),
     );
     result
 }
@@ -319,9 +438,9 @@ pub(super) async fn handle_begin_rootfs_tar_staging(
 }
 
 /// Stable caller identity used to bind a staging slot to its requester.
-fn principal_subject(principal: &crate::auth::principal::Principal) -> Result<String, Status> {
+fn principal_subject(principal: &Principal) -> Result<String, Status> {
     match principal {
-        crate::auth::principal::Principal::User(user) => Ok(user.identity.subject.clone()),
+        Principal::User(user) => Ok(user.identity.subject.clone()),
         _ => Err(Status::permission_denied(
             "rootfs tar staging requires a user principal",
         )),
@@ -676,6 +795,7 @@ async fn handle_create_sandbox_inner(
     for exposure in &request.service_exposures {
         let endpoint = match super::service::expose_service_endpoint(
             state,
+            &principal,
             sandbox.object_workspace(),
             &sandbox,
             &exposure.service,
@@ -1286,6 +1406,41 @@ pub(super) async fn handle_attach_sandbox_provider(
     state: &Arc<ServerState>,
     request: Request<AttachSandboxProviderRequest>,
 ) -> Result<Response<AttachSandboxProviderResponse>, Status> {
+    let facts = SandboxAuditFacts::capture(
+        &request,
+        &request.get_ref().sandbox,
+        request.get_ref().workspace_scope.as_ref(),
+    );
+    let provider_name = request.get_ref().provider.clone();
+    let result = handle_attach_sandbox_provider_inner(state, request).await;
+
+    let identity = result
+        .as_ref()
+        .ok()
+        .and_then(|response| response_sandbox_identity(response.get_ref().sandbox.as_ref()));
+    let sandbox_name = facts.name.clone();
+    // A no-op (provider already in the requested state) is not a state
+    // change.
+    facts.emit(
+        state,
+        EntityActivityId::Update,
+        &result,
+        |response| response.attached,
+        identity.as_ref(),
+        format!("provider {provider_name} attached to sandbox {sandbox_name}"),
+        format!("provider {provider_name} attach to sandbox {sandbox_name} failed"),
+        vec![
+            ("operation", serde_json::Value::from("attach_provider")),
+            ("provider", serde_json::Value::from(provider_name.clone())),
+        ],
+    );
+    result
+}
+
+async fn handle_attach_sandbox_provider_inner(
+    state: &Arc<ServerState>,
+    request: Request<AttachSandboxProviderRequest>,
+) -> Result<Response<AttachSandboxProviderResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     #[cfg(test)]
     let attach_wait_probe = request
@@ -1473,6 +1628,41 @@ pub(super) async fn handle_detach_sandbox_provider(
     state: &Arc<ServerState>,
     request: Request<DetachSandboxProviderRequest>,
 ) -> Result<Response<DetachSandboxProviderResponse>, Status> {
+    let facts = SandboxAuditFacts::capture(
+        &request,
+        &request.get_ref().sandbox,
+        request.get_ref().workspace_scope.as_ref(),
+    );
+    let provider_name = request.get_ref().provider.clone();
+    let result = handle_detach_sandbox_provider_inner(state, request).await;
+
+    let identity = result
+        .as_ref()
+        .ok()
+        .and_then(|response| response_sandbox_identity(response.get_ref().sandbox.as_ref()));
+    let sandbox_name = facts.name.clone();
+    // A no-op (provider already in the requested state) is not a state
+    // change.
+    facts.emit(
+        state,
+        EntityActivityId::Update,
+        &result,
+        |response| response.detached,
+        identity.as_ref(),
+        format!("provider {provider_name} detached from sandbox {sandbox_name}"),
+        format!("provider {provider_name} detach from sandbox {sandbox_name} failed"),
+        vec![
+            ("operation", serde_json::Value::from("detach_provider")),
+            ("provider", serde_json::Value::from(provider_name.clone())),
+        ],
+    );
+    result
+}
+
+async fn handle_detach_sandbox_provider_inner(
+    state: &Arc<ServerState>,
+    request: Request<DetachSandboxProviderRequest>,
+) -> Result<Response<DetachSandboxProviderResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let request = request.into_inner();
     let sandbox = resolve_and_authorize_sandbox_name(
@@ -1593,7 +1783,29 @@ pub(super) async fn handle_delete_sandbox(
     state: &Arc<ServerState>,
     request: Request<DeleteSandboxRequest>,
 ) -> Result<Response<DeleteSandboxResponse>, Status> {
+    let facts = SandboxAuditFacts::capture(
+        &request,
+        &request.get_ref().name,
+        request.get_ref().workspace_scope.as_ref(),
+    );
     let result = handle_delete_sandbox_inner(state, request).await;
+    let identity = result
+        .as_ref()
+        .ok()
+        .filter(|response| !response.get_ref().sandbox_id.is_empty())
+        .map(|response| (response.get_ref().sandbox_id.clone(), facts.name.clone()));
+    let (name, workspace) = (facts.name.clone(), facts.workspace.clone());
+    // An `allow_missing` no-op delete is not a state change.
+    facts.emit(
+        state,
+        EntityActivityId::Delete,
+        &result,
+        |response| audit::deletion_changed_state(response.outcome),
+        identity.as_ref(),
+        format!("sandbox {name} deleted from workspace {workspace}"),
+        format!("sandbox {name} delete from workspace {workspace} failed"),
+        Vec::new(),
+    );
     let outcome = match &result {
         Ok(_) => TelemetryOutcome::Success,
         _ => TelemetryOutcome::Failure,
@@ -1653,7 +1865,27 @@ pub(super) async fn handle_stop_sandbox(
     state: &Arc<ServerState>,
     request: Request<StopSandboxRequest>,
 ) -> Result<Response<SandboxResponse>, Status> {
+    let facts = SandboxAuditFacts::capture(
+        &request,
+        &request.get_ref().name,
+        request.get_ref().workspace_scope.as_ref(),
+    );
     let result = handle_stop_sandbox_inner(state, request).await;
+    let identity = result
+        .as_ref()
+        .ok()
+        .and_then(|response| response_sandbox_identity(response.get_ref().sandbox.as_ref()));
+    let name = facts.name.clone();
+    facts.emit(
+        state,
+        EntityActivityId::Update,
+        &result,
+        |_| true,
+        identity.as_ref(),
+        format!("sandbox {name} stopped"),
+        format!("sandbox {name} stop failed"),
+        vec![("operation", serde_json::Value::from("stop"))],
+    );
     openshell_core::telemetry::emit_lifecycle(
         LifecycleResource::Sandbox,
         LifecycleOperation::Stop,
@@ -1694,7 +1926,27 @@ pub(super) async fn handle_start_sandbox(
     state: &Arc<ServerState>,
     request: Request<StartSandboxRequest>,
 ) -> Result<Response<SandboxResponse>, Status> {
+    let facts = SandboxAuditFacts::capture(
+        &request,
+        &request.get_ref().name,
+        request.get_ref().workspace_scope.as_ref(),
+    );
     let result = handle_start_sandbox_inner(state, request).await;
+    let identity = result
+        .as_ref()
+        .ok()
+        .and_then(|response| response_sandbox_identity(response.get_ref().sandbox.as_ref()));
+    let name = facts.name.clone();
+    facts.emit(
+        state,
+        EntityActivityId::Update,
+        &result,
+        |_| true,
+        identity.as_ref(),
+        format!("sandbox {name} started"),
+        format!("sandbox {name} start failed"),
+        vec![("operation", serde_json::Value::from("start"))],
+    );
     openshell_core::telemetry::emit_lifecycle(
         LifecycleResource::Sandbox,
         LifecycleOperation::Start,
@@ -2416,9 +2668,100 @@ fn pty_dimensions(cols: u32, rows: u32) -> (u32, u32) {
     )
 }
 
+/// Audit an exec or forward session acceptance/rejection: 3004 Update on the
+/// sandbox. Session initiation and the command line are in scope; session
+/// I/O never is. Authorization denials are excluded (boundary events).
+fn emit_session_audit<T>(
+    state: &ServerState,
+    facts: &SandboxAuditFacts,
+    result: &Result<T, Status>,
+    identity: Option<&(String, String)>,
+    description: &str,
+    unmapped: Vec<(&'static str, serde_json::Value)>,
+) {
+    let success = match result {
+        Ok(_) => true,
+        Err(status) if audit::audited_failure(status) => false,
+        Err(_) => return,
+    };
+    let name = identity.map_or(facts.name.as_str(), |(_, name)| name.as_str());
+    let mut unmapped = unmapped;
+    unmapped.push((
+        "workspace",
+        serde_json::Value::from(facts.workspace.clone()),
+    ));
+    audit::emit_entity(
+        &state.config.audit,
+        success,
+        audit::EntityOutcome {
+            activity: EntityActivityId::Update,
+            entity: sandbox_entity(identity, &facts.name),
+            sandbox: if success {
+                identity.map(identity_ref)
+            } else {
+                None
+            },
+            principal: &facts.principal,
+            request_id: facts.request_id.as_deref(),
+            success_message: format!("{description} accepted in sandbox {name}"),
+            failure_message: format!("{description} in sandbox {name} rejected"),
+            unmapped,
+        },
+    );
+}
+
+fn exec_audit_unmapped(
+    state: &ServerState,
+    req: &ExecSandboxRequest,
+    interactive: bool,
+) -> Vec<(&'static str, serde_json::Value)> {
+    let mut unmapped = vec![
+        ("operation", serde_json::Value::from("exec")),
+        ("command", exec_audit_command(state, &req.command)),
+    ];
+    if interactive {
+        unmapped.push(("interactive", serde_json::Value::from(true)));
+    }
+    unmapped
+}
+
+fn exec_audit_description(req: &ExecSandboxRequest, interactive: bool) -> String {
+    let binary = req.command.first().map_or("", String::as_str);
+    if interactive {
+        format!("interactive exec {binary}")
+    } else {
+        format!("exec {binary}")
+    }
+}
+
 pub(super) async fn handle_exec_sandbox(
     state: &Arc<ServerState>,
     request: Request<ExecSandboxRequest>,
+) -> Result<Response<ReceiverStream<Result<ExecSandboxEvent, Status>>>, Status> {
+    let facts = SandboxAuditFacts::capture(
+        &request,
+        &request.get_ref().sandbox,
+        request.get_ref().workspace_scope.as_ref(),
+    );
+    let unmapped = exec_audit_unmapped(state, request.get_ref(), false);
+    let description = exec_audit_description(request.get_ref(), false);
+    let mut identity = None;
+    let result = handle_exec_sandbox_inner(state, request, &mut identity).await;
+    emit_session_audit(
+        state,
+        &facts,
+        &result,
+        identity.as_ref(),
+        &description,
+        unmapped,
+    );
+    result
+}
+
+async fn handle_exec_sandbox_inner(
+    state: &Arc<ServerState>,
+    request: Request<ExecSandboxRequest>,
+    identity: &mut Option<(String, String)>,
 ) -> Result<Response<ReceiverStream<Result<ExecSandboxEvent, Status>>>, Status> {
     use openshell_core::ObjectId;
 
@@ -2438,6 +2781,11 @@ pub(super) async fn handle_exec_sandbox(
         MinWorkspaceRole::User,
     )
     .await?;
+
+    *identity = Some((
+        sandbox.object_id().to_string(),
+        sandbox.object_name().to_string(),
+    ));
 
     if let Some(completion) = &completion {
         completion.ensure_target(sandbox.object_id())?;
@@ -2552,6 +2900,7 @@ pub(super) async fn handle_forward_tcp(
     Status,
 > {
     let principal = super::extract_principal(&request)?;
+    let mut facts = SandboxAuditFacts::capture(&request, "", None);
     let mut inbound = request.into_inner();
     let first = inbound
         .message()
@@ -2562,7 +2911,53 @@ pub(super) async fn handle_forward_tcp(
             "first TcpForwardFrame must be init",
         ));
     };
+    facts.name.clone_from(&init.sandbox);
+    facts.workspace.clone_from(&init.workspace);
 
+    // Audit the tunnel acceptance/rejection. The target is a non-secret
+    // description (loopback-validated, but distinct hosts are meaningful);
+    // the authorization token and forwarded bytes never enter the record.
+    let target_label = match &init.target {
+        Some(tcp_forward_init::Target::Ssh(_)) => "ssh".to_string(),
+        Some(tcp_forward_init::Target::Tcp(tcp)) => format!("tcp:{}:{}", tcp.host, tcp.port),
+        None => "none".to_string(),
+    };
+    let mut unmapped = vec![
+        ("operation", serde_json::Value::from("forward")),
+        ("target", serde_json::Value::from(target_label.clone())),
+    ];
+    if !init.service_id.is_empty() {
+        unmapped.push((
+            "service_id",
+            serde_json::Value::from(init.service_id.clone()),
+        ));
+    }
+    let mut identity = None;
+    let result = forward_tcp_with_init(state, &principal, inbound, init, &mut identity).await;
+    emit_session_audit(
+        state,
+        &facts,
+        &result,
+        identity.as_ref(),
+        &format!("tcp forward {target_label}"),
+        unmapped,
+    );
+    result
+}
+
+async fn forward_tcp_with_init(
+    state: &Arc<ServerState>,
+    principal: &Principal,
+    inbound: tonic::Streaming<TcpForwardFrame>,
+    init: TcpForwardInit,
+    identity: &mut Option<(String, String)>,
+) -> Result<
+    Response<
+        Pin<Box<dyn tokio_stream::Stream<Item = Result<TcpForwardFrame, Status>> + Send + 'static>>,
+    >,
+    Status,
+> {
+    let principal = principal.clone();
     let target = validate_tcp_forward_init(&init)?;
 
     let sandbox = resolve_and_authorize_sandbox_name(
@@ -2573,6 +2968,10 @@ pub(super) async fn handle_forward_tcp(
         MinWorkspaceRole::User,
     )
     .await?;
+    *identity = Some((
+        sandbox.object_id().to_string(),
+        sandbox.object_name().to_string(),
+    ));
 
     // The main process may finish between minting the SSH token and opening
     // its transport. Keep the relay reachable until terminal delivery is
@@ -2894,6 +3293,8 @@ pub(super) async fn handle_exec_sandbox_interactive(
     state: &Arc<ServerState>,
     request: Request<tonic::Streaming<ExecSandboxInput>>,
 ) -> Result<Response<ReceiverStream<Result<ExecSandboxEvent, Status>>>, Status> {
+    let audit_principal = audit::principal(&request);
+    let audit_request_id = audit::request_id(&request);
     let (metadata, extensions, mut input_stream) = request.into_parts();
 
     let first_msg = input_stream
@@ -2901,7 +3302,37 @@ pub(super) async fn handle_exec_sandbox_interactive(
         .await
         .map_err(|e| Status::internal(format!("failed to read first message: {e}")))?;
 
-    let req = validate_interactive_exec_start(first_msg)?;
+    // A malformed start message never reaches the audited start handler;
+    // record the rejection here when there is a start payload to attribute.
+    let audit_start = match first_msg.as_ref().and_then(|msg| msg.payload.as_ref()) {
+        Some(openshell_core::proto::exec_sandbox_input::Payload::Start(req)) => Some(req.clone()),
+        _ => None,
+    };
+    let req = match validate_interactive_exec_start(first_msg) {
+        Ok(req) => req,
+        Err(status) => {
+            if let Some(start) = audit_start {
+                let facts = SandboxAuditFacts {
+                    principal: audit_principal,
+                    request_id: audit_request_id,
+                    name: start.sandbox.clone(),
+                    workspace: super::workspace::audit_workspace_name(
+                        start.workspace_scope.as_ref(),
+                    ),
+                };
+                let result: Result<(), Status> = Err(status.clone());
+                emit_session_audit(
+                    state,
+                    &facts,
+                    &result,
+                    None,
+                    &exec_audit_description(&start, true),
+                    exec_audit_unmapped(state, &start, true),
+                );
+            }
+            return Err(status);
+        }
+    };
 
     let mut request = Request::from_parts(
         metadata,
@@ -2923,6 +3354,32 @@ pub(super) async fn handle_exec_sandbox_interactive(
 pub(super) async fn handle_exec_sandbox_interactive_start(
     state: &Arc<ServerState>,
     request: Request<ExecSandboxInput>,
+) -> Result<Response<ReceiverStream<Result<ExecSandboxEvent, Status>>>, Status> {
+    let start = super::mutation_replay::streaming::start(request.get_ref())
+        .ok()
+        .cloned();
+    let Some(start) = start else {
+        return handle_exec_sandbox_interactive_start_inner(state, request, &mut None).await;
+    };
+    let facts =
+        SandboxAuditFacts::capture(&request, &start.sandbox, start.workspace_scope.as_ref());
+    let mut identity = None;
+    let result = handle_exec_sandbox_interactive_start_inner(state, request, &mut identity).await;
+    emit_session_audit(
+        state,
+        &facts,
+        &result,
+        identity.as_ref(),
+        &exec_audit_description(&start, true),
+        exec_audit_unmapped(state, &start, true),
+    );
+    result
+}
+
+async fn handle_exec_sandbox_interactive_start_inner(
+    state: &Arc<ServerState>,
+    request: Request<ExecSandboxInput>,
+    identity: &mut Option<(String, String)>,
 ) -> Result<Response<ReceiverStream<Result<ExecSandboxEvent, Status>>>, Status> {
     let principal = super::extract_principal(&request)?;
     let completion = request
@@ -2951,6 +3408,10 @@ pub(super) async fn handle_exec_sandbox_interactive_start(
         MinWorkspaceRole::User,
     )
     .await?;
+    *identity = Some((
+        sandbox.object_id().to_string(),
+        sandbox.object_name().to_string(),
+    ));
 
     if let Some(completion) = &completion {
         completion.ensure_target(sandbox.object_id())?;
@@ -3031,9 +3492,80 @@ fn sandbox_relay_reachable(state: &ServerState, sandbox: &Sandbox) -> bool {
             && state.supervisor_sessions.has_session(sandbox.object_id()))
 }
 
+/// Non-secret identity of a freshly committed SSH session, for its audit
+/// event.
+struct SshSessionAuditFacts {
+    session_name: String,
+    sandbox_id: String,
+    sandbox_name: String,
+    expires_at_ms: i64,
+}
+
 pub(super) async fn handle_create_ssh_session(
     state: &Arc<ServerState>,
     request: Request<CreateSshSessionRequest>,
+) -> Result<Response<CreateSshSessionResponse>, Status> {
+    let facts = SandboxAuditFacts::capture(
+        &request,
+        &request.get_ref().sandbox,
+        request.get_ref().workspace_scope.as_ref(),
+    );
+    let mut created = None;
+    let result = handle_create_ssh_session_inner(state, request, &mut created).await;
+    // The session is identified by its generated name — the bearer token
+    // never enters the audit record.
+    let entity = audit::entity(
+        "ssh_session",
+        created.as_ref().map(|session| session.session_name.clone()),
+        None,
+    );
+    let sandbox = created
+        .as_ref()
+        .map(|session| (session.sandbox_id.as_str(), session.sandbox_name.as_str()));
+    let message = created.as_ref().map_or_else(String::new, |session| {
+        format!(
+            "ssh session {} created for sandbox {}",
+            session.session_name, session.sandbox_name
+        )
+    });
+    let mut unmapped = vec![
+        ("sandbox", serde_json::Value::from(facts.name.clone())),
+        (
+            "workspace",
+            serde_json::Value::from(facts.workspace.clone()),
+        ),
+    ];
+    if let Some(session) = &created {
+        unmapped.push((
+            "sandbox_id",
+            serde_json::Value::from(session.sandbox_id.clone()),
+        ));
+        unmapped.push((
+            "expires_at_ms",
+            serde_json::Value::from(session.expires_at_ms),
+        ));
+    }
+    audit::emit_entity_outcome(
+        &state.config.audit,
+        &result,
+        audit::EntityOutcome {
+            activity: EntityActivityId::Create,
+            entity,
+            sandbox,
+            principal: &facts.principal,
+            request_id: facts.request_id.as_deref(),
+            success_message: message,
+            failure_message: format!("ssh session create for sandbox {} failed", facts.name),
+            unmapped,
+        },
+    );
+    result
+}
+
+async fn handle_create_ssh_session_inner(
+    state: &Arc<ServerState>,
+    request: Request<CreateSshSessionRequest>,
+    created: &mut Option<SshSessionAuditFacts>,
 ) -> Result<Response<CreateSshSessionResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
@@ -3103,6 +3635,12 @@ pub(super) async fn handle_create_ssh_session(
         )
         .await
         .map_err(|e| Status::internal(format!("persist ssh session failed: {e}")))?;
+    *created = Some(SshSessionAuditFacts {
+        session_name: session.object_name().to_string(),
+        sandbox_id: sandbox_id.clone(),
+        sandbox_name: sandbox.object_name().to_string(),
+        expires_at_ms,
+    });
 
     let (gateway_host, gateway_port) = resolve_gateway(&state.config);
     let scheme = if state.config.tls.is_some() {
@@ -3126,6 +3664,57 @@ pub(super) async fn handle_create_ssh_session(
 pub(super) async fn handle_revoke_ssh_session(
     state: &Arc<ServerState>,
     request: Request<RevokeSshSessionRequest>,
+) -> Result<Response<RevokeSshSessionResponse>, Status> {
+    let principal = audit::principal(&request);
+    let request_id = audit::request_id(&request);
+    let mut revoked = None;
+    let result = handle_revoke_ssh_session_inner(state, request, &mut revoked).await;
+    // The request identifies the session only by its bearer token, which
+    // never enters the audit record: a revocation is identified by the
+    // session's generated name, and attempts that changed nothing (unknown,
+    // or already revoked) carry no identifier and audit as Failure.
+    let entity = audit::entity(
+        "ssh_session",
+        revoked
+            .as_ref()
+            .map(|(session_name, _)| session_name.clone()),
+        None,
+    );
+    let sandbox = revoked
+        .as_ref()
+        .map(|(_, sandbox_id)| (sandbox_id.as_str(), ""));
+    let message = revoked
+        .as_ref()
+        .map_or_else(String::new, |(session_name, _)| {
+            format!("ssh session {session_name} revoked")
+        });
+    let mut unmapped = vec![("operation", serde_json::Value::from("revoke"))];
+    if let Some((_, sandbox_id)) = &revoked {
+        unmapped.push(("sandbox_id", serde_json::Value::from(sandbox_id.clone())));
+    }
+    audit::emit_entity_outcome_judged(
+        &state.config.audit,
+        &result,
+        |_| revoked.is_some(),
+        audit::EntityOutcome {
+            activity: EntityActivityId::Delete,
+            entity,
+            sandbox,
+            principal: &principal,
+            request_id: request_id.as_deref(),
+            success_message: message,
+            failure_message: "ssh session revoke changed nothing (unknown or already revoked)"
+                .to_string(),
+            unmapped,
+        },
+    );
+    result
+}
+
+async fn handle_revoke_ssh_session_inner(
+    state: &Arc<ServerState>,
+    request: Request<RevokeSshSessionRequest>,
+    revoked: &mut Option<(String, String)>,
 ) -> Result<Response<RevokeSshSessionResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
@@ -3197,6 +3786,10 @@ pub(super) async fn handle_revoke_ssh_session(
         )
         .await
         .map_err(|e| super::persistence_error_to_status(e, "revoke ssh session"))?;
+    *revoked = Some((
+        session.object_name().to_string(),
+        session.sandbox_id.clone(),
+    ));
 
     Ok(Response::new(RevokeSshSessionResponse {
         outcome: openshell_core::proto::DeletionOutcome::Completed.into(),
@@ -8445,6 +9038,218 @@ mod tests {
 
         assert!(state.supervisor_sessions.disconnect("sandbox-work"));
         assert!(!sandbox_relay_reachable(&state, &sandbox));
+    }
+
+    /// Sandbox-family mutations leave a 3004 audit trail with correct
+    /// sandbox association and no secret material: ssh session events carry
+    /// the generated session name but never the bearer token, exec
+    /// rejections record the attempted command line (never environment or
+    /// stdin), revokes record the session, and a repeated revoke audits as a
+    /// no-op Failure.
+    #[tokio::test]
+    async fn sandbox_sessions_and_exec_emit_audit_events_without_secrets() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_sandbox("audit-sb", Vec::new()))
+            .await
+            .unwrap();
+        let workspace_scope = || Some(openshell_core::proto::workspace_selector("default"));
+
+        let (captured, guard) = audit::test_capture::install();
+        let token = handle_create_ssh_session(
+            &state,
+            authed_request(CreateSshSessionRequest {
+                sandbox: "audit-sb".to_string(),
+                workspace_scope: workspace_scope(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .token;
+
+        let error = handle_exec_sandbox(
+            &state,
+            authed_request(ExecSandboxRequest {
+                sandbox: "no-such-sandbox".to_string(),
+                workspace_scope: workspace_scope(),
+                command: vec![
+                    "curl".to_string(),
+                    "-H".to_string(),
+                    "Authorization: Bearer sk-exec-arg".to_string(),
+                ],
+                environment: HashMap::from([(
+                    "SECRET_ENV".to_string(),
+                    "sk-env-secret".to_string(),
+                )]),
+                stdin: b"sk-stdin-secret".to_vec(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::NotFound);
+
+        // Malformed request: rejected before any sandbox resolution, but
+        // still audited like any other exec rejection.
+        let error = handle_exec_sandbox(
+            &state,
+            authed_request(ExecSandboxRequest {
+                sandbox: "audit-sb".to_string(),
+                workspace_scope: workspace_scope(),
+                command: Vec::new(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+
+        handle_revoke_ssh_session(
+            &state,
+            authed_request(RevokeSshSessionRequest {
+                allow_missing: false,
+                token: token.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+        // Re-revoking the same token changes nothing.
+        handle_revoke_ssh_session(
+            &state,
+            authed_request(RevokeSshSessionRequest {
+                allow_missing: false,
+                token: token.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+        drop(guard);
+
+        let records = captured.json();
+        assert_eq!(records.len(), 5, "{records:?}");
+
+        let ssh_create = &records[0];
+        assert_eq!(ssh_create["entity"]["type"], "ssh_session");
+        assert!(
+            ssh_create["entity"]["uid"]
+                .as_str()
+                .is_some_and(|uid| !uid.is_empty() && uid != token),
+            "session is identified by its generated name, never the token"
+        );
+        assert_eq!(ssh_create["container"]["uid"], "sandbox-audit-sb");
+
+        let exec_reject = &records[1];
+        assert_eq!(exec_reject["status"], "Failure");
+        assert_eq!(exec_reject["unmapped"]["operation"], "exec");
+        assert_eq!(
+            exec_reject["unmapped"]["command"],
+            serde_json::json!(["curl", "-H", "Authorization: Bearer sk-exec-arg"]),
+            "full argv recorded by default (exec_args=true)"
+        );
+        assert!(exec_reject.get("container").is_none());
+
+        let malformed = &records[2];
+        assert_eq!(malformed["status"], "Failure");
+        assert_eq!(malformed["unmapped"]["operation"], "exec");
+
+        let revoke = &records[3];
+        assert_eq!(revoke["entity"]["type"], "ssh_session");
+        assert_eq!(revoke["unmapped"]["operation"], "revoke");
+        assert_eq!(revoke["status"], "Success");
+        assert_eq!(revoke["container"]["uid"], "sandbox-audit-sb");
+
+        let re_revoke = &records[4];
+        assert_eq!(re_revoke["unmapped"]["operation"], "revoke");
+        assert_eq!(re_revoke["status"], "Failure");
+
+        for (record, event) in records.iter().zip(captured.events()) {
+            let rendered = format!("{record} {}", event.format_shorthand());
+            assert!(
+                !rendered.contains(&token),
+                "ssh bearer token must never appear in any audit record"
+            );
+            assert!(
+                !rendered.contains("sk-env-secret") && !rendered.contains("SECRET_ENV"),
+                "environment variables must never appear in any audit record"
+            );
+            assert!(
+                !rendered.contains("sk-stdin-secret"),
+                "stdin must never appear in any audit record"
+            );
+        }
+    }
+
+    /// `exec_args = false` reduces the audited command line to the binary
+    /// name — arguments that may carry secrets stay out of the record.
+    #[tokio::test]
+    async fn exec_args_toggle_reduces_audited_command_to_binary() {
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state).unwrap().config.audit.exec_args = false;
+
+        let (captured, guard) = audit::test_capture::install();
+        let _ = handle_exec_sandbox(
+            &state,
+            authed_request(ExecSandboxRequest {
+                sandbox: "no-such-sandbox".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                command: vec![
+                    "curl".to_string(),
+                    "--token".to_string(),
+                    "sk-secret-arg".to_string(),
+                ],
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        drop(guard);
+
+        let records = captured.json();
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0]["unmapped"]["command"], "curl");
+        assert!(!records[0].to_string().contains("sk-secret-arg"));
+        assert!(
+            !captured.events()[0]
+                .format_shorthand()
+                .contains("sk-secret-arg")
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_lifecycle_audit_names_the_sandbox() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_sandbox("life", Vec::new()))
+            .await
+            .unwrap();
+
+        let (captured, guard) = audit::test_capture::install();
+        let response = handle_delete_sandbox(
+            &state,
+            authed_request(DeleteSandboxRequest {
+                name: "missing".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                allow_missing: true,
+                request_id: String::new(),
+            }),
+        )
+        .await
+        .unwrap();
+        drop(guard);
+        assert!(!audit::deletion_changed_state(response.get_ref().outcome));
+
+        let records = captured.json();
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0]["entity"]["type"], "sandbox");
+        assert_eq!(records[0]["entity"]["name"], "missing");
+        assert_eq!(records[0]["activity_id"], 4);
+        assert_eq!(
+            records[0]["status"], "Failure",
+            "no-op delete is not a change"
+        );
     }
 
     #[tokio::test]

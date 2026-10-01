@@ -17,10 +17,12 @@ use openshell_core::proto::{
     RemoveWorkspaceMemberResponse, Sandbox, SandboxWorkloadTemplate, ServiceEndpoint, SshSession,
     Workspace, WorkspaceMember, WorkspaceRole,
 };
+use openshell_ocsf::{EntityActivityId, ManagedEntity, ManagedEntityTypeId};
 use prost::Message;
 use tonic::{Request, Response, Status};
 
 use crate::ServerState;
+use crate::audit;
 use crate::auth::principal::Principal;
 use crate::auth::workspace_authz::{AuthGrant, MinWorkspaceRole, authorize_workspace};
 use crate::pagination::Pagination;
@@ -145,6 +147,40 @@ pub async fn resolve_workspace(
 }
 
 pub(super) async fn handle_create_workspace(
+    state: &Arc<ServerState>,
+    request: Request<CreateWorkspaceRequest>,
+) -> Result<Response<CreateWorkspaceResponse>, Status> {
+    let principal = audit::principal(&request);
+    let request_id = audit::request_id(&request);
+    let name = request.get_ref().name.clone();
+
+    let result = handle_create_workspace_inner(state, request).await;
+
+    let uid = result
+        .as_ref()
+        .ok()
+        .and_then(|resp| resp.get_ref().workspace.as_ref())
+        .and_then(|w| w.metadata.as_ref())
+        .map(|m| m.id.clone());
+    let entity = audit::entity(WORKSPACE_OBJECT_TYPE, uid, Some(name.clone()));
+    audit::emit_entity_outcome(
+        &state.config.audit,
+        &result,
+        audit::EntityOutcome {
+            activity: EntityActivityId::Create,
+            entity,
+            sandbox: None,
+            principal: &principal,
+            request_id: request_id.as_deref(),
+            success_message: format!("workspace {name} created"),
+            failure_message: format!("workspace {name} create failed"),
+            unmapped: Vec::new(),
+        },
+    );
+    result
+}
+
+async fn handle_create_workspace_inner(
     state: &Arc<ServerState>,
     request: Request<CreateWorkspaceRequest>,
 ) -> Result<Response<CreateWorkspaceResponse>, Status> {
@@ -292,6 +328,35 @@ pub(super) async fn handle_list_workspaces(
 }
 
 pub(super) async fn handle_delete_workspace(
+    state: &Arc<ServerState>,
+    request: Request<DeleteWorkspaceRequest>,
+) -> Result<Response<DeleteWorkspaceResponse>, Status> {
+    let principal = audit::principal(&request);
+    let request_id = audit::request_id(&request);
+    let name = request.get_ref().name.clone();
+
+    let result = handle_delete_workspace_inner(state, request).await;
+
+    let entity = audit::entity(WORKSPACE_OBJECT_TYPE, None, Some(name.clone()));
+    audit::emit_entity_outcome_judged(
+        &state.config.audit,
+        &result,
+        |response| audit::deletion_changed_state(response.outcome),
+        audit::EntityOutcome {
+            activity: EntityActivityId::Delete,
+            entity,
+            sandbox: None,
+            principal: &principal,
+            request_id: request_id.as_deref(),
+            success_message: format!("workspace {name} deleted"),
+            failure_message: format!("workspace {name} delete failed"),
+            unmapped: Vec::new(),
+        },
+    );
+    result
+}
+
+async fn handle_delete_workspace_inner(
     state: &Arc<ServerState>,
     request: Request<DeleteWorkspaceRequest>,
 ) -> Result<Response<DeleteWorkspaceResponse>, Status> {
@@ -457,6 +522,22 @@ pub(super) async fn handle_delete_workspace(
     }))
 }
 
+/// The workspace a request's `workspace_scope` names, for audit events.
+///
+/// Best effort and never failing: the audit record names what the caller
+/// asked for (`*` for all workspaces, empty when unset); validation stays
+/// with the handler.
+pub(super) fn audit_workspace_name(
+    selector: Option<&openshell_core::proto::WorkspaceSelector>,
+) -> String {
+    use openshell_core::proto::workspace_selector::Selection;
+    match selector.and_then(|selector| selector.selection.as_ref()) {
+        Some(Selection::Workspace(workspace)) => workspace.clone(),
+        Some(Selection::AllWorkspaces(_)) => "*".to_string(),
+        None => String::new(),
+    }
+}
+
 pub(super) fn authorize_member_role(role: i32, grant: AuthGrant) -> Result<(), Status> {
     let role = WorkspaceRole::try_from(role).unwrap_or(WorkspaceRole::Unspecified);
     if role == WorkspaceRole::Unspecified {
@@ -473,6 +554,45 @@ pub(super) fn authorize_member_role(role: i32, grant: AuthGrant) -> Result<(), S
 }
 
 pub(super) async fn handle_add_workspace_member(
+    state: &Arc<ServerState>,
+    request: Request<AddWorkspaceMemberRequest>,
+) -> Result<Response<AddWorkspaceMemberResponse>, Status> {
+    let principal = audit::principal(&request);
+    let request_id = audit::request_id(&request);
+    let req = request.get_ref();
+    let subject = req.principal_subject.clone();
+    let workspace = audit_workspace_name(req.workspace_scope.as_ref());
+    let role = match WorkspaceRole::try_from(req.role) {
+        Ok(WorkspaceRole::User) => Some("user"),
+        Ok(WorkspaceRole::Admin) => Some("admin"),
+        _ => None,
+    };
+
+    let result = handle_add_workspace_member_inner(state, request).await;
+
+    let mut unmapped = vec![("workspace", serde_json::Value::from(workspace.clone()))];
+    if let Some(role) = role {
+        unmapped.push(("role", serde_json::Value::from(role)));
+    }
+    audit::emit_entity_outcome(
+        &state.config.audit,
+        &result,
+        audit::EntityOutcome {
+            activity: EntityActivityId::Create,
+            entity: ManagedEntity::new(WorkspaceMember::object_type(), subject.clone())
+                .with_type_id(ManagedEntityTypeId::User),
+            sandbox: None,
+            principal: &principal,
+            request_id: request_id.as_deref(),
+            success_message: format!("member {subject} added to workspace {workspace}"),
+            failure_message: format!("member {subject} add to workspace {workspace} failed"),
+            unmapped,
+        },
+    );
+    result
+}
+
+async fn handle_add_workspace_member_inner(
     state: &Arc<ServerState>,
     request: Request<AddWorkspaceMemberRequest>,
 ) -> Result<Response<AddWorkspaceMemberResponse>, Status> {
@@ -572,6 +692,39 @@ pub(super) async fn handle_remove_workspace_member(
     state: &Arc<ServerState>,
     request: Request<RemoveWorkspaceMemberRequest>,
 ) -> Result<Response<RemoveWorkspaceMemberResponse>, Status> {
+    let principal = audit::principal(&request);
+    let request_id = audit::request_id(&request);
+    let req = request.get_ref();
+    let subject = req.principal_subject.clone();
+    let workspace = audit_workspace_name(req.workspace_scope.as_ref());
+
+    let result = handle_remove_workspace_member_inner(state, request).await;
+
+    // Removing a member who was never in the workspace (`allow_missing`) is
+    // not a state change.
+    audit::emit_entity_outcome_judged(
+        &state.config.audit,
+        &result,
+        |response| audit::deletion_changed_state(response.outcome),
+        audit::EntityOutcome {
+            activity: EntityActivityId::Delete,
+            entity: ManagedEntity::new(WorkspaceMember::object_type(), subject.clone())
+                .with_type_id(ManagedEntityTypeId::User),
+            sandbox: None,
+            principal: &principal,
+            request_id: request_id.as_deref(),
+            success_message: format!("member {subject} removed from workspace {workspace}"),
+            failure_message: format!("member {subject} remove from workspace {workspace} failed"),
+            unmapped: vec![("workspace", serde_json::Value::from(workspace.clone()))],
+        },
+    );
+    result
+}
+
+async fn handle_remove_workspace_member_inner(
+    state: &Arc<ServerState>,
+    request: Request<RemoveWorkspaceMemberRequest>,
+) -> Result<Response<RemoveWorkspaceMemberResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
 
@@ -658,6 +811,138 @@ mod tests {
     use crate::grpc::test_support::{
         authed_request, test_server_state, test_server_state_with_workspace_cleanup_failures,
     };
+
+    /// Workspace mutations leave an audit trail: 3004 events with the
+    /// authenticated actor, entity identity and request correlation, with no
+    /// container (gateway-scoped). Exercises create, membership add (with
+    /// the workspace in `unmapped`), and an audited failure (deleting the
+    /// default workspace).
+    #[tokio::test]
+    async fn workspace_mutations_emit_entity_audit_events() {
+        let state = test_server_state().await;
+        let (captured, guard) = audit::test_capture::install();
+
+        let mut request = authed_request(CreateWorkspaceRequest {
+            request_id: String::new(),
+            name: "audit-ws".to_string(),
+            labels: HashMap::new(),
+        });
+        request
+            .metadata_mut()
+            .insert("x-request-id", "req-42".parse().unwrap());
+        handle_create_workspace(&state, request).await.unwrap();
+
+        handle_add_workspace_member(
+            &state,
+            authed_request(AddWorkspaceMemberRequest {
+                workspace_scope: Some(openshell_core::proto::workspace_selector("audit-ws")),
+                principal_subject: "bob".to_string(),
+                role: WorkspaceRole::User.into(),
+                request_id: String::new(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let error = handle_delete_workspace(
+            &state,
+            authed_request(DeleteWorkspaceRequest {
+                name: DEFAULT_WORKSPACE_NAME.to_string(),
+                allow_missing: false,
+                request_id: String::new(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        drop(guard);
+
+        let records = captured.json();
+        assert_eq!(records.len(), 3, "{records:?}");
+
+        let create = &records[0];
+        assert!(create.get("container").is_none(), "gateway-scoped");
+        assert_eq!(create["class_uid"], 3004);
+        assert_eq!(create["activity_id"], 1);
+        assert_eq!(create["entity"]["type"], "workspace");
+        assert_eq!(create["entity"]["name"], "audit-ws");
+        assert!(
+            create["entity"]["uid"]
+                .as_str()
+                .is_some_and(|uid| !uid.is_empty()),
+            "created entity carries its store id"
+        );
+        assert_eq!(create["actor"]["user"]["uid"], "dev-user");
+        assert_eq!(create["unmapped"]["request_id"], "req-42");
+        assert_eq!(create["status"], "Success");
+        assert_eq!(create["metadata"]["product"]["name"], "OpenShell Gateway");
+
+        let member = &records[1];
+        assert_eq!(member["entity"]["type"], "workspace_member");
+        assert_eq!(
+            member["entity"]["type_id"], 2,
+            "members are OCSF User entities"
+        );
+        assert_eq!(member["entity"]["uid"], "bob");
+        assert_eq!(member["unmapped"]["workspace"], "audit-ws");
+        assert_eq!(member["unmapped"]["role"], "user");
+
+        let delete = &records[2];
+        assert_eq!(delete["activity_id"], 4);
+        assert_eq!(delete["entity"]["name"], "default");
+        assert_eq!(delete["status"], "Failure");
+        assert_eq!(delete["severity_id"], 2, "failures emit at Low");
+    }
+
+    /// `[openshell.gateway.audit] enabled = false` silences entity events
+    /// without touching the mutations themselves.
+    #[tokio::test]
+    async fn disabled_audit_config_suppresses_workspace_audit_events() {
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state).unwrap().config.audit.enabled = false;
+        let (captured, guard) = audit::test_capture::install();
+
+        let resp = handle_create_workspace(
+            &state,
+            authed_request(CreateWorkspaceRequest {
+                request_id: String::new(),
+                name: "quiet-ws".to_string(),
+                labels: HashMap::new(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(resp.get_ref().workspace.is_some());
+        drop(guard);
+
+        assert!(captured.events().is_empty(), "{:?}", captured.json());
+    }
+
+    /// An `allow_missing` no-op delete is not a state change: it audits as
+    /// a Failure rather than claiming a deletion.
+    #[tokio::test]
+    async fn noop_member_removal_audits_as_failure() {
+        let state = test_server_state().await;
+        let (captured, guard) = audit::test_capture::install();
+        let response = handle_remove_workspace_member(
+            &state,
+            authed_request(RemoveWorkspaceMemberRequest {
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                principal_subject: "nobody".to_string(),
+                allow_missing: true,
+                request_id: String::new(),
+            }),
+        )
+        .await
+        .unwrap();
+        drop(guard);
+        assert!(!audit::deletion_changed_state(response.get_ref().outcome));
+
+        let records = captured.json();
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0]["status"], "Failure");
+        assert_eq!(records[0]["entity"]["uid"], "nobody");
+    }
 
     #[tokio::test]
     async fn create_workspace_returns_metadata() {

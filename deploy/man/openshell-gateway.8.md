@@ -93,6 +93,29 @@ TLS.
     the Kubernetes compute driver.
     Environment: **OPENSHELL_ENABLE_MTLS_AUTH**.
 
+**--audit-events** *BOOL*
+:   Emit gateway audit events: OCSF records for state-changing RPCs,
+    authentication failures, and suspicious authorization patterns, each
+    carrying the authenticated principal. Defaults to true.
+    Environment: **OPENSHELL_AUDIT_EVENTS**.
+
+**--audit-auth-success-events** *BOOL*
+:   Also emit an audit event for every successfully authenticated request.
+    Failures are always emitted while audit events are enabled. Defaults to
+    false.
+    Environment: **OPENSHELL_AUDIT_AUTH_SUCCESS_EVENTS**.
+
+**--audit-exec-args** *BOOL*
+:   Record full command lines in sandbox exec audit events. Set to false to
+    record only the binary name. Defaults to true.
+    Environment: **OPENSHELL_AUDIT_EXEC_ARGS**.
+
+**--audit-settings-values** *BOOL*
+:   Record before and after values of changed settings in audit events. Set
+    to false to record key names only. Keys that look like credentials are
+    always redacted. Defaults to true.
+    Environment: **OPENSHELL_AUDIT_SETTINGS_VALUES**.
+
 **--disable-tls**
 :   Disable TLS entirely and listen on plaintext HTTP. When the bind
     address is **0.0.0.0** (the RPM default), disabling TLS exposes the

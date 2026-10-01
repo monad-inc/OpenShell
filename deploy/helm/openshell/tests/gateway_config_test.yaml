@@ -303,6 +303,47 @@ tests:
           path: data["gateway.toml"]
           pattern: '\[openshell\.gateway\.otlp\]'
 
+  - it: omits the audit table when all toggles keep their defaults
+    template: templates/gateway-config.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '\[openshell\.gateway\.audit\]'
+
+  - it: treats a null audit map as defaults
+    template: templates/gateway-config.yaml
+    set:
+      server.audit: null
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '\[openshell\.gateway\.audit\]'
+
+  - it: renders enabled = false when audit events are turned off
+    template: templates/gateway-config.yaml
+    set:
+      server.audit.enabled: false
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\.audit\].*?enabled\s*=\s*false'
+
+  - it: renders the audit table with only the non-default toggles
+    template: templates/gateway-config.yaml
+    set:
+      server.audit.authSuccessEvents: true
+      server.audit.settingsValues: false
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\.audit\].*?auth_success_events\s*=\s*true'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\.audit\].*?settings_values\s*=\s*false'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'exec_args\s*='
+
   - it: omits OCSF JSONL output by default
     template: templates/gateway-config.yaml
     asserts:

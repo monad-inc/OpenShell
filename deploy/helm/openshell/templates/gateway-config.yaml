@@ -15,6 +15,11 @@ One value is intentionally NOT rendered here:
 {{- $credentialDrivers := list -}}
 {{- $otlp := .Values.server.otlp | default dict -}}
 {{- $ocsfLog := .Values.server.ocsfLog | default dict -}}
+{{- $audit := .Values.server.audit | default dict -}}
+{{- $auditEnabled := ternary true $audit.enabled (kindIs "invalid" $audit.enabled) -}}
+{{- $auditAuthSuccess := ternary false $audit.authSuccessEvents (kindIs "invalid" $audit.authSuccessEvents) -}}
+{{- $auditExecArgs := ternary true $audit.execArgs (kindIs "invalid" $audit.execArgs) -}}
+{{- $auditSettingsValues := ternary true $audit.settingsValues (kindIs "invalid" $audit.settingsValues) -}}
 {{- if .Values.server.credentialDrivers.kubernetesSecrets.enabled -}}
 {{- $credentialDrivers = append $credentialDrivers "kubernetes-secrets" -}}
 {{- end -}}
@@ -122,6 +127,23 @@ data:
     {{- end }}
     queue_capacity = {{ $ocsfQueueCapacity }}
     queue_max_bytes = {{ $ocsfQueueMaxBytes }}
+    {{- end }}
+
+    {{- if or (not $auditEnabled) $auditAuthSuccess (not $auditExecArgs) (not $auditSettingsValues) }}
+
+    [openshell.gateway.audit]
+    {{- if not $auditEnabled }}
+    enabled             = false
+    {{- end }}
+    {{- if $auditAuthSuccess }}
+    auth_success_events = true
+    {{- end }}
+    {{- if not $auditExecArgs }}
+    exec_args           = false
+    {{- end }}
+    {{- if not $auditSettingsValues }}
+    settings_values     = false
+    {{- end }}
     {{- end }}
 
     {{- if not .Values.server.disableTls }}

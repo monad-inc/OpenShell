@@ -2078,7 +2078,7 @@ async fn refresh_states(
             status = %state.status,
             "refreshing provider credential"
         );
-        if let Err(err) = refresh_provider_credential(
+        let result = refresh_provider_credential(
             store,
             state.object_workspace(),
             credentials,
@@ -2086,8 +2086,9 @@ async fn refresh_states(
             &state.provider_name,
             &state.credential_key,
         )
-        .await
-        {
+        .await;
+        audit_refresh_rotation(&state, rotation_requested, result.is_ok());
+        if let Err(err) = result {
             warn!(
                 provider = %state.provider_name,
                 credential_key = %state.credential_key,
@@ -2099,6 +2100,53 @@ async fn refresh_states(
             );
         }
     }
+}
+
+/// Audit a timer-driven credential rotation. The same rotation performed via
+/// `RotateProviderCredential` is audited with the caller as actor; the
+/// background path must be just as visible. Identity fields only — never key
+/// material.
+fn audit_refresh_rotation(
+    state: &StoredProviderCredentialRefreshState,
+    rotation_requested: bool,
+    success: bool,
+) {
+    let target = format!("{}/{}", state.provider_name, state.credential_key);
+    crate::audit::emit_system_entity(
+        crate::audit::global_config(),
+        success,
+        crate::audit::SystemEntityOutcome {
+            activity: openshell_ocsf::EntityActivityId::Update,
+            entity: openshell_ocsf::ManagedEntity::new("credential", target.clone()),
+            sandbox: None,
+            component: "provider-refresh",
+            success_message: format!("credential auto-rotated for {target}"),
+            failure_message: format!("credential auto-rotate for {target} failed"),
+            unmapped: vec![
+                ("operation", serde_json::Value::from("auto_rotate")),
+                (
+                    "workspace",
+                    serde_json::Value::from(state.object_workspace().to_string()),
+                ),
+                (
+                    "provider",
+                    serde_json::Value::from(state.provider_name.clone()),
+                ),
+                (
+                    "credential_key",
+                    serde_json::Value::from(state.credential_key.clone()),
+                ),
+                (
+                    "trigger",
+                    serde_json::Value::from(if rotation_requested {
+                        "rotation_requested"
+                    } else {
+                        "scheduled"
+                    }),
+                ),
+            ],
+        },
+    );
 }
 
 #[cfg(test)]
