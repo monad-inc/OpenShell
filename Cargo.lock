@@ -4750,6 +4750,7 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "criterion",
  "futures",
  "futures-util",
  "glob",
@@ -7882,6 +7883,7 @@ dependencies = [
  "tower-layer",
  "tower-service",
  "tracing",
+ "webpki-roots",
 ]
 
 [[package]]

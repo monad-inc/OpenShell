@@ -9,7 +9,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, NaiveDate, Utc};
-use openshell_ocsf::{OcsfEvent, format::downgrade::downgrade_event};
+use openshell_ocsf::OcsfEvent;
 use tracing::{Event, Subscriber};
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
@@ -162,12 +162,13 @@ fn serialize_event(
     event: &OcsfEvent,
     schema_version: Option<OcsfSchemaVersion>,
 ) -> Result<Vec<u8>, serde_json::Error> {
-    let Some(schema_version) = schema_version else {
-        return event.to_json_line().map(String::into_bytes);
-    };
-    let mut event = serde_json::to_value(event)?;
-    downgrade_event(&mut event, schema_version.as_str());
-    let mut line = serde_json::to_vec(&event)?;
+    // The shared renderer is also what OTLP export puts in `ocsf.raw`, so the
+    // two gateway sinks always carry the same document for one event.
+    let mut line = openshell_ocsf::format::event_json_string(
+        event,
+        schema_version.map(OcsfSchemaVersion::as_str),
+    )?
+    .into_bytes();
     line.push(b'\n');
     Ok(line)
 }

@@ -18,12 +18,15 @@
 //! and mirrored nowhere here. `docs/how-it-works/gateways/configuration.mdx` documents
 //! the variables operators are likely to want.
 //!
-//! Only traces are exported. Logs and metrics have their own surfaces (OCSF
-//! JSONL and the Prometheus `/metrics` endpoint).
+//! Traces are exported through the SDK's batch pipeline. Logs are exported to
+//! the same endpoint, under the same resource, by [`crate::log_export`] when
+//! `export_logs` is set; that worker owns its own batching, so the SDK's
+//! `OTEL_BLRP_*` variables have no effect. Transport variables such as
+//! `OTEL_EXPORTER_OTLP_HEADERS` / `OTEL_EXPORTER_OTLP_LOGS_HEADERS` still apply.
+//! Metrics stay on the Prometheus `/metrics` endpoint.
 
 use openshell_otel::{OtlpTraceConfig, ServiceName};
 pub use openshell_otel::{SetupError, TraceContextInterceptor, mark_error};
-#[cfg(test)]
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing::Subscriber;
@@ -121,6 +124,29 @@ pub fn provider_for(
     gateway: GatewayResourceAttributes<'_>,
 ) -> (Option<SdkTracerProvider>, Option<SetupError>) {
     openshell_otel::provider_for(cfg.map(|cfg| trace_config(cfg, gateway)))
+}
+
+/// Resolve the OTLP **log** exporter (and its resource) for a gateway config.
+///
+/// Returns `None` unless the `[openshell.gateway.otlp]` table is present *and*
+/// `export_logs` is set: log export is opt-in on top of the endpoint the
+/// tracer uses. The resource is built from the same [`trace_config`] as the
+/// spans, so log records carry the same `service.name`, `service.version` and
+/// gateway identity attributes. Like [`provider_for`], a broken exporter never
+/// stops the gateway; the error is returned for the caller to report.
+///
+/// Must be called from within a Tokio runtime.
+pub fn log_exporter_for(
+    cfg: Option<&OtlpConfig>,
+    gateway: GatewayResourceAttributes<'_>,
+) -> (
+    Option<(openshell_otel::OtlpLogExporter, Resource)>,
+    Option<SetupError>,
+) {
+    openshell_otel::log_exporter_for(
+        cfg.filter(|cfg| cfg.export_logs)
+            .map(|cfg| trace_config(cfg, gateway)),
+    )
 }
 
 /// Build the `tracing` layer that forwards spans to `provider`.
@@ -293,10 +319,7 @@ mod tests {
     use super::*;
 
     fn config() -> OtlpConfig {
-        OtlpConfig {
-            endpoint: "http://127.0.0.1:4317".into(),
-            service_name: None,
-        }
+        OtlpConfig::new("http://127.0.0.1:4317")
     }
 
     fn build_test_resource(cfg: &OtlpConfig) -> Resource {
@@ -359,6 +382,49 @@ mod tests {
                 .map(|v| v.to_string()),
             Some("vm".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn log_export_is_opt_in_on_top_of_the_trace_table() {
+        let (parts, error) =
+            log_exporter_for(Some(&config()), GatewayResourceAttributes::default());
+        assert!(parts.is_none(), "trace-only table must not export logs");
+        assert!(error.is_none());
+
+        let (parts, error) = log_exporter_for(None, GatewayResourceAttributes::default());
+        assert!(parts.is_none() && error.is_none());
+    }
+
+    #[tokio::test]
+    async fn log_exporter_shares_the_span_resource() {
+        let mut cfg = config();
+        cfg.export_logs = true;
+        cfg.service_name = Some("gateway-staging".into());
+        let gateway = GatewayResourceAttributes::new(Some("vm-dev"), Some("vm"));
+
+        let (parts, error) = log_exporter_for(Some(&cfg), gateway);
+        assert!(error.is_none(), "unexpected setup error: {error:?}");
+        let (_exporter, resource) = parts.expect("log exporter builds");
+        let spans = build_resource(&cfg, gateway);
+        for key in [
+            "service.name",
+            "service.version",
+            "openshell.gateway.name",
+            "openshell.gateway.compute_driver",
+        ] {
+            let key = opentelemetry::Key::from_static_str(key);
+            assert!(resource.get(&key).is_some(), "log resource lacks {key}");
+            assert_eq!(resource.get(&key), spans.get(&key), "{key} differs");
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_log_endpoint_is_reported_not_fatal() {
+        let mut cfg = OtlpConfig::new("definitely not a url");
+        cfg.export_logs = true;
+        let (parts, error) = log_exporter_for(Some(&cfg), GatewayResourceAttributes::default());
+        assert!(parts.is_none());
+        assert!(matches!(error, Some(SetupError::InvalidEndpoint { .. })));
     }
 
     struct EnvVarGuard {

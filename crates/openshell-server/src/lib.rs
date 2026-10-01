@@ -25,6 +25,7 @@ mod gateway_listener;
 mod gateway_ocsf;
 mod grpc;
 mod http;
+pub mod log_export;
 mod middleware;
 mod multiplex;
 mod ocsf_log;

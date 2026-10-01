@@ -87,6 +87,12 @@ data:
     {{- if $otlp.serviceName }}
     service_name = {{ $otlp.serviceName | quote }}
     {{- end }}
+    {{- if $otlp.exportLogs }}
+    export_logs = true
+    {{- end }}
+    {{- if and (not (kindIs "invalid" $otlp.ocsfFullPayload)) (not $otlp.ocsfFullPayload) }}
+    ocsf_full_payload = false
+    {{- end }}
     {{- end }}
 
     {{- if $ocsfLog.enabled }}
