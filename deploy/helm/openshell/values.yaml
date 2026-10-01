@@ -270,6 +270,13 @@ server:
     endpoint: ""
     # -- Gateway OpenTelemetry service name. Empty uses openshell-gateway.
     serviceName: ""
+    # -- Also export gateway and sandbox logs (including OCSF events) as OTLP
+    # log records to the same endpoint. Drops are reported downstream as
+    # telemetry_gap records.
+    exportLogs: false
+    # -- Carry the structured OCSF document (ocsf.raw) on exported OCSF
+    # records. Set false to export only the shorthand line.
+    ocsfFullPayload: true
   # Gateway-native OCSF JSONL output.
   ocsfLog:
     # -- Write gateway OCSF events as JSONL.

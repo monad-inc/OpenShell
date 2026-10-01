@@ -619,6 +619,21 @@ async fn run_from_args(
         Some(prepared.config.name.as_str()),
         Some(prepared.compute_driver.name()),
     );
+    // Started before tracing so the subscriber can carry its layer; like the
+    // tracer, a setup failure is reported once tracing is up.
+    let (log_export, log_export_error) = crate::log_export::LogExport::start(
+        otlp_config,
+        gateway_resource,
+        prepared
+            .config_file
+            .as_ref()
+            .and_then(|file| file.openshell.gateway.ocsf_log.as_ref())
+            .and_then(|log| log.schema_version)
+            .map(config_file::OcsfSchemaVersion::as_str),
+    );
+    if let Some(export) = &log_export {
+        tracing_log_bus.set_export(export.handle());
+    }
     let compute_driver_tracing = compute_drivers.in_process_tracing(
         &prepared.compute_driver,
         &prepared.config.compute_driver_endpoints,
@@ -629,10 +644,12 @@ async fn run_from_args(
             .to_string(),
         &tracing_log_bus,
         ocsf_log.as_ref(),
+        log_export.as_ref(),
         otlp_config,
         compute_driver_tracing,
         gateway_resource,
     );
+    let setup_error = setup_error.or(log_export_error);
 
     if prepared.legacy_compute_driver_env_seen {
         warn!("OPENSHELL_DRIVERS is deprecated; migrate to OPENSHELL_COMPUTE_DRIVER");
@@ -671,7 +688,11 @@ async fn run_from_args(
         .as_ref()
         .and_then(|f| f.openshell.gateway.otlp.as_ref())
     {
-        info!(endpoint = %otlp.endpoint, "OTLP exporting enabled");
+        info!(
+            endpoint = %otlp.endpoint,
+            logs = log_export.is_some(),
+            "OTLP exporting enabled"
+        );
     }
     if prepared.config.auth.allow_unauthenticated_users {
         warn!(
@@ -698,6 +719,10 @@ async fn run_from_args(
 
     if let Some(log) = ocsf_log {
         log.shutdown().await;
+    }
+    // Last, so shutdown events from every other subsystem still leave the box.
+    if let Some(export) = log_export {
+        export.shutdown().await;
     }
 
     result.into_diagnostic()

@@ -4,7 +4,7 @@
 //! Capture openshell-server tracing logs for streaming over gRPC.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use openshell_core::proto::{SandboxLogLine, SandboxStreamEvent};
 use openshell_ocsf::OCSF_TARGET;
@@ -22,6 +22,11 @@ pub struct TracingLogBus {
     inner: Arc<Mutex<Inner>>,
     pub(crate) platform_event_bus: PlatformEventBus,
     seq: SeqAllocator,
+    /// Off-box OTLP log export for supervisor-pushed lines. Installed once at
+    /// startup when `[openshell.gateway.otlp] export_logs` is set. Gateway
+    /// events reach export through their own layer
+    /// ([`crate::log_export::LogExport::layer`]), not through this bus.
+    export: Arc<OnceLock<crate::log_export::LogExportHandle>>,
 }
 
 #[derive(Debug, Clone)]
@@ -200,7 +205,14 @@ impl TracingLogBus {
             })),
             platform_event_bus: PlatformEventBus::new(seq.clone()),
             seq,
+            export: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// Install the off-box export sink for lines published through
+    /// [`Self::publish_external`]. The first handle installed wins.
+    pub fn set_export(&self, handle: crate::log_export::LogExportHandle) {
+        let _ = self.export.set(handle);
     }
 
     pub(crate) fn layer<S: Subscriber>(&self) -> impl Layer<S> {
@@ -291,7 +303,14 @@ impl TracingLogBus {
     /// Injects the line into the same broadcast channel and tail buffer
     /// used by the tracing layer, so it appears in `WatchSandbox` and
     /// `GetSandboxLogs` transparently.
+    ///
+    /// When log export is on, the line is also enqueued for OTLP export. The
+    /// tap runs before any bus lock is taken and never blocks, so export cannot
+    /// lengthen the cursor critical section in [`Self::publish`].
     pub fn publish_external(&self, log: SandboxLogLine) {
+        if let Some(export) = self.export.get() {
+            export.enqueue(log.clone());
+        }
         let evt = SandboxStreamEvent {
             payload: Some(openshell_core::proto::sandbox_stream_event::Payload::Log(
                 log.clone(),
@@ -462,6 +481,57 @@ mod tests {
         assert_eq!(bus.tail("sb-audit", 10).len(), 1);
         assert!(bus.tail("", 10).is_empty());
         assert!(receiver.try_recv().is_err());
+    }
+
+    /// Supervisor-pushed lines are exported (with their fields) and still
+    /// reach the tail; gateway tracing events are not exported by the bus,
+    /// since the export layer captures those itself and would double them.
+    #[tokio::test]
+    async fn pushed_lines_are_tapped_for_export_once() {
+        use tracing_subscriber::prelude::*;
+
+        let exporter = opentelemetry_sdk::logs::InMemoryLogExporter::default();
+        let (handle, worker) = crate::log_export::spawn(
+            exporter.clone(),
+            opentelemetry_sdk::Resource::builder_empty().build(),
+            true,
+        );
+        let bus = TracingLogBus::new();
+        bus.set_export(handle);
+
+        let mut pushed = make_log_event("sb-1", "pushed");
+        pushed.source = "sandbox".to_string();
+        pushed
+            .fields
+            .insert("ocsf.raw".to_string(), "{}".to_string());
+        bus.publish_external(pushed);
+        {
+            let subscriber = tracing_subscriber::registry().with(bus.layer());
+            let _guard = crate::otel_tracing::test_exporter::install_scoped(subscriber);
+            tracing::info!(sandbox_id = "sb-1", "gateway line");
+        }
+        assert_eq!(bus.tail("sb-1", 10).len(), 2);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while exporter.get_emitted_logs().unwrap().is_empty() {
+            assert!(std::time::Instant::now() < deadline, "nothing exported");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let emitted = exporter.get_emitted_logs().unwrap();
+        assert_eq!(
+            emitted.len(),
+            1,
+            "only the pushed line is exported by the bus"
+        );
+        assert!(
+            emitted[0]
+                .record
+                .attributes_iter()
+                .any(|(k, _)| k.as_str() == "ocsf.raw")
+        );
+        drop(emitted);
+        // InMemoryLogExporter clears itself on shutdown; assert before it.
+        worker.shutdown().await;
     }
 
     fn make_log_event(sandbox_id: &str, message: &str) -> SandboxLogLine {

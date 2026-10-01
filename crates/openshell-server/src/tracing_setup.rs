@@ -72,6 +72,7 @@ pub fn install(
     filter_directives: &str,
     tracing_log_bus: &TracingLogBus,
     ocsf_log: Option<&crate::ocsf_log::OcsfLog>,
+    log_export: Option<&crate::log_export::LogExport>,
     otlp_config: Option<&OtlpConfig>,
     driver: Option<openshell_otel::ComputeDriverTracing>,
     gateway: GatewayResourceAttributes<'_>,
@@ -114,6 +115,16 @@ pub fn install(
         .with(
             tracing_log_bus
                 .layer()
+                .with_filter(filter_from(filter_directives).or(filter_fn(|metadata| {
+                    metadata.target() == openshell_ocsf::OCSF_TARGET
+                }))),
+        )
+        // OTLP log export sits beside the JSONL sink and uses the bus filter:
+        // the operator's directives decide which diagnostics leave the box,
+        // while OCSF events always do.
+        .with(
+            log_export
+                .map(crate::log_export::LogExport::layer)
                 .with_filter(filter_from(filter_directives).or(filter_fn(|metadata| {
                     metadata.target() == openshell_ocsf::OCSF_TARGET
                 }))),

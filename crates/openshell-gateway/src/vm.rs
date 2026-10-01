@@ -808,8 +808,8 @@ mod tests {
         append_otlp_args(
             &mut command,
             Some(&OtlpConfig {
-                endpoint: "http://collector.internal:4317".to_string(),
                 service_name: Some("custom-gateway".to_string()),
+                ..OtlpConfig::new("http://collector.internal:4317")
             }),
             "production-us-west",
         );

@@ -273,6 +273,26 @@ tests:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.gateway\.otlp\].*?endpoint\s*=\s*"http://otel-collector\.observability\.svc:4317".*?service_name\s*=\s*"production-gateway"'
 
+  - it: keeps OTLP log export off unless requested
+    template: templates/gateway-config.yaml
+    set:
+      server.otlp.endpoint: http://otel-collector.observability.svc:4317
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'export_logs|ocsf_full_payload'
+
+  - it: renders OTLP log export configuration when enabled
+    template: templates/gateway-config.yaml
+    set:
+      server.otlp.endpoint: http://otel-collector.observability.svc:4317
+      server.otlp.exportLogs: true
+      server.otlp.ocsfFullPayload: false
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\.otlp\].*?export_logs\s*=\s*true.*?ocsf_full_payload\s*=\s*false'
+
   - it: omits OTLP tracing configuration by default
     template: templates/gateway-config.yaml
     asserts:

@@ -275,7 +275,8 @@ impl TryFrom<RawOcsfLogConfig> for OcsfLogConfig {
 }
 /// `[openshell.gateway.otlp]` section.
 ///
-/// Presence of this table enables OTLP export; there is no `enabled` flag.
+/// Presence of this table enables OTLP **trace** export; there is no `enabled`
+/// flag. Log export is opt-in on top of the same endpoint via `export_logs`.
 /// SDK tuning knobs are deliberately absent — see [`crate::otel_tracing`] for what
 /// this table owns and what the `OTEL_*` environment variables own.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -288,6 +289,44 @@ pub struct OtlpConfig {
     /// `service.name` resource attribute. Defaults to `openshell-gateway`.
     #[serde(default)]
     pub service_name: Option<String>,
+
+    /// Export aggregated sandbox and gateway logs (including OCSF events) as
+    /// OTLP log records to `endpoint`, in addition to traces.
+    ///
+    /// Off by default: enabling it turns the gateway into the single egress
+    /// point for sandbox and gateway log telemetry. Records are held in a
+    /// bounded in-memory queue and released only after the collector accepts
+    /// them; anything dropped (queue full, export failure after bounded
+    /// retries) is reported downstream as a countable `telemetry_gap` record.
+    #[serde(default)]
+    pub export_logs: bool,
+
+    /// Carry the structured OCSF payload (`ocsf.raw`, or the flattened
+    /// `ocsf.*` attributes a sandbox pushed) on exported OCSF log records.
+    ///
+    /// On by default, so a collector or SIEM receives the full OCSF document
+    /// next to the human-readable shorthand body. Turn it off to ship only the
+    /// shorthand and cut per-record size. Has no effect unless `export_logs`
+    /// is set.
+    #[serde(default = "default_ocsf_full_payload")]
+    pub ocsf_full_payload: bool,
+}
+
+const fn default_ocsf_full_payload() -> bool {
+    true
+}
+
+impl OtlpConfig {
+    /// A trace-only OTLP table for `endpoint`, as if only `endpoint` were set.
+    #[must_use]
+    pub fn new(endpoint: impl Into<String>) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+            service_name: None,
+            export_logs: false,
+            ocsf_full_payload: default_ocsf_full_payload(),
+        }
+    }
 }
 
 /// `[openshell.supervisor]` section.
@@ -988,6 +1027,25 @@ endpoint = "http://127.0.0.1:4317"
         let otlp = file.openshell.gateway.otlp.expect("otlp config");
         assert_eq!(otlp.endpoint, "http://127.0.0.1:4317");
         assert!(otlp.service_name.is_none());
+        // Log export is opt-in; once on, OCSF records carry their payload.
+        assert!(!otlp.export_logs);
+        assert!(otlp.ocsf_full_payload);
+        assert_eq!(otlp, OtlpConfig::new("http://127.0.0.1:4317"));
+    }
+
+    #[test]
+    fn parses_gateway_otlp_log_export_flags() {
+        let toml = r#"
+[openshell.gateway.otlp]
+endpoint = "http://otel-collector.observability.svc:4317"
+export_logs = true
+ocsf_full_payload = false
+"#;
+        let tmp = write_tmp(toml);
+        let file = load(tmp.path()).expect("valid otlp config parses");
+        let otlp = file.openshell.gateway.otlp.expect("otlp config");
+        assert!(otlp.export_logs);
+        assert!(!otlp.ocsf_full_payload);
     }
 
     #[test]

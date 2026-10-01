@@ -19,6 +19,8 @@ This output is separate from the sandbox-local file described below. Enabling on
 
 Gateway records use the configured gateway name for both `device.uid` and `device.name`. Replicas of one installation share that identity; `device.hostname` identifies the emitting replica. Assign distinct gateway names to installations whose events are collected together. Reusing a name, including the default name, groups those installations under the same identity. Renaming a gateway changes its audit identity.
 
+To send the same events to an OpenTelemetry collector instead of a file, enable [OTLP log export](/how-it-works/gateways/configuration#otlp-log-export). It runs alongside the JSONL file, carries each gateway event's document as `ocsf.raw`, and also exports the OCSF events sandboxes push to the gateway.
+
 Without JSONL enabled, gateway OCSF events still appear as shorthand in console output, subject to the diagnostic log filter. Events associated with a sandbox also appear in its gateway log stream; gateway-wide events have no sandbox association.
 
 ## Enable Sandbox JSON Export

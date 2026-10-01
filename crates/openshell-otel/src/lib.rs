@@ -1,10 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Shared OpenTelemetry trace export support for `OpenShell` services.
+//! Shared OpenTelemetry trace and log export support for `OpenShell` services.
 
 mod driver;
 mod grpc;
+mod logs;
 mod propagation;
 
 pub use driver::{
@@ -17,16 +18,20 @@ pub use grpc::{
     RecordGrpcStatus, TracedGrpcStream, compute_driver_rpc_layer, compute_driver_rpc_operation,
     grpc_status_code_name, record_grpc_status, rpc,
 };
+pub use logs::{OtlpLogConfig, build_log_exporter, log_exporter_for, logger};
+pub use opentelemetry_otlp::LogExporter as OtlpLogExporter;
+pub use opentelemetry_sdk::logs::SdkLoggerProvider;
 pub use propagation::{
     HeaderMapExtractor, MetadataMapInjector, TraceContextInterceptor, current_trace_context_carrier,
 };
 
 use opentelemetry::KeyValue;
 use opentelemetry::trace::TracerProvider as _;
-use opentelemetry_otlp::{SpanExporter, WithExportConfig};
-use opentelemetry_sdk::Resource;
+use opentelemetry_otlp::{SpanExporter, WithExportConfig, WithTonicConfig as _};
+pub use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::trace::SdkTracer;
 pub use opentelemetry_sdk::trace::SdkTracerProvider;
+use tonic::transport::ClientTlsConfig;
 use tracing::Subscriber;
 use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::Layer as _;
@@ -137,8 +142,38 @@ pub enum SetupError {
         source: http::uri::InvalidUri,
     },
 
-    #[error("failed to build the OTLP span exporter: {0}")]
+    #[error("failed to build the OTLP exporter: {0}")]
     Exporter(#[from] opentelemetry_otlp::ExporterBuildError),
+}
+
+/// Trim and validate an OTLP endpoint, returning it alongside its parsed URI.
+pub(crate) fn validated_endpoint(endpoint: &str) -> Result<(&str, http::Uri), SetupError> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Err(SetupError::EmptyEndpoint);
+    }
+    let uri = endpoint
+        .parse::<http::Uri>()
+        .map_err(|source| SetupError::InvalidEndpoint {
+            endpoint: endpoint.to_string(),
+            source,
+        })?;
+    Ok((endpoint, uri))
+}
+
+/// TLS settings for `uri`, or `None` when the endpoint is plaintext.
+///
+/// `opentelemetry-otlp` falls back to `ClientTlsConfig::new()` for an `https://`
+/// endpoint, and that config starts with an empty root store, so every server
+/// certificate is rejected. Supplying the config explicitly with the compiled-in
+/// public roots lets the gateway (and the compute-driver providers built through
+/// [`build_provider`]) reach a hosted OTLP collector. The roots travel with the
+/// binary rather than coming from the host trust store, so a gateway on a
+/// minimal image trusts the same anchors as one on a full distribution.
+/// Collectors fronted by a private CA are not reachable over `https://` yet.
+pub(crate) fn tls_config_for(uri: &http::Uri) -> Option<ClientTlsConfig> {
+    (uri.scheme() == Some(&http::uri::Scheme::HTTPS))
+        .then(|| ClientTlsConfig::new().with_webpki_roots())
 }
 
 fn resource_attributes(config: &OtlpTraceConfig<'_>) -> Vec<KeyValue> {
@@ -183,21 +218,13 @@ pub fn resource_for(config: &OtlpTraceConfig<'_>) -> Resource {
 
 /// Build an OTLP/gRPC trace provider.
 pub fn build_provider(config: &OtlpTraceConfig<'_>) -> Result<SdkTracerProvider, SetupError> {
-    let endpoint = config.endpoint.trim();
-    if endpoint.is_empty() {
-        return Err(SetupError::EmptyEndpoint);
-    }
-    endpoint
-        .parse::<http::Uri>()
-        .map_err(|source| SetupError::InvalidEndpoint {
-            endpoint: endpoint.to_string(),
-            source,
-        })?;
+    let (endpoint, uri) = validated_endpoint(config.endpoint)?;
 
-    let exporter = SpanExporter::builder()
-        .with_tonic()
-        .with_endpoint(endpoint)
-        .build()?;
+    let mut builder = SpanExporter::builder().with_tonic().with_endpoint(endpoint);
+    if let Some(tls_config) = tls_config_for(&uri) {
+        builder = builder.with_tls_config(tls_config);
+    }
+    let exporter = builder.build()?;
 
     Ok(SdkTracerProvider::builder()
         .with_batch_exporter(exporter)
@@ -505,5 +532,27 @@ mod tests {
 
         assert!(provider.is_none());
         assert!(matches!(error, Some(SetupError::InvalidEndpoint { .. })));
+    }
+
+    #[tokio::test]
+    async fn https_endpoint_builds_a_provider_with_public_roots() {
+        // Without an explicit TLS config the exporter build fails outright for
+        // an https:// endpoint, so a hosted collector would never be reached.
+        let (provider, error) = provider_for(Some(OtlpTraceConfig {
+            endpoint: "https://collector.example.com:4317",
+            service_name: ServiceName::Fixed("openshell-gateway"),
+            service_version: None,
+            resource_attributes: Vec::new(),
+        }));
+
+        assert!(error.is_none(), "unexpected setup error: {error:?}");
+        let provider = provider.expect("https provider builds");
+        let _ = provider.shutdown();
+    }
+
+    #[test]
+    fn tls_is_configured_only_for_https_endpoints() {
+        assert!(tls_config_for(&"https://collector.example.com:4317".parse().unwrap()).is_some());
+        assert!(tls_config_for(&"http://127.0.0.1:4317".parse().unwrap()).is_none());
     }
 }
