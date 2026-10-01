@@ -6091,6 +6091,9 @@ fn print_log_line(log: &openshell_core::proto::SandboxLogLine) {
     println!("{}", format_log_line(log));
 }
 
+/// Prefix of the structured OCSF fields a sandbox pushes with each OCSF line.
+const OCSF_FIELD_PREFIX: &str = "ocsf.";
+
 fn format_log_line(log: &openshell_core::proto::SandboxLogLine) -> String {
     let source = if log.source.is_empty() {
         "gateway"
@@ -6100,14 +6103,21 @@ fn format_log_line(log: &openshell_core::proto::SandboxLogLine) -> String {
     let timestamp_ms = proto_timestamp_ms(log.event_time.as_ref());
     let secs = timestamp_ms / 1000;
     let millis = timestamp_ms % 1000;
-    if log.fields.is_empty() {
+    // `ocsf.*` fields carry the structured OCSF document (a full `ocsf.raw`
+    // JSON by default) for export; the message is already its shorthand, so
+    // the one-line view leaves them out.
+    let mut entries: Vec<_> = log
+        .fields
+        .iter()
+        .filter(|(k, _)| !k.starts_with(OCSF_FIELD_PREFIX))
+        .collect();
+    if entries.is_empty() {
         format!(
             "[{secs}.{millis:03}] [{source:<7}] [{:<5}] [{}] {}",
             log.level, log.target, log.message
         )
     } else {
         let mut fields_str = String::new();
-        let mut entries: Vec<_> = log.fields.iter().collect();
         entries.sort_by_key(|(k, _)| k.as_str());
         for (k, v) in entries {
             if !fields_str.is_empty() {
@@ -8124,6 +8134,36 @@ mod tests {
                 .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
                 .collect(),
         }
+    }
+
+    #[test]
+    fn format_log_line_hides_structured_ocsf_fields() {
+        let log = log_line(
+            "OCSF",
+            "ocsf",
+            "NET:OPEN [MED] DENIED example.com:443",
+            "sandbox",
+            &[
+                ("ocsf.raw", "{\"class_uid\":4001}"),
+                ("ocsf.severity_id", "3"),
+            ],
+        );
+        assert_eq!(
+            format_log_line(&log),
+            "[1234.567] [sandbox] [OCSF ] [ocsf] NET:OPEN [MED] DENIED example.com:443"
+        );
+
+        let gap = log_line(
+            "WARN",
+            "telemetry_gap",
+            "gap",
+            "sandbox",
+            &[("dropped", "4"), ("ocsf.x", "y")],
+        );
+        assert_eq!(
+            format_log_line(&gap),
+            "[1234.567] [sandbox] [WARN ] [telemetry_gap] gap dropped=4"
+        );
     }
 
     #[test]

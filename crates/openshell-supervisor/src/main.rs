@@ -330,23 +330,29 @@ fn main() -> Result<()> {
 
     let exit_code = runtime.block_on(async move {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let ocsf_enabled = Arc::new(AtomicBool::new(false));
+        let ocsf_schema_version = Arc::new(std::sync::Mutex::new(String::new()));
         let log_push_state = if args.role == SupervisorRole::IsolationBackend
             && let (Some(sandbox_id), Some(endpoint)) = (&args.sandbox_id, &args.openshell_endpoint)
         {
-            let (tx, handle) = openshell_supervisor_process::log_push::spawn_log_push_task(
+            let (tx, dropped, handle) = openshell_supervisor_process::log_push::spawn_log_push_task(
                 endpoint.clone(),
                 sandbox_id.clone(),
             );
-            let layer =
-                openshell_supervisor_process::log_push::LogPushLayer::new(sandbox_id.clone(), tx);
+            // Pushed `ocsf.raw` follows the same schema-version setting as the
+            // local JSONL file, so both carry the same document.
+            let layer = openshell_supervisor_process::log_push::LogPushLayer::new(
+                sandbox_id.clone(),
+                tx,
+                dropped,
+            )
+            .with_target_version(ocsf_schema_version.clone());
             Some((layer, handle))
         } else {
             None
         };
         let push_layer = log_push_state.as_ref().map(|(layer, _)| layer.clone());
         let _log_push_handle = log_push_state.map(|(_, handle)| handle);
-        let ocsf_enabled = Arc::new(AtomicBool::new(false));
-        let ocsf_schema_version = Arc::new(std::sync::Mutex::new(String::new()));
 
         let (_file_guard, _jsonl_guard) = if let Some((file_writer, file_guard)) = file_logging {
             let jsonl_logging = tracing_appender::rolling::RollingFileAppender::builder()
