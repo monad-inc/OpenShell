@@ -12,7 +12,7 @@ use tracing::Subscriber;
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
 
-use crate::format::downgrade::downgrade_event;
+use crate::format::jsonl::event_json_string;
 use crate::tracing_layers::event_bridge::{OCSF_TARGET, clone_current_event};
 
 /// A tracing `Layer` that intercepts OCSF events and writes JSONL output.
@@ -87,27 +87,19 @@ where
         if let Some(ocsf_event) = clone_current_event()
             && let Ok(mut w) = self.writer.lock()
         {
-            let line = if let Some(ref target) = self.target_version
-                && let Ok(version) = target.lock()
-                && !version.is_empty()
-            {
-                let Ok(mut json) = serde_json::to_value(&ocsf_event) else {
-                    return;
-                };
-                downgrade_event(&mut json, &version);
-                match serde_json::to_string(&json) {
-                    Ok(mut s) => {
-                        s.push('\n');
-                        s
-                    }
-                    Err(_) => return,
-                }
-            } else {
-                match ocsf_event.to_json_line() {
-                    Ok(l) => l,
-                    Err(_) => return,
-                }
+            // Same renderer as every other structured sink (OTLP export
+            // included), so they agree on the document for a given version.
+            let target = self
+                .target_version
+                .as_ref()
+                .and_then(|target| target.lock().ok());
+            let Ok(mut line) =
+                event_json_string(&ocsf_event, target.as_ref().map(|version| version.as_str()))
+            else {
+                return;
             };
+            drop(target);
+            line.push('\n');
             let _ = w.write_all(line.as_bytes());
         }
     }

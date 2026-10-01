@@ -10,12 +10,14 @@
 use std::net::{IpAddr, Ipv4Addr};
 
 use openshell_ocsf::{
-    ActionId, ActivityId, AiModel, ApiActivityBuilder, AppLifecycleBuilder, Attack, AuthTypeId,
-    BaseEventBuilder, ConfidenceId, ConfigStateChangeBuilder, ConnectionInfo,
-    DetectionFindingBuilder, DispositionId, Endpoint, EventContext, EventOrigin, FindingInfo,
-    HttpActivityBuilder, HttpMethod, HttpRequest, HttpResponse, LaunchTypeId,
-    NetworkActivityBuilder, OcsfEvent, Process, ProcessActivityBuilder, RiskLevelId,
-    SecurityLevelId, SeverityId, SshActivityBuilder, StateId, StatusId, Url,
+    ActionId, ActivityId, AiModel, ApiActivityBuilder, AppLifecycleBuilder, Attack, AuthActivityId,
+    AuthProtocolId, AuthTypeId, AuthenticationBuilder, BaseEventBuilder, ConfidenceId,
+    ConfigStateChangeBuilder, ConnectionInfo, DetectionFindingBuilder, DispositionId, Endpoint,
+    EntityActivityId, EntityManagementBuilder, EventContext, EventOrigin, FindingInfo,
+    HttpActivityBuilder, HttpMethod, HttpRequest, HttpResponse, LaunchTypeId, ManagedEntity,
+    ManagedEntityTypeId, NetworkActivityBuilder, OcsfEvent, Process, ProcessActivityBuilder,
+    RiskLevelId, SecurityLevelId, Service, SeverityId, SshActivityBuilder, StateId, StatusId, Url,
+    User, UserTypeId,
 };
 
 fn ctx() -> EventContext {
@@ -218,4 +220,62 @@ fn base_event_round_trips() {
         .build();
 
     assert_round_trips("base_event", &event);
+}
+
+#[test]
+fn device_config_state_change_with_actor_round_trips() {
+    let event = ConfigStateChangeBuilder::new(&ctx())
+        .state(StateId::Other, "approved")
+        .severity(SeverityId::Informational)
+        .status(StatusId::Success)
+        .actor_user(User::new("alice", "oidc|alice-123", UserTypeId::User))
+        .message("policy chunk approved")
+        .unmapped("request_id", "req-1")
+        .build();
+
+    assert_round_trips("device_config_state_change_with_actor", &event);
+}
+
+#[test]
+fn authentication_round_trips() {
+    let event = AuthenticationBuilder::new(&ctx(), User::named("unknown"))
+        .activity(AuthActivityId::Logon)
+        .auth_protocol(AuthProtocolId::OpenId)
+        .src_endpoint(Endpoint::from_ip(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9)),
+            51044,
+        ))
+        .dst_endpoint(Endpoint::from_ip(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080))
+        .service(
+            Service::new("openshell-gateway")
+                .with_uid("production")
+                .with_version("0.42.1"),
+        )
+        .severity(SeverityId::Medium)
+        .status(StatusId::Failure)
+        .status_detail("token expired")
+        .message("OIDC token rejected")
+        .unmapped("request_id", "req-2")
+        .build();
+
+    assert_round_trips("authentication", &event);
+}
+
+#[test]
+fn entity_management_round_trips() {
+    let event = EntityManagementBuilder::new(
+        &ctx(),
+        EntityActivityId::Update,
+        ManagedEntity::new("workspace_member", "oidc|bob")
+            .with_type_id(ManagedEntityTypeId::User)
+            .with_name("bob"),
+    )
+    .actor_user(User::new("alice", "oidc|alice-123", UserTypeId::Admin))
+    .severity(SeverityId::Informational)
+    .status(StatusId::Success)
+    .message("member role updated")
+    .unmapped("role", "admin")
+    .build();
+
+    assert_round_trips("entity_management", &event);
 }

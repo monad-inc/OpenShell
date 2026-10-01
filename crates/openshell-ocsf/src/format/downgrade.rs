@@ -5,6 +5,12 @@
 //!
 //! Transforms serialized OCSF JSON events to conform to older schema versions
 //! by stripping fields and profiles that don't exist in the target version.
+//!
+//! Two tiers apply:
+//! - at or below 1.3: top-level fields and profiles added after 1.3;
+//! - at or below 1.1: nested, class-aware rewrites for fields and enum values
+//!   1.1 lacks (Entity Management's `entity.type_id` and its post-1.1
+//!   activity ids).
 
 use serde_json::Value;
 
@@ -13,6 +19,26 @@ const STRIP_FOR_V1_3: &[&str] = &["ai_model", "container", "observation_point_id
 
 /// Profile names to remove from `metadata.profiles` when downgrading to v1.3.0 or earlier.
 const STRIP_PROFILES_V1_3: &[&str] = &["ai_operation", "container"];
+
+/// Entity Management [3004] class uid.
+const ENTITY_MANAGEMENT_CLASS_UID: u64 = 3004;
+
+/// Highest Entity Management `activity_id` OCSF 1.1.0 defines (besides 99).
+const ENTITY_MANAGEMENT_MAX_V1_1_ACTIVITY: u64 = 4;
+
+/// Managed-entity objects on an Entity Management event. `type_id` on them is
+/// absent from OCSF 1.1.0.
+const ENTITY_MANAGEMENT_ENTITY_FIELDS: &[&str] = &["entity", "entity_result"];
+
+/// Whether downgrading to `target_version` changes anything, i.e. whether the
+/// target is older than [`crate::OCSF_VERSION`].
+///
+/// Lets callers skip building a `serde_json::Value` tree when no downgrade
+/// applies.
+#[must_use]
+pub fn is_downgrade_target(target_version: &str) -> bool {
+    parse_version(target_version) < parse_version(crate::OCSF_VERSION)
+}
 
 /// Downgrade a serialized OCSF event to the target schema version.
 ///
@@ -25,6 +51,7 @@ const STRIP_PROFILES_V1_3: &[&str] = &["ai_operation", "container"];
 pub fn downgrade_event(event: &mut Value, target_version: &str) -> bool {
     let target = parse_version(target_version);
     let v1_3 = (1, 3, 0);
+    let v1_1 = (1, 1, 0);
 
     if target >= parse_version(crate::OCSF_VERSION) {
         return false;
@@ -57,6 +84,10 @@ pub fn downgrade_event(event: &mut Value, target_version: &str) -> bool {
         }
     }
 
+    if target <= v1_1 && downgrade_class_fields_v1_1(obj) {
+        modified = true;
+    }
+
     if let Some(metadata) = obj.get_mut("metadata").and_then(Value::as_object_mut) {
         let original_version = metadata
             .get("version")
@@ -78,6 +109,41 @@ pub fn downgrade_event(event: &mut Value, target_version: &str) -> bool {
                 Value::String(original_version),
             );
         }
+    }
+
+    modified
+}
+
+/// Rewrite class-specific nested fields that OCSF 1.1.0 does not define.
+fn downgrade_class_fields_v1_1(obj: &mut serde_json::Map<String, Value>) -> bool {
+    let class_uid = obj.get("class_uid").and_then(Value::as_u64);
+    if class_uid != Some(ENTITY_MANAGEMENT_CLASS_UID) {
+        return false;
+    }
+
+    let mut modified = false;
+    for field in ENTITY_MANAGEMENT_ENTITY_FIELDS {
+        if let Some(entity) = obj.get_mut(*field).and_then(Value::as_object_mut)
+            && entity.remove("type_id").is_some()
+        {
+            modified = true;
+        }
+    }
+
+    // 1.3 added Move, Enroll, … (5-13). 1.1 knows only 0-4 and 99, so map the
+    // newer ones to Other, keeping `type_uid` and the label consistent.
+    let activity_id = obj.get("activity_id").and_then(Value::as_u64);
+    if let Some(id) = activity_id
+        && id > ENTITY_MANAGEMENT_MAX_V1_1_ACTIVITY
+        && id != 99
+    {
+        obj.insert("activity_id".to_string(), Value::from(99));
+        obj.insert("activity_name".to_string(), Value::from("Other"));
+        obj.insert(
+            "type_uid".to_string(),
+            Value::from(ENTITY_MANAGEMENT_CLASS_UID * 100 + 99),
+        );
+        modified = true;
     }
 
     modified
@@ -244,5 +310,71 @@ mod tests {
                 .and_then(|u| u.get("downgraded_from"))
                 .is_none()
         );
+    }
+
+    fn entity_management_event(activity_id: u64) -> Value {
+        serde_json::json!({
+            "class_uid": 3004,
+            "activity_id": activity_id,
+            "activity_name": "Enable",
+            "type_uid": 300_400 + activity_id,
+            "metadata": {
+                "version": crate::OCSF_VERSION,
+                "profiles": ["security_control", "container", "host"]
+            },
+            "entity": {"type_id": 99, "type": "workspace", "uid": "ws-1"},
+            "actor": {"user": {"name": "alice", "type_id": 1, "type": "User"}}
+        })
+    }
+
+    #[test]
+    fn test_downgrade_to_v1_1_strips_managed_entity_type_id() {
+        let mut event = entity_management_event(1);
+        assert!(downgrade_event(&mut event, "1.1.0"));
+
+        assert!(event["entity"].get("type_id").is_none());
+        assert_eq!(event["entity"]["type"], "workspace");
+        assert_eq!(event["activity_id"], 1);
+        assert_eq!(event["actor"]["user"]["type_id"], 1);
+    }
+
+    #[test]
+    fn test_downgrade_to_v1_3_keeps_managed_entity_type_id() {
+        let mut event = entity_management_event(1);
+        downgrade_event(&mut event, "1.3.0");
+
+        assert_eq!(event["entity"]["type_id"], 99);
+    }
+
+    #[test]
+    fn test_downgrade_to_v1_1_remaps_post_v1_1_entity_activities() {
+        let mut event = entity_management_event(9);
+        downgrade_event(&mut event, "1.1.0");
+
+        assert_eq!(event["activity_id"], 99);
+        assert_eq!(event["activity_name"], "Other");
+        assert_eq!(event["type_uid"], 300_499);
+    }
+
+    #[test]
+    fn test_v1_1_tier_ignores_other_classes() {
+        let mut event = serde_json::json!({
+            "class_uid": 5019,
+            "activity_id": 7,
+            "metadata": {"version": crate::OCSF_VERSION, "profiles": []},
+            "entity": {"type_id": 99}
+        });
+        downgrade_event(&mut event, "1.1.0");
+
+        assert_eq!(event["activity_id"], 7);
+        assert_eq!(event["entity"]["type_id"], 99);
+    }
+
+    #[test]
+    fn test_is_downgrade_target() {
+        assert!(is_downgrade_target("1.1"));
+        assert!(is_downgrade_target("1.3.0"));
+        assert!(!is_downgrade_target(crate::OCSF_VERSION));
+        assert!(!is_downgrade_target("1.9.0"));
     }
 }

@@ -10,11 +10,14 @@ mod connection;
 mod container;
 mod device;
 mod endpoint;
+mod entity;
 mod finding;
 mod firewall_rule;
 mod http;
 mod metadata;
 mod process;
+mod service;
+mod user;
 
 pub use ai_model::AiModel;
 pub use api::Api;
@@ -23,8 +26,14 @@ pub use connection::ConnectionInfo;
 pub use container::{Container, Image};
 pub use device::{Device, OsInfo};
 pub use endpoint::Endpoint;
+pub use entity::ManagedEntity;
 pub use finding::{Evidence, FindingInfo, Remediation};
 pub use firewall_rule::FirewallRule;
 pub use http::{HttpRequest, HttpResponse, Url};
 pub use metadata::{Metadata, Product};
 pub use process::{Actor, Process};
+pub use service::Service;
+pub use user::User;
+
+/// Re-exported beside [`User`] for callers that build users from `objects`.
+pub use crate::enums::UserTypeId;

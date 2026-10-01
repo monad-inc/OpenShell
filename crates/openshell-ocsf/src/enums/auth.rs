@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! OCSF `auth_type_id` enum for SSH Activity.
+//! OCSF authentication enums: `auth_type_id` (SSH Activity) and the
+//! Authentication [3002] `activity_id` and `auth_protocol_id`.
 
 use serde_repr::{Deserialize_repr, Serialize_repr};
 
@@ -48,6 +49,70 @@ impl AuthTypeId {
     }
 }
 
+/// OCSF Authentication [3002] activity ids.
+///
+/// A subset of the schema's set, valid in every supported schema version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize_repr, Deserialize_repr)]
+#[repr(u8)]
+pub enum AuthActivityId {
+    /// 0 — Unknown
+    Unknown = 0,
+    /// 1 — Logon
+    Logon = 1,
+    /// 2 — Logoff
+    Logoff = 2,
+    /// 99 — Other
+    Other = 99,
+}
+
+impl AuthActivityId {
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unknown => "Unknown",
+            Self::Logon => "Logon",
+            Self::Logoff => "Logoff",
+            Self::Other => "Other",
+        }
+    }
+
+    #[must_use]
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+}
+
+/// OCSF Auth Protocol ID for Authentication [3002] events.
+///
+/// Only the values the gateway can produce are represented; the rest of the
+/// OCSF vocabulary is unused here. All exist in OCSF 1.1.0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize_repr, Deserialize_repr)]
+#[repr(u8)]
+pub enum AuthProtocolId {
+    /// 0 — Unknown
+    Unknown = 0,
+    /// 4 — `OpenID` (OIDC bearer tokens)
+    OpenId = 4,
+    /// 99 — Other (mTLS client certificates, gateway-minted sandbox JWTs)
+    Other = 99,
+}
+
+impl AuthProtocolId {
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unknown => "Unknown",
+            Self::OpenId => "OpenID",
+            Self::Other => "Other",
+        }
+    }
+
+    #[must_use]
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -66,6 +131,15 @@ mod tests {
         assert_eq!(AuthTypeId::CertificateBased.as_u8(), 1);
         assert_eq!(AuthTypeId::PublicKey.as_u8(), 6);
         assert_eq!(AuthTypeId::Other.as_u8(), 99);
+    }
+
+    #[test]
+    fn test_authentication_activity_and_protocol_values() {
+        assert_eq!(AuthActivityId::Logon.as_u8(), 1);
+        assert_eq!(AuthActivityId::Logoff.label(), "Logoff");
+        assert_eq!(AuthProtocolId::OpenId.as_u8(), 4);
+        assert_eq!(AuthProtocolId::OpenId.label(), "OpenID");
+        assert_eq!(AuthProtocolId::Other.as_u8(), 99);
     }
 
     #[test]

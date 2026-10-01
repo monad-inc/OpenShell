@@ -4,6 +4,44 @@
 //! JSONL formatter — full OCSF JSON output.
 
 use crate::events::OcsfEvent;
+use crate::format::downgrade::{downgrade_event, is_downgrade_target};
+
+/// The downgrade target to apply, if any: `None`, an empty string, or a
+/// version at or above [`crate::OCSF_VERSION`] mean "current schema".
+fn effective_target(target_version: Option<&str>) -> Option<&str> {
+    target_version.filter(|version| !version.is_empty() && is_downgrade_target(version))
+}
+
+/// Serialize an event to JSON at the requested schema version.
+///
+/// The single place every structured sink — the JSONL layers, the gateway
+/// JSONL file and OTLP export (`ocsf.raw`, flattened `ocsf.*`) — renders an
+/// event, so they can never disagree about the document for one event.
+/// `target_version` is an OCSF version such as `"1.1"`; `None` or an empty
+/// string keeps the current schema.
+pub fn event_json(
+    event: &OcsfEvent,
+    target_version: Option<&str>,
+) -> Result<serde_json::Value, serde_json::Error> {
+    let mut json = event.to_json()?;
+    if let Some(target) = effective_target(target_version) {
+        downgrade_event(&mut json, target);
+    }
+    Ok(json)
+}
+
+/// Serialize an event to a compact JSON string at the requested schema
+/// version. Same document as [`event_json`]; skips the intermediate
+/// `serde_json::Value` tree when no downgrade applies.
+pub fn event_json_string(
+    event: &OcsfEvent,
+    target_version: Option<&str>,
+) -> Result<String, serde_json::Error> {
+    if effective_target(target_version).is_none() {
+        return serde_json::to_string(event);
+    }
+    serde_json::to_string(&event_json(event, target_version)?)
+}
 
 impl OcsfEvent {
     /// Serialize to a `serde_json::Value`.
@@ -90,5 +128,26 @@ mod tests {
         assert!(json.get("container").is_none());
         assert!(json.get("unmapped").is_none());
         assert!(json.get("status_detail").is_none());
+    }
+
+    #[test]
+    fn event_json_string_matches_event_json_at_every_target() {
+        let event = test_event();
+        for target in [
+            None,
+            Some(""),
+            Some("1.1"),
+            Some("1.3"),
+            Some(crate::OCSF_VERSION),
+        ] {
+            let tree = super::event_json(&event, target).unwrap();
+            let text = super::event_json_string(&event, target).unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(parsed, tree, "target {target:?}");
+        }
+        let downgraded = super::event_json(&event, Some("1.1")).unwrap();
+        assert_eq!(downgraded["metadata"]["version"], "1.1");
+        let current = super::event_json(&event, Some("")).unwrap();
+        assert_eq!(current, event.to_json().unwrap());
     }
 }

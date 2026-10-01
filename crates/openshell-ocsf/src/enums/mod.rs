@@ -8,22 +8,28 @@ mod activity;
 mod auth;
 mod device_type;
 mod disposition;
+mod entity_activity;
 mod http_method;
 mod launch;
+mod managed_entity_type;
 mod security;
 mod severity;
 mod status;
+mod user_type;
 
 pub use action::ActionId;
 pub use activity::ActivityId;
-pub use auth::AuthTypeId;
+pub use auth::{AuthActivityId, AuthProtocolId, AuthTypeId};
 pub use device_type::DeviceTypeId;
 pub use disposition::DispositionId;
+pub use entity_activity::EntityActivityId;
 pub use http_method::HttpMethod;
 pub use launch::LaunchTypeId;
+pub use managed_entity_type::ManagedEntityTypeId;
 pub use security::{ConfidenceId, RiskLevelId, SecurityLevelId};
 pub use severity::SeverityId;
 pub use status::{StateId, StatusId};
+pub use user_type::UserTypeId;
 
 /// Trait for OCSF enum types that have an integer ID and a string label.
 ///
@@ -51,13 +57,18 @@ macro_rules! impl_ocsf_enum {
 
 impl_ocsf_enum!(
     ActionId,
+    AuthActivityId,
+    AuthProtocolId,
     AuthTypeId,
     ConfidenceId,
     DispositionId,
+    EntityActivityId,
     LaunchTypeId,
+    ManagedEntityTypeId,
     RiskLevelId,
     SecurityLevelId,
     SeverityId,
     StateId,
     StatusId,
+    UserTypeId,
 );

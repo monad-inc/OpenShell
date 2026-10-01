@@ -74,10 +74,40 @@ impl Process {
 }
 
 /// OCSF Actor object — the entity that initiated the event.
+///
+/// Sandbox events carry the acting `process`; gateway audit events carry the
+/// authenticated `user`. The schema requires at least one of them (among
+/// others), so build actors through [`Actor::from_process`] or
+/// [`Actor::from_user`], which always set one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Actor {
     /// The process that performed the action.
-    pub process: Process,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process: Option<Process>,
+
+    /// The authenticated identity that performed the action.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<crate::objects::User>,
+}
+
+impl Actor {
+    /// An actor acting through a process (sandbox events).
+    #[must_use]
+    pub fn from_process(process: Process) -> Self {
+        Self {
+            process: Some(process),
+            user: None,
+        }
+    }
+
+    /// An actor acting as an authenticated identity (gateway audit events).
+    #[must_use]
+    pub fn from_user(user: crate::objects::User) -> Self {
+        Self {
+            process: None,
+            user: Some(user),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -131,10 +161,25 @@ mod tests {
 
     #[test]
     fn test_actor_serialization() {
-        let actor = Actor {
-            process: Process::new("python3", 42),
-        };
+        let actor = Actor::from_process(Process::new("python3", 42));
         let json = serde_json::to_value(&actor).unwrap();
         assert_eq!(json["process"]["name"], "python3");
+        assert!(
+            json.get("user").is_none(),
+            "process actors serialize without a user"
+        );
+    }
+
+    #[test]
+    fn test_user_actor_serialization() {
+        let actor = Actor::from_user(crate::objects::User::named("alice"));
+        let json = serde_json::to_value(&actor).unwrap();
+        assert_eq!(json["user"]["name"], "alice");
+        assert!(
+            json.get("process").is_none(),
+            "user actors serialize without a process"
+        );
+        let back: Actor = serde_json::from_value(json).unwrap();
+        assert_eq!(back, actor);
     }
 }

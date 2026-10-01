@@ -28,6 +28,22 @@ pub fn clone_current_event() -> Option<OcsfEvent> {
     CURRENT_EVENT.with(|cell| cell.borrow().clone())
 }
 
+/// Clears the thread-local on scope exit — including when a layer panics.
+///
+/// Without this, a mid-dispatch panic (caught at a task boundary) would leave
+/// a stale event that a later, unrelated `ocsf`-target line on the same thread
+/// would silently substitute for its own content. `try_with` keeps the drop
+/// safe during thread-local teardown.
+struct ClearCurrentEvent;
+
+impl Drop for ClearCurrentEvent {
+    fn drop(&mut self) {
+        let _ = CURRENT_EVENT.try_with(|cell| {
+            cell.borrow_mut().take();
+        });
+    }
+}
+
 /// Emit an `OcsfEvent` through the tracing subscriber.
 ///
 /// The OCSF layers (`OcsfShorthandLayer`, `OcsfJsonlLayer`) format it
@@ -37,13 +53,12 @@ pub fn clone_current_event() -> Option<OcsfEvent> {
 pub fn emit_ocsf_event(event: OcsfEvent) {
     // Store the event in thread-local so layers can access it
     set_current_event(event);
+    // Clear the thread-local after dispatch completes, even if a layer panics.
+    let _clear = ClearCurrentEvent;
 
     // Emit a tracing event with the `ocsf` target.
     // The layers detect this target and clone the OcsfEvent from thread-local.
     tracing::info!(target: "ocsf", "ocsf_event");
-
-    // Clear the thread-local after dispatch completes.
-    clear_current_event();
 }
 
 /// Store an `OcsfEvent` in the thread-local bridge so OCSF layers
@@ -84,8 +99,8 @@ pub fn clear_current_event() {
 pub fn emit_ocsf_event_routed(sandbox_id: &str, event: OcsfEvent) {
     let message = event.format_shorthand();
     set_current_event(event);
+    let _clear = ClearCurrentEvent;
     tracing::info!(target: "ocsf", sandbox_id = %sandbox_id, message = %message);
-    clear_current_event();
 }
 
 /// Convenience macro for emitting an `OcsfEvent`.
@@ -166,6 +181,38 @@ mod tests {
 
         // Should be empty now
         assert!(clone_current_event().is_none());
+    }
+
+    /// A layer that panics on every OCSF event, standing in for a buggy sink.
+    struct PanickingLayer;
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for PanickingLayer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            assert!(event.metadata().target() != OCSF_TARGET, "sink failed");
+        }
+    }
+
+    #[test]
+    fn a_panicking_layer_does_not_leave_a_stale_event() {
+        use tracing_subscriber::prelude::*;
+
+        let bare: fn() = || emit_ocsf_event(test_event());
+        let routed: fn() = || emit_ocsf_event_routed("sb-1", test_event());
+        for emit in [bare, routed] {
+            let subscriber = tracing_subscriber::registry().with(PanickingLayer);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                tracing::subscriber::with_default(subscriber, emit);
+            }));
+            assert!(result.is_err(), "the layer panicked");
+            assert!(
+                clone_current_event().is_none(),
+                "the panicking emit left its event behind"
+            );
+        }
     }
 
     /// A `Write` sink that appends into a shared buffer we can inspect.

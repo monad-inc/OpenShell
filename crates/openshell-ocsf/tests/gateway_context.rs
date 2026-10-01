@@ -6,8 +6,9 @@
 use std::net::{IpAddr, Ipv4Addr};
 
 use openshell_ocsf::{
-    ActivityId, AppLifecycleBuilder, ConfigStateChangeBuilder, EventContext, EventOrigin, OsInfo,
-    SeverityId, StateId, StatusId,
+    ActivityId, AppLifecycleBuilder, AuthenticationBuilder, ConfigStateChangeBuilder,
+    EntityActivityId, EntityManagementBuilder, EventContext, EventOrigin, ManagedEntity, OcsfEvent,
+    OsInfo, Service, SeverityId, StateId, StatusId, User, UserTypeId,
 };
 
 fn gateway_ctx() -> EventContext {
@@ -145,4 +146,54 @@ fn supervisor_events_still_carry_their_sandbox_container() {
     assert_eq!(json["container"]["name"], "agent-01");
     assert_eq!(json["container"]["uid"], "sb-1");
     assert!(json["device"].get("name").is_none());
+}
+
+fn gateway_audit_events(context: &EventContext) -> Vec<OcsfEvent> {
+    vec![
+        AuthenticationBuilder::new(context, User::named("unknown"))
+            .service(Service::new("openshell-gateway"))
+            .status(StatusId::Failure)
+            .build(),
+        EntityManagementBuilder::new(
+            context,
+            EntityActivityId::Create,
+            ManagedEntity::new("workspace", "ws-1"),
+        )
+        .actor_user(User::new("alice", "oidc|alice-123", UserTypeId::User))
+        .status(StatusId::Success)
+        .build(),
+        ConfigStateChangeBuilder::new(context)
+            .state(StateId::Other, "approved")
+            .actor_user(User::new("alice", "oidc|alice-123", UserTypeId::User))
+            .status(StatusId::Success)
+            .build(),
+    ]
+}
+
+#[test]
+fn gateway_audit_events_carry_gateway_identity_and_no_container() {
+    for event in gateway_audit_events(&gateway_ctx()) {
+        let json = event.to_json().unwrap();
+
+        assert!(json.get("container").is_none(), "no container: {json}");
+        assert_eq!(json["metadata"]["product"]["name"], "OpenShell Gateway");
+        assert_eq!(json["device"]["type_id"], 1);
+        assert_eq!(json["device"]["type"], "Server");
+        assert_eq!(json["device"]["uid"], "production-us-west");
+    }
+}
+
+#[test]
+fn sandbox_scoped_gateway_audit_events_route_by_container_uid() {
+    let mut context = gateway_ctx();
+    context.sandbox_id = "sb-1".to_string();
+    context.sandbox_name = "agent-01".to_string();
+
+    for event in gateway_audit_events(&context) {
+        let json = event.to_json().unwrap();
+
+        assert_eq!(json["container"]["uid"], "sb-1");
+        assert_eq!(json["metadata"]["product"]["name"], "OpenShell Gateway");
+        assert_eq!(json["device"]["type_id"], 1);
+    }
 }

@@ -7,15 +7,18 @@
 //! sandbox logging.
 //!
 //! This crate provides:
-//! - **8 OCSF event classes**: Network Activity, HTTP Activity, SSH Activity,
+//! - **11 OCSF event classes**: Network Activity, HTTP Activity, SSH Activity,
 //!   Process Activity, Detection Finding, Application Lifecycle, Device Config
-//!   State Change, and Base Event
+//!   State Change, API Activity, Entity Management, Authentication, and Base
+//!   Event
 //! - **Typed enums and objects**: All OCSF enum and object types used by the
 //!   event classes
 //! - **Builders**: Ergonomic per-class builders with `EventContext` for shared
 //!   metadata
-//! - **Dual formatters**: `format_shorthand()` for human-readable single-line
-//!   output, and `to_json()`/`to_json_line()` for OCSF-compliant JSONL
+//! - **Formatters**: `format_shorthand()` for human-readable single-line
+//!   output, `to_json()`/`to_json_line()` and `format::event_json()` (with
+//!   schema downgrade) for OCSF-compliant JSONL, and `format::attributes` for
+//!   raw (`ocsf.raw`) or flat (`ocsf.*`) export attributes
 //! - **Tracing layers**: `OcsfShorthandLayer` and `OcsfJsonlLayer` for
 //!   subscriber integration
 //! - **`ocsf_emit!` macro**: Thin wrapper for emitting events through the
@@ -37,29 +40,31 @@ pub mod validation;
 
 // --- Core event types ---
 pub use events::{
-    ApiActivityEvent, ApplicationLifecycleEvent, BaseEvent, BaseEventData, DetectionFindingEvent,
-    DeviceConfigStateChangeEvent, HttpActivityEvent, NetworkActivityEvent, OcsfEvent,
-    ProcessActivityEvent, SshActivityEvent,
+    ApiActivityEvent, ApplicationLifecycleEvent, AuthenticationEvent, BaseEvent, BaseEventData,
+    DetectionFindingEvent, DeviceConfigStateChangeEvent, EntityManagementEvent, HttpActivityEvent,
+    NetworkActivityEvent, OcsfEvent, ProcessActivityEvent, SshActivityEvent,
 };
 
 // --- Enum types ---
 pub use enums::{
-    ActionId, ActivityId, AuthTypeId, ConfidenceId, DeviceTypeId, DispositionId, HttpMethod,
-    LaunchTypeId, OcsfEnum, RiskLevelId, SecurityLevelId, SeverityId, StateId, StatusId,
+    ActionId, ActivityId, AuthActivityId, AuthProtocolId, AuthTypeId, ConfidenceId, DeviceTypeId,
+    DispositionId, EntityActivityId, HttpMethod, LaunchTypeId, ManagedEntityTypeId, OcsfEnum,
+    RiskLevelId, SecurityLevelId, SeverityId, StateId, StatusId, UserTypeId,
 };
 
 // --- Object types ---
 pub use objects::{
     Actor, AiModel, Api, Attack, ConnectionInfo, Container, Device, Endpoint, Evidence,
-    FindingInfo, FirewallRule, HttpRequest, HttpResponse, Image, Metadata, OsInfo, Process,
-    Product, Remediation, Tactic, Technique, Url,
+    FindingInfo, FirewallRule, HttpRequest, HttpResponse, Image, ManagedEntity, Metadata, OsInfo,
+    Process, Product, Remediation, Service, Tactic, Technique, Url, User,
 };
 
 // --- Builders ---
 pub use builders::{
-    ApiActivityBuilder, AppLifecycleBuilder, BaseEventBuilder, ConfigStateChangeBuilder,
-    DetectionFindingBuilder, EventContext, EventOrigin, HttpActivityBuilder,
-    NetworkActivityBuilder, ProcessActivityBuilder, SshActivityBuilder,
+    ApiActivityBuilder, AppLifecycleBuilder, AuthenticationBuilder, BaseEventBuilder,
+    ConfigStateChangeBuilder, DetectionFindingBuilder, EntityManagementBuilder, EventContext,
+    EventOrigin, HttpActivityBuilder, NetworkActivityBuilder, ProcessActivityBuilder,
+    SshActivityBuilder,
 };
 
 // --- Tracing layers ---

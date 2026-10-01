@@ -131,9 +131,7 @@ impl<'a> ApiActivityBuilder<'a> {
         OcsfEvent::ApiActivity(ApiActivityEvent {
             base,
             api: Api::new(&self.api_operation),
-            actor: Actor {
-                process: Process::new("openshell-supervisor", 1),
-            },
+            actor: Actor::from_process(Process::new("openshell-supervisor", 1)),
             src_endpoint: self.ctx.proxy_endpoint(),
             http_request: self.http_request,
             http_response: None,
