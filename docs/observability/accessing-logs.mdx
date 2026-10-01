@@ -39,6 +39,28 @@ The sandbox pushes logs to the gateway over gRPC in real time. The gateway store
 
 For durable log storage, use the log files inside the sandbox or enable [OCSF JSON export](/observability/ocsf-json-export) and ship the JSONL files to an external log aggregator.
 
+### Structured OCSF Fields
+
+Each pushed OCSF line carries the shorthand as its message and the event's structure as fields. By default the structure is the complete OCSF JSON document in one `ocsf.raw` field, plus `ocsf.severity_id` so a consumer can rank the record without parsing it. The document follows the sandbox's `ocsf_schema_version` setting, so it matches the sandbox's own JSONL file for the same event.
+
+Set `OPENSHELL_OCSF_PUSH_FORMAT=flat` in the supervisor's environment to push flattened `ocsf.*` keys instead, such as `ocsf.dst_endpoint.port`. Flattened values are stringified and truncated, and each event costs one field per leaf. Any other value keeps the raw default. The gateway accepts both shapes.
+
+The `openshell logs` text output and the TUI log list hide `ocsf.*` fields, because the message already carries the shorthand. The TUI detail view shows them.
+
+### Push Channel Loss Accounting
+
+The push channel from the sandbox to the gateway is bounded. When its queue is full, a log event waits up to 25 ms for space and is then dropped. Set `OPENSHELL_LOG_PUSH_BLOCK_MS` in the supervisor's environment to change the wait; `0` drops immediately without waiting. Lines buffered while the supervisor reconnects to the gateway are capped at 200, and lines over the cap are dropped.
+
+Drops are counted rather than silent. The supervisor reports them on its next flush as a `WARN` line with target `telemetry_gap` and a `dropped` field holding the count:
+
+```text
+[1775014140.512] [sandbox] [WARN ] [telemetry_gap] telemetry gap: 12 sandbox log line(s) dropped dropped=12
+```
+
+The gateway ingests at most 100 lines per push request. If a request exceeds that, the gateway publishes a `gateway`-sourced `telemetry_gap` line with `reason=push_batch_limit` for the excess. The gateway also counts both kinds of loss in the `openshell_sandbox_log_push_dropped_total` metric, labelled `reason="sandbox"` or `reason="push_batch_limit"`.
+
+Lines still in flight when the gateway connection breaks, and lines logged after the supervisor stops pushing because the gateway rejected its credentials, are not counted.
+
 ## Loss Awareness and Resume
 
 The watch stream behind `openshell logs` is loss-aware. Each resumable event (log line or platform event) carries an opaque `cursor` token. Status snapshots and warnings carry an empty cursor.
@@ -76,7 +98,7 @@ openshell sandbox exec --name my-sandbox -- cat /var/log/openshell.2026-04-01.lo
 `sandbox connect` attaches to the sandbox's existing canonical main process; it
 does not start a new shell.
 
-The log files inside the sandbox contain the complete record, including events that the gRPC push channel can drop under load. The push channel is bounded and drops events rather than blocking.
+The log files inside the sandbox contain the complete record, including events that the gRPC push channel can drop under load. Drops on the push channel are reported as `telemetry_gap` lines; see [Push Channel Loss Accounting](#push-channel-loss-accounting).
 
 ## Filtering by Event Type
 

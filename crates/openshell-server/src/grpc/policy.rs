@@ -4747,18 +4747,101 @@ pub(super) async fn handle_push_sandbox_logs(
         )
         .await?;
 
-        let logs: Vec<_> = batch.logs.into_iter().take(100).collect();
+        // Bound each request, but account for what the bound cuts instead of
+        // dropping it silently. Current supervisors send at most
+        // `MAX_PUSH_LINES_PER_REQUEST / 2` lines per request, so this only
+        // trips for older or misbehaving senders.
+        let mut logs = batch.logs;
+        let over_limit = logs.len().saturating_sub(MAX_PUSH_LINES_PER_REQUEST);
+        logs.truncate(MAX_PUSH_LINES_PER_REQUEST);
         validate_sandbox_log_timestamps(&logs)?;
 
-        for log in logs {
-            let mut log = log;
+        for mut log in logs {
             log.source = "sandbox".to_string();
             log.sandbox_id.clone_from(&batch.sandbox_id);
+            sanitize_pushed_log_fields(&mut log);
+            record_pushed_telemetry_gap(&log);
             state.tracing_log_bus.publish_external(log);
+        }
+
+        if over_limit > 0 {
+            metrics::counter!(
+                "openshell_sandbox_log_push_dropped_total",
+                "reason" => "push_batch_limit"
+            )
+            .increment(over_limit as u64);
+            state
+                .tracing_log_bus
+                .publish_external(push_batch_limit_gap_line(&batch.sandbox_id, over_limit));
         }
     }
 
     Ok(Response::new(PushSandboxLogsResponse {}))
+}
+
+/// Maximum log lines the gateway ingests from one `PushSandboxLogsRequest`.
+const MAX_PUSH_LINES_PER_REQUEST: usize = 100;
+
+/// Target of an accounted loss line. Shared with the supervisor's log push,
+/// which reports its own drops under the same target.
+const TELEMETRY_GAP_TARGET: &str = "telemetry_gap";
+
+/// Strip pushed field keys that collide with the identity attributes the
+/// gateway stamps on every exported record (`sandbox.id`, `log.source`,
+/// `log.target`, `log.level`, `log.ocsf`). A pushed field with one of those
+/// keys would export as a duplicate attribute and let a compromised sandbox
+/// masquerade as another sandbox, or as the gateway, in downstream consumers
+/// that resolve duplicate keys last-wins.
+///
+/// Both OCSF push formats pass through untouched: the raw `ocsf.raw` +
+/// `ocsf.severity_id` pair (the default) and flattened `ocsf.*` keys.
+fn sanitize_pushed_log_fields(log: &mut SandboxLogLine) {
+    log.fields.retain(|key, _| {
+        !matches!(
+            key.as_str(),
+            "sandbox.id" | "log.source" | "log.target" | "log.level" | "log.ocsf"
+        )
+    });
+}
+
+/// Count a sandbox-reported `telemetry_gap` in the gateway's metrics, so loss
+/// on the sandbox-to-gateway hop shows up next to the gateway sinks' own
+/// `*_dropped_total` counters. The line itself is still published.
+fn record_pushed_telemetry_gap(log: &SandboxLogLine) {
+    if log.target != TELEMETRY_GAP_TARGET {
+        return;
+    }
+    let dropped = log
+        .fields
+        .get("dropped")
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or(0);
+    if dropped > 0 {
+        metrics::counter!(
+            "openshell_sandbox_log_push_dropped_total",
+            "reason" => "sandbox"
+        )
+        .increment(dropped);
+    }
+}
+
+/// Accounted loss line for pushed lines cut by [`MAX_PUSH_LINES_PER_REQUEST`].
+fn push_batch_limit_gap_line(sandbox_id: &str, dropped: usize) -> SandboxLogLine {
+    SandboxLogLine {
+        sandbox_id: sandbox_id.to_string(),
+        event_time: openshell_core::time::timestamp_from_millis(openshell_core::time::now_ms())
+            .ok(),
+        level: "WARN".to_string(),
+        target: TELEMETRY_GAP_TARGET.to_string(),
+        message: format!(
+            "telemetry gap: {dropped} sandbox log line(s) over the per-request push limit dropped"
+        ),
+        source: "gateway".to_string(),
+        fields: HashMap::from([
+            ("dropped".to_string(), dropped.to_string()),
+            ("reason".to_string(), "push_batch_limit".to_string()),
+        ]),
+    }
 }
 
 fn validate_sandbox_log_timestamps(logs: &[SandboxLogLine]) -> Result<(), Status> {
@@ -4780,6 +4863,13 @@ async fn ensure_log_stream_sandbox_scope(
 ) -> Result<(), Status> {
     if let Some(validated) = validated_sandbox_id.as_deref() {
         if sandbox_id != validated {
+            // A stream authenticated for one sandbox that switches ids
+            // mid-stream is a cross-sandbox attempt; report it as one.
+            let principal_sandbox_id = match principal {
+                Principal::Sandbox(sandbox) => sandbox.sandbox_id.as_str(),
+                _ => validated,
+            };
+            emit_log_stream_sandbox_switch_finding(principal_sandbox_id, sandbox_id);
             return Err(Status::permission_denied(
                 "log stream sandbox_id changed after validation",
             ));
@@ -4796,6 +4886,36 @@ async fn ensure_log_stream_sandbox_scope(
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
     *validated_sandbox_id = Some(sandbox_id.to_string());
     Ok(())
+}
+
+/// Dual-emit the mid-stream sandbox id switch: a plain tracing event in the
+/// style of the up-front scope guard, and an OCSF Detection Finding scoped to
+/// the offending sandbox (routed to its log stream by `container.uid`, and
+/// captured by the gateway's OCSF sinks).
+fn emit_log_stream_sandbox_switch_finding(principal_sandbox_id: &str, requested_sandbox_id: &str) {
+    warn!(
+        principal_sandbox_id = %principal_sandbox_id,
+        requested_sandbox_id = %requested_sandbox_id,
+        "log stream sandbox_id changed after validation"
+    );
+    let ctx = crate::gateway_ocsf::context(principal_sandbox_id, "");
+    let event = openshell_ocsf::DetectionFindingBuilder::new(&ctx)
+        .activity(openshell_ocsf::ActivityId::Open)
+        .action(openshell_ocsf::ActionId::Denied)
+        .disposition(openshell_ocsf::DispositionId::Blocked)
+        .severity(SeverityId::High)
+        .is_alert(true)
+        .finding_info(openshell_ocsf::FindingInfo::new(
+            "openshell.gateway.log_stream_sandbox_switch",
+            "Log stream switched sandbox id after validation",
+        ))
+        .evidence_pairs(&[
+            ("principal_sandbox_id", principal_sandbox_id),
+            ("requested_sandbox_id", requested_sandbox_id),
+        ])
+        .message("cross-sandbox log stream id switch denied")
+        .build();
+    openshell_ocsf::ocsf_emit!(event);
 }
 
 // ---------------------------------------------------------------------------
@@ -10819,6 +10939,112 @@ mod tests {
             .expect_err("later frame must not switch sandbox ids");
 
         assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    /// Capture OCSF events emitted inside `f` from the event bridge.
+    fn capture_ocsf_events(f: impl FnOnce()) -> Vec<OcsfEvent> {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<OcsfEvent>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if event.metadata().target() == openshell_ocsf::OCSF_TARGET
+                    && let Some(ocsf) = openshell_ocsf::clone_current_event()
+                {
+                    self.0.lock().unwrap().push(ocsf);
+                }
+            }
+        }
+
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber =
+            tracing_subscriber::registry().with(Capture(std::sync::Arc::clone(&events)));
+        tracing::subscriber::with_default(subscriber, f);
+        events.lock().unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn log_stream_sandbox_id_switch_emits_a_detection_finding() {
+        let state = test_server_state().await;
+        for id in ["sb-a", "sb-b"] {
+            let sandbox = test_sandbox(id, id, ProtoSandboxPolicy::default(), vec![]);
+            state.store.put_message(&sandbox).await.unwrap();
+        }
+        let req = with_sandbox(Request::new(()), "sb-a");
+        let principal = req.extensions().get::<Principal>().unwrap().clone();
+        let mut validated = Some("sb-a".to_string());
+
+        let events = capture_ocsf_events(|| {
+            let err = futures::executor::block_on(ensure_log_stream_sandbox_scope(
+                &state,
+                &principal,
+                "sb-b",
+                &mut validated,
+            ))
+            .expect_err("switch is denied");
+            assert_eq!(err.code(), Code::PermissionDenied);
+        });
+
+        assert_eq!(events.len(), 1, "one finding per switch: {events:?}");
+        let json = events[0].to_json().unwrap();
+        assert_eq!(json["class_uid"], 2004);
+        assert_eq!(json["severity_id"], 4);
+        assert_eq!(
+            json["container"]["uid"], "sb-a",
+            "routed to the offending sandbox"
+        );
+        assert_eq!(json["metadata"]["product"]["name"], "OpenShell Gateway");
+    }
+
+    #[test]
+    fn pushed_log_fields_cannot_shadow_gateway_identity_attributes() {
+        let mut log = SandboxLogLine {
+            fields: HashMap::from([
+                ("sandbox.id".to_string(), "victim-sb".to_string()),
+                ("log.source".to_string(), "gateway".to_string()),
+                ("log.target".to_string(), "audit".to_string()),
+                ("log.level".to_string(), "OCSF".to_string()),
+                ("log.ocsf".to_string(), "true".to_string()),
+                ("ocsf.raw".to_string(), "{}".to_string()),
+                ("ocsf.severity_id".to_string(), "3".to_string()),
+                ("ocsf.dst_endpoint.port".to_string(), "443".to_string()),
+                ("custom.field".to_string(), "kept".to_string()),
+            ]),
+            ..Default::default()
+        };
+        sanitize_pushed_log_fields(&mut log);
+        let mut kept: Vec<_> = log.fields.keys().map(String::as_str).collect();
+        kept.sort_unstable();
+        assert_eq!(
+            kept,
+            vec![
+                "custom.field",
+                "ocsf.dst_endpoint.port",
+                "ocsf.raw",
+                "ocsf.severity_id"
+            ],
+            "both OCSF push formats survive; reserved keys do not"
+        );
+    }
+
+    #[test]
+    fn push_batch_limit_gap_line_is_accounted_and_ingestible() {
+        let line = push_batch_limit_gap_line("sb-a", 37);
+        assert_eq!(line.sandbox_id, "sb-a");
+        assert_eq!(line.target, TELEMETRY_GAP_TARGET);
+        assert_eq!(line.source, "gateway");
+        assert_eq!(line.level, "WARN");
+        assert_eq!(line.fields.get("dropped").map(String::as_str), Some("37"));
+        assert_eq!(
+            line.fields.get("reason").map(String::as_str),
+            Some("push_batch_limit")
+        );
+        validate_sandbox_log_timestamps(std::slice::from_ref(&line))
+            .expect("gap line carries a valid event_time");
     }
 
     #[tokio::test]

@@ -229,11 +229,12 @@ fn render_log_line<'a>(log: &'a LogLine, max_width: usize, t: &'a crate::theme::
     // Message.
     spans.push(Span::styled(log.message.as_str(), t.text));
 
-    // Structured fields — ordered, non-empty only.
+    // Structured fields — ordered, non-empty only. `ocsf.*` fields hold the
+    // OCSF document behind the shorthand message; the detail popup shows them.
     if !log.fields.is_empty() {
         let ordered = ordered_fields(log);
         for (k, v) in &ordered {
-            if v.is_empty() {
+            if v.is_empty() || k.starts_with("ocsf.") {
                 continue;
             }
             spans.push(Span::raw(" "));
