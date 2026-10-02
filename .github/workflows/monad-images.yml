@@ -80,6 +80,8 @@ jobs:
           - { package: openshell-supervisor, binary: openshell-supervisor, triple: aarch64-unknown-linux-gnu }
           - { package: openshell-sandbox, binary: openshell-sandbox, triple: x86_64-unknown-linux-musl }
           - { package: openshell-sandbox, binary: openshell-sandbox, triple: aarch64-unknown-linux-musl }
+          - { package: openshell-cli, binary: openshell, triple: x86_64-unknown-linux-musl }
+          - { package: openshell-cli, binary: openshell, triple: aarch64-unknown-linux-musl }
     # Repository variables MONAD_RUNNER_X64 / MONAD_RUNNER_ARM64 select larger runners
     # (e.g. ubuntu-24.04-8core / ubuntu-24.04-arm-8core); unset uses the standard ones.
     runs-on: ${{ startsWith(matrix.triple, 'aarch64') && (vars.MONAD_RUNNER_ARM64 || 'ubuntu-24.04-arm') || (vars.MONAD_RUNNER_X64 || 'ubuntu-24.04') }}
@@ -114,6 +116,7 @@ jobs:
           - { component: gateway, binary: openshell-gateway, target-suffix: unknown-linux-gnu }
           - { component: supervisor, binary: openshell-supervisor, target-suffix: unknown-linux-gnu }
           - { component: sandbox, binary: openshell-sandbox, target-suffix: unknown-linux-musl }
+          - { component: cli, binary: openshell, target-suffix: unknown-linux-musl }
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:

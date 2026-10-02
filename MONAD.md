@@ -17,7 +17,13 @@ This fork carries Monad's changes on top of upstream OpenShell releases: OCSF Au
 
 ## Images
 
-`.github/workflows/monad-images.yml` builds the gateway, supervisor, and sandbox runtime for amd64 and arm64 and pushes them to `ghcr.io/monad-inc/openshell/{gateway,supervisor,sandbox}`. The packages are private.
+`.github/workflows/monad-images.yml` builds the gateway, supervisor, sandbox runtime, and CLI for amd64 and arm64 and pushes them to `ghcr.io/monad-inc/openshell/{gateway,supervisor,sandbox,cli}`. The packages are private.
+
+The `cli` image only carries the static `openshell` binary. Copy it into images that need a client matching the gateway build:
+
+```dockerfile
+COPY --from=ghcr.io/monad-inc/openshell/cli:<tag> /usr/local/bin/openshell /usr/local/bin/openshell
+```
 
 | Tag | Meaning |
 |---|---|

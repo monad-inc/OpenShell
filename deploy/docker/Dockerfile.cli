@@ -1,0 +1,19 @@
+# syntax=docker/dockerfile:1.4
+
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Monad fork: carries the static musl `openshell` CLI built alongside the
+# gateway, so images that need a matching client can copy it in:
+#
+#   COPY --from=ghcr.io/monad-inc/openshell/cli:<tag> /usr/local/bin/openshell /usr/local/bin/openshell
+
+FROM scratch AS cli
+
+ARG TARGETARCH
+
+COPY --chmod=0555 deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell /usr/local/bin/openshell
+
+USER 65532:65532
+
+ENTRYPOINT ["/usr/local/bin/openshell"]
