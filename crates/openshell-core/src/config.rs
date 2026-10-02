@@ -84,10 +84,24 @@ impl FromStr for PolicyValidationFailureMode {
 }
 
 /// Default OCI repository for the supervisor image (no tag).
-pub const DEFAULT_SUPERVISOR_IMAGE_REPO: &str = "ghcr.io/nvidia/openshell/supervisor";
+///
+/// Distributors that publish their own images override this at build time
+/// with `OPENSHELL_SUPERVISOR_IMAGE_REPO`.
+pub const DEFAULT_SUPERVISOR_IMAGE_REPO: &str = match option_env!("OPENSHELL_SUPERVISOR_IMAGE_REPO")
+{
+    Some(repo) => repo,
+    None => "ghcr.io/nvidia/openshell/supervisor",
+};
 
 /// Default OCI repository for the sandbox runtime image (no tag).
-pub const DEFAULT_SANDBOX_RUNTIME_IMAGE_REPO: &str = "ghcr.io/nvidia/openshell/sandbox";
+///
+/// Distributors that publish their own images override this at build time
+/// with `OPENSHELL_SANDBOX_RUNTIME_IMAGE_REPO`.
+pub const DEFAULT_SANDBOX_RUNTIME_IMAGE_REPO: &str =
+    match option_env!("OPENSHELL_SANDBOX_RUNTIME_IMAGE_REPO") {
+        Some(repo) => repo,
+        None => "ghcr.io/nvidia/openshell/sandbox",
+    };
 
 /// Return the default sandbox runtime image reference with a version-pinned tag.
 #[must_use]
@@ -1695,14 +1709,17 @@ mod tests {
 
     #[test]
     fn default_supervisor_image_is_version_pinned() {
-        use super::{default_sandbox_runtime_image, default_supervisor_image};
+        use super::{
+            DEFAULT_SANDBOX_RUNTIME_IMAGE_REPO, DEFAULT_SUPERVISOR_IMAGE_REPO,
+            default_sandbox_runtime_image, default_supervisor_image,
+        };
         let image = default_supervisor_image();
-        assert!(image.starts_with("ghcr.io/nvidia/openshell/supervisor:"));
+        assert!(image.starts_with(&format!("{DEFAULT_SUPERVISOR_IMAGE_REPO}:")));
         let tag = image.rsplit_once(':').unwrap().1;
         assert!(!tag.is_empty());
 
         let sandbox_image = default_sandbox_runtime_image();
-        assert!(sandbox_image.starts_with("ghcr.io/nvidia/openshell/sandbox:"));
+        assert!(sandbox_image.starts_with(&format!("{DEFAULT_SANDBOX_RUNTIME_IMAGE_REPO}:")));
         let sandbox_tag = sandbox_image.rsplit_once(':').unwrap().1;
         assert!(!sandbox_tag.is_empty());
     }
