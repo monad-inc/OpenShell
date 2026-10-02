@@ -77,14 +77,19 @@ obviously yours and easy to discard.
 
 ## Writing findings when there is no PR
 
-The summary is the deliverable in most cycles. Make it something a person woken
+Your announcement in `slack.report_channel` is the deliverable in most cycles,
+and the only record that the work happened. Make it something a person woken
 at 3am can act on:
 
 - What is firing, since when, and how bad.
 - What you checked and what you found — including the things you ruled out.
   Knowing the dependency was flat is worth as much as knowing the service was.
 - The most probable direction, with your confidence stated plainly.
-- The exact queries you ran, so they can be re-run without reconstruction.
+- The exact tool calls you made, so they can be re-run without reconstruction.
+- The `alert-key:` line, always.
 
 Ruling things out is real progress. Report it as such rather than treating a
 cycle without a cause as a wasted one.
+
+A PR that is not linked in the announcement is effectively lost, because the
+announcement is the only place this work is written down.

@@ -78,6 +78,22 @@ endpoints:
       - allow: { method: GET, path: "/api/ruler/grafana/api/v1/rules" }
       - allow: { method: GET, path: "/api/v1/provisioning/alert-rules" }
       - allow: { method: GET, path: "/api/v1/provisioning/alert-rules/**" }
+      # Grafana's Prometheus-compatible rules and alerts API. A live cycle was
+      # denied here while investigating loki-high-4xx-rate; it is a read, and
+      # mcp-grafana prefers it for rule state.
+      - allow: { method: GET, path: "/api/prometheus/grafana/api/v1/rules" }
+      - allow: { method: GET, path: "/api/prometheus/grafana/api/v1/alerts" }
+
+      # Grafana IRM (incidents / on-call), which the list_incidents and
+      # get_current_oncall_users tools reach through the plugin's RPC surface.
+      #
+      # Named one RPC at a time, NOT as /api/plugins/grafana-irm-app/** — that
+      # prefix also carries incident *creation*, so a wildcard here would hand
+      # the agent write access to production incident management. These two are
+      # reads that happen to use POST because the query travels in the body.
+      # Other IRM tools will surface more RPCs; add each one deliberately.
+      - allow: { method: POST, path: "/api/plugins/grafana-irm-app/resources/api/v1/IncidentsService.QueryIncidentPreviews" }
+      - allow: { method: POST, path: "/api/plugins/grafana-irm-app/resources/api/v1/IncidentsService.GetIncident" }
 
       # Deploy markers and incident context recorded by humans. GET only.
       - allow: { method: GET, path: "/api/annotations" }

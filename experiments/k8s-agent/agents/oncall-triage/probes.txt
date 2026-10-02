@@ -25,9 +25,19 @@ grafana-read-search|allow|curl -X GET https://grafana.monad.com/api/search
 grafana-read-query|allow|curl -X POST https://grafana.monad.com/api/ds/query
 grafana-write-dashboard|deny|curl -X POST https://grafana.monad.com/api/dashboards/db
 grafana-write-annotation|deny|curl -X POST https://grafana.monad.com/api/annotations
+grafana-prom-rules|allow|curl -X GET https://grafana.monad.com/api/prometheus/grafana/api/v1/rules
+grafana-irm-read|allow|curl -X POST https://grafana.monad.com/api/plugins/grafana-irm-app/resources/api/v1/IncidentsService.QueryIncidentPreviews
+grafana-irm-create|deny|curl -X POST https://grafana.monad.com/api/plugins/grafana-irm-app/resources/api/v1/IncidentsService.CreateIncident
 grafana-admin-users|deny|curl -X GET https://grafana.monad.com/api/admin/users
 slack-read-history|allow|curl -X GET https://slack.com/api/conversations.history
-slack-write-post|deny|curl -X POST https://slack.com/api/chat.postMessage
+slack-read-history-post|allow|curl -X POST https://slack.com/api/conversations.history
+# Flipped from deny to allow when the agent was asked to report in Slack. The
+# permitted write surface is exactly chat.postMessage and chat.delete; the
+# probes below assert the rest of Slack is still closed.
+slack-write-post|allow|curl -X POST https://slack.com/api/chat.postMessage
+slack-write-update|deny|curl -X POST https://slack.com/api/chat.update
+slack-file-upload|deny|curl -X POST https://slack.com/api/files.getUploadURLExternal
+slack-admin|deny|curl -X GET https://slack.com/api/admin.conversations.search
 github-wrong-binary|deny|curl -X GET https://api.github.com/repos/monad-inc/OpenShell
 github-org-clone|allow|git ls-remote https://github.com/monad-inc/OpenShell
 github-outside-org|deny|git ls-remote https://github.com/torvalds/linux

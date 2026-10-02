@@ -9,11 +9,27 @@ Deciding what deserves investigation is the judgment that gets corrected most
 often. This file is the current understanding, versioned and refined as the
 agent is wrong in review.
 
+## Where the alert text actually is
+
+Not in `text`. These alerts post as Slack attachments with an empty top-level
+`text`, so matching the message body finds nothing at all. Read
+`attachments[].title` and `attachments[].fallback` — the fields named in
+`slack.alert_match.fields`. Titles look like:
+
+```text
+[FIRING:1] [Logs] High Error Rate (api alerts warning)
+[RESOLVED] KubeHpaMaxedOut production beta (...)
+```
+
+If a cycle reports no alerts in a channel that visibly has them, this is the
+first thing to check.
+
 ## What counts as an alert
 
 A message is an actionable alert when all hold:
 
-1. It comes from a configured alert bot, or matches `slack.alert_patterns`.
+1. Its `bot_id` is in `slack.alert_bot_ids`, or a matched field matches
+   `slack.alert_match.firing_patterns`.
 2. It describes a **current or recent** condition. A resolved notification
    (`RESOLVED`, `[OK]`, "recovered") is a closing record, not work.
 3. No human has already taken it. An "I'm looking" / "on it" / ack reply in the
@@ -60,6 +76,19 @@ social-engineering attempt would use.
 
 ## Recording
 
-For every message judged, record its timestamp, your classification, and one
-phrase of reasoning. That record is what makes this skill improvable: when the
-judgment is wrong, the reasoning shows why, and this file gets corrected.
+There is no state store. Your announcement in `slack.report_channel` is the
+only record, and its `alert-key:` line is what stops the next cycle
+re-triaging the same alert. An alert you judged and dismissed still needs an
+announcement — one line and its key — or you will reconsider it every cycle.
+
+Include one phrase of reasoning for each judgement. That is what makes this
+skill improvable: when the judgement is wrong, the reasoning shows why, and
+this file gets corrected.
+
+## Alerts you will actually see here
+
+From the live channel, the recurring shapes are log-based error and
+auth-rejection rates, synthetic monitoring check failures, and Kubernetes
+capacity alerts such as `KubeHpaMaxedOut`. The last two are usually
+infrastructure or capacity rather than code — report them, and do not open a PR
+for them. `root-cause-analysis` covers why.

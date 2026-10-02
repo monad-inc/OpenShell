@@ -17,18 +17,40 @@
 version: 1
 
 slack:
-  # Channel IDs carrying production alerts. Read-only.
+  # Channels the agent reads alerts from. Read-only in practice: the agent is
+  # told to post only to report_channel, and nothing here writes.
+  # C07S7CXTTJ7 = #alerts-production
+  alert_channels:
+    - C07S7CXTTJ7
+
+  # Where the agent announces what it did. This channel is also the agent's
+  # memory: there is no state issue and no other store, so each cycle reads its
+  # own prior announcements here to know which alerts it has already handled.
+  # Every announcement carries an `alert-key:` line for exactly that purpose.
   # C0C6777N7SP = #triage-bot-test
-  channels:
-    - C0C6777N7SP
-  # Messages from these bot/app user IDs are treated as alerts. Left empty, the
-  # agent falls back to `alert_patterns` against the message text.
-  alert_bot_user_ids: []
-  alert_patterns:
-    - "FIRING"
-    - "\\[ALERT\\]"
-    - "PagerDuty"
-  # On a cold start with no recorded cursor, look back no further than this.
+  report_channel: C0C6777N7SP
+
+  # Alerts arrive as Slack *attachments* with an empty top-level `text`, so
+  # matching the message text finds nothing. Match the attachment title or
+  # fallback instead. Verified against the live channel: every alert has
+  # text_len=0 and an attachments[0].title like
+  #   "[FIRING:1] [Logs] High Error Rate (api alerts warning)"
+  #   "[RESOLVED] KubeHpaMaxedOut production beta (...)"
+  alert_match:
+    fields: [attachments.title, attachments.fallback]
+    firing_patterns:
+      - "\\[FIRING"
+    resolved_patterns:
+      - "\\[RESOLVED\\]"
+
+  # Messages from these Slack bot ids are alerts. B07RKQWD00H is the Grafana
+  # alerting integration posting into #alerts-production. These are `bot_id`
+  # values, not user ids — the alert messages carry no `user`.
+  alert_bot_ids:
+    - B07RKQWD00H
+
+  # On a cold start with no prior announcement to anchor to, look back no
+  # further than this.
   cold_start_lookback_seconds: 3600
 
 grafana:
@@ -62,10 +84,10 @@ github:
     - monad-inc/core
   base_branch: main
   branch_prefix: oncall/
-  # Durable cross-cycle state: a fenced ```json openshell-oncall-state block in
-  # this issue's body. Each cycle is a fresh process, so anything that must
-  # survive lives here. Until set, the agent reports `blocked` by design.
-  state_issue: null
+  # No state issue, deliberately. The agent writes no tracking state anywhere:
+  # its announcements in slack.report_channel are the only record, and the
+  # `alert-key:` line in each one is what the next cycle reads to avoid
+  # re-triaging the same alert.
 
 triage:
   # Investigations per cycle. Triage depth beats breadth: one alert understood

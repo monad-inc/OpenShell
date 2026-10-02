@@ -3,12 +3,32 @@
 
 # SPDX-License-Identifier: Apache-2.0
 
-# Read-only Slack access for the on-call triage agent.
+# Slack access for the on-call triage agent: read alerts, announce results.
 #
-# The agent watches an alerts channel and never speaks. No chat.postMessage,
-# chat.update, reactions, or file upload rule exists, so those calls are refused
-# at the proxy even if the token would permit them. Pair with a bot token
-# carrying only channels:history, groups:history, channels:read, users:read.
+# This was read-only until the agent was asked to report its findings in Slack.
+# It now permits exactly one write — chat.postMessage — plus chat.delete so it
+# can retract its own mistake. Everything else still has no rule and is refused
+# at the proxy: no chat.update, no file upload, no admin, no reactions.
+#
+# ---------------------------------------------------------------------------
+# KNOWN LIMIT — the proxy cannot constrain WHICH channel it posts to.
+#
+# The target channel travels in the request body, and L7 policy here matches on
+# method and path, not body content. So permitting chat.postMessage permits
+# posting to any channel the bot is a member of — including #alerts-production,
+# which it must join in order to read.
+#
+# What actually bounds this:
+#   1. Channel membership. The bot is in exactly two channels; keep it that way
+#      and the blast radius is those two.
+#   2. slack.report_channel in watch-config.yaml, and the prompt, which say to
+#      announce only there. That is instruction, not enforcement.
+#
+# If posting into #alerts-production ever needs to be impossible rather than
+# merely not-instructed, the answer is a second Slack app: a read-only token for
+# the alerts channel and a write token for the report channel, since Slack
+# scopes a token to an app and not to a channel.
+# ---------------------------------------------------------------------------
 id: slack-oncall-reader
 display_name: Slack (on-call, read-only)
 description: Read-only Slack Web API access for watching production alert channels
@@ -30,9 +50,24 @@ endpoints:
     rules:
       - allow: { method: GET, path: "/api/auth.test" }
       - allow: { method: POST, path: "/api/auth.test" }
+      # Both verbs on each read method. Slack accepts POST for its Web API
+      # generally, and a live cycle was denied on POST /api/conversations.history
+      # while GET was permitted — allowing only GET quietly breaks any client
+      # that posts form bodies, which is most of them.
       - allow: { method: GET, path: "/api/conversations.list" }
+      - allow: { method: POST, path: "/api/conversations.list" }
       - allow: { method: GET, path: "/api/conversations.info" }
+      - allow: { method: POST, path: "/api/conversations.info" }
       - allow: { method: GET, path: "/api/conversations.history" }
+      - allow: { method: POST, path: "/api/conversations.history" }
       - allow: { method: GET, path: "/api/conversations.replies" }
+      - allow: { method: POST, path: "/api/conversations.replies" }
       - allow: { method: GET, path: "/api/users.info" }
+      - allow: { method: POST, path: "/api/users.info" }
+      # Announce results. See KNOWN LIMIT above: the channel is in the body and
+      # is therefore not enforceable here.
+      - allow: { method: POST, path: "/api/chat.postMessage" }
+      # Retract its own message. Slack only permits deleting messages the token
+      # authored, so this cannot touch anyone else's.
+      - allow: { method: POST, path: "/api/chat.delete" }
 binaries: [/usr/bin/curl, /usr/local/bin/curl]
