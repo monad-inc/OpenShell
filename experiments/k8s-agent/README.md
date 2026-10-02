@@ -577,11 +577,27 @@ and generates `mcp.json` into the read-only payload. The harness loads it with
 fixed at build time. Install kinds are `oci_binary` and `npm`; adding an MCP
 server to an agent is this block and nothing else — no chart change, no service.
 
-Pinning `image` by digest would be better than a tag, and the digest resolves
-under `docker manifest inspect`, but a by-digest pull of this Docker Hub repo
-fails under BuildKit with `insufficient_scope: authorization failed` on an
-anonymous pull. Pin by digest once the image is mirrored somewhere you
-authenticate to.
+`install.image` is pinned by digest, which required mirroring the upstream image
+first: a by-digest pull of `docker.io/mcp/grafana` fails under BuildKit with
+`insufficient_scope: authorization failed` on an anonymous pull, so only a
+moving tag worked there. The mirror lives at
+`ghcr.io/monad-inc/openshell/mirror/mcp-grafana` — `mirror/` marks it as a copy
+of a third-party image rather than something Monad builds.
+
+It is a server-side manifest copy, so the mirrored index carries the identical
+digest to the source with both `linux/amd64` and `linux/arm64` intact, and the
+digest is therefore verifiable against upstream rather than being a new identity:
+
+```shell
+docker buildx imagetools create \
+  --tag ghcr.io/monad-inc/openshell/mirror/mcp-grafana:<date> \
+  mcp/grafana@sha256:<upstream-digest>
+```
+
+Refreshing the MCP server means re-copying upstream and bumping the digest in
+`agent.yaml`. The cluster never pulls this image — the binary is baked into the
+agent image at build time — so it needs no pull secret; only the build host
+needs `docker login ghcr.io`.
 
 #### Why not run the MCP server as a service
 
@@ -873,7 +889,6 @@ On `kind-kind` / `openshell-experiments`, observed directly:
 - `-enabled-tools` is set from the Grafana MCP catalogue, not from watching a
   real investigation. Expect to narrow it, and the path allowlist, once real
   cycles show what is actually used.
-- `mcp_servers[].install.image` is pinned by tag, not digest — see above.
 - The repo-watcher agent builds after the restructure but has not been
   redeployed; its values file is ready.
 - Skills are unproven in practice. They encode judgment that only survives

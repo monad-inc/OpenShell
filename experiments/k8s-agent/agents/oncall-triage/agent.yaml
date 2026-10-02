@@ -103,13 +103,23 @@ mcp_servers:
       # Copies a binary out of a published image at build time via a
       # multi-stage COPY --from: no download step, no package manager.
       #
-      # A digest would be better than a tag for reproducibility, and the digest
-      # resolves fine with `docker manifest inspect`, but a by-digest pull of
-      # this Docker Hub repo fails under BuildKit with
-      # "insufficient_scope: authorization failed" on an anonymous pull. Pin by
-      # digest once the image is mirrored to a registry you authenticate to.
+      # Pinned by digest, and mirrored into ghcr to make that possible: a
+      # by-digest pull of the upstream Docker Hub repo fails under BuildKit with
+      # "insufficient_scope: authorization failed" on an anonymous pull, so only
+      # a moving tag worked there. The mirror is a server-side manifest copy, so
+      # this is the identical index digest as docker.io/mcp/grafana:latest with
+      # both linux/amd64 and linux/arm64 intact.
+      #
+      # Refresh it by re-copying upstream and bumping the digest here:
+      #   docker buildx imagetools create \
+      #     --tag ghcr.io/monad-inc/openshell/mirror/mcp-grafana:<date> \
+      #     mcp/grafana@sha256:<upstream-digest>
+      #
+      # Private, like the rest of ghcr.io/monad-inc: `docker login ghcr.io`
+      # before building. The cluster never pulls it — the binary is baked into
+      # the agent image — so no pull secret is needed for it.
       kind: oci_binary
-      image: mcp/grafana:latest
+      image: ghcr.io/monad-inc/openshell/mirror/mcp-grafana@sha256:9362bcf6aa0e44e61f645b905cec03fb346a946a34a4dafecd7f3e28d3724014
       source_path: /app/mcp-grafana
       dest_path: /usr/local/bin/mcp-grafana
     command: /usr/local/bin/mcp-grafana
