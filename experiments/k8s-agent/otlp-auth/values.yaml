@@ -26,12 +26,17 @@ otlp:
   # `Bearer <token>`)", and for a vendor API-key header, "use the vendor's
   # header name (for example `X-API-Key`) and store the bare key" — in which
   # case set name: X-API-Key and prefix: "".
+  # Monad's OTel input expects `Authorization: ApiKey <API_KEY>` — the ApiKey
+  # scheme, not Bearer. The key must be an ORGANIZATION api key holding
+  # `pipeline:data:write` (default for Contributor and System Administrator);
+  # a personal key will not do.
   header:
-    name: authorization
-    prefix: "Bearer "
+    name: Authorization
+    prefix: "ApiKey "
 
-  # Merged in as `key=value` pairs. Use this if the receiver wants the pipeline
-  # id as a header rather than in the endpoint path.
+  # Merged in as `key=value` pairs. Monad SaaS carries the pipeline id in the
+  # endpoint hostname, so this stays empty; a self-hosted Monad without
+  # wildcard DNS wants `monad-pipeline-id: <pipeline-id>` here instead.
   extraHeaders: {}
 
   # NEVER commit a real key. Supply it at install time from a file kept outside

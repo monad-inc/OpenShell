@@ -61,6 +61,28 @@ server:
   # without deleting the volume. Bump the suffix on a future incompatible
   # upgrade, or migrate deliberately.
   dbUrl: "sqlite:/var/openshell/openshell-0.1.3-monad.db"
+  # Forward everything the gateway and its sandboxes do to Monad, as OTLP log
+  # records, so the bot's work can be reviewed in Elasticsearch instead of by
+  # watching it live. Carries gateway logs, every sandbox's logs, and the
+  # control-plane audit trail; OCSF lines put the shorthand in the record body
+  # and the full document in `ocsf.raw`.
+  #
+  # The pipeline id is the hostname, per Monad's OTel input docs:
+  #   https://<pipeline-id>.data.monad.com:4317
+  # Verified: this name resolves and serves a valid *.data.monad.com cert,
+  # which matters because the gateway verifies https collectors against public
+  # web PKI only — a private CA is not supported.
+  #
+  # Self-hosted Monad without wildcard DNS takes the pipeline id as the
+  # `monad-pipeline-id` gRPC metadata key instead; that would go in
+  # otlp.extraHeaders rather than the hostname.
+  otlp:
+    endpoint: "https://15f14846-1141-4734-9c2e-037e784c6f00.data.monad.com:4317"
+    exportLogs: true
+    headersSecret:
+      # Created by the otlp-auth release, which must be installed first.
+      name: openshell-otlp-headers
+
   # Sandbox pods land in the release namespace.
   sandboxNamespace: ""
   # Sandbox pods (supervisor + sandbox runtime) pull Monad's private images too.
