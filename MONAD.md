@@ -28,6 +28,8 @@ This fork carries Monad's changes on top of upstream OpenShell releases: OCSF Au
 
 The gateway binary is compiled to launch Monad's supervisor and sandbox runtime images at the same `sha-` tag, so the gateway and supervisor always match.
 
+Binaries build on the standard `ubuntu-24.04` and `ubuntu-24.04-arm` runners. To use larger org runners, set the repository variables `MONAD_RUNNER_X64` and `MONAD_RUNNER_ARM64` (for example `ubuntu-24.04-8core` and `ubuntu-24.04-arm-8core`); the runner group must allow this repository.
+
 To cut a release, tag `monad/main` with `monad-v<semver>`, for example `git tag monad-v0.1.3-monad.1 && git push origin monad-v0.1.3-monad.1`.
 
 ## Pulling the images

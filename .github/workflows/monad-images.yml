@@ -74,13 +74,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { package: openshell-gateway, binary: openshell-gateway, triple: x86_64-unknown-linux-gnu, runner: ubuntu-24.04-8core }
-          - { package: openshell-gateway, binary: openshell-gateway, triple: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm-8core }
-          - { package: openshell-supervisor, binary: openshell-supervisor, triple: x86_64-unknown-linux-gnu, runner: ubuntu-24.04-8core }
-          - { package: openshell-supervisor, binary: openshell-supervisor, triple: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm-8core }
-          - { package: openshell-sandbox, binary: openshell-sandbox, triple: x86_64-unknown-linux-musl, runner: ubuntu-24.04-8core }
-          - { package: openshell-sandbox, binary: openshell-sandbox, triple: aarch64-unknown-linux-musl, runner: ubuntu-24.04-arm-8core }
-    runs-on: ${{ matrix.runner }}
+          - { package: openshell-gateway, binary: openshell-gateway, triple: x86_64-unknown-linux-gnu }
+          - { package: openshell-gateway, binary: openshell-gateway, triple: aarch64-unknown-linux-gnu }
+          - { package: openshell-supervisor, binary: openshell-supervisor, triple: x86_64-unknown-linux-gnu }
+          - { package: openshell-supervisor, binary: openshell-supervisor, triple: aarch64-unknown-linux-gnu }
+          - { package: openshell-sandbox, binary: openshell-sandbox, triple: x86_64-unknown-linux-musl }
+          - { package: openshell-sandbox, binary: openshell-sandbox, triple: aarch64-unknown-linux-musl }
+    # Repository variables MONAD_RUNNER_X64 / MONAD_RUNNER_ARM64 select larger runners
+    # (e.g. ubuntu-24.04-8core / ubuntu-24.04-arm-8core); unset uses the standard ones.
+    runs-on: ${{ startsWith(matrix.triple, 'aarch64') && (vars.MONAD_RUNNER_ARM64 || 'ubuntu-24.04-arm') || (vars.MONAD_RUNNER_X64 || 'ubuntu-24.04') }}
     timeout-minutes: 120
     env:
       # Compiled-in defaults, so a gateway built here launches Monad's supervisor and sandbox runtime.
