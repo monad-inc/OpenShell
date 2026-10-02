@@ -1,0 +1,173 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Audit Configuration"
+sidebar-title: "Audit Configuration"
+description: "Every toggle that controls OpenShell gateway audit events: what each one governs, when to change it, and how it changes the records you get."
+keywords: "Generative AI, Cybersecurity, Audit, OCSF, Configuration, Toggles, SIEM"
+---
+
+Gateway audit events answer to one master switch and three per-field toggles under `[openshell.gateway.audit]`. Settings in the OTLP table and the sandbox supervisor's environment decide how the records leave the box and what shape they take.
+
+Every audit toggle is mirrored by an environment variable and a command-line flag. The gateway resolves them in this order, highest precedence first:
+
+```text
+command-line flag  >  environment variable  >  configuration file  >  built-in default
+```
+
+## Toggle Reference
+
+| Setting | Environment variable | Flag | Helm value | Default |
+|---|---|---|---|---|
+| `enabled` | `OPENSHELL_AUDIT_EVENTS` | `--audit-events` | `server.audit.enabled` | `true` |
+| `auth_success_events` | `OPENSHELL_AUDIT_AUTH_SUCCESS_EVENTS` | `--audit-auth-success-events` | `server.audit.authSuccessEvents` | `false` |
+| `exec_args` | `OPENSHELL_AUDIT_EXEC_ARGS` | `--audit-exec-args` | `server.audit.execArgs` | `true` |
+| `settings_values` | `OPENSHELL_AUDIT_SETTINGS_VALUES` | `--audit-settings-values` | `server.audit.settingsValues` | `true` |
+
+A gateway that keeps the defaults needs no table. To be explicit, or to change one value, add the table. Unknown fields are rejected. Restart the gateway after changing it.
+
+```toml
+[openshell.gateway.audit]
+enabled             = true
+auth_success_events = false
+exec_args           = true
+settings_values     = true
+```
+
+The Helm chart renders the table only when a value differs from its default, so a rendered `gateway.toml` without the table means every toggle is at its default.
+
+## The Master Switch
+
+`enabled` governs every audit emission across all four event classes. That includes the system-actor events from background workers, detection findings, and the gateway's policy and service-endpoint config events. With it off, the gateway performs the same operations and records none of them. The gateway logs `gateway audit events disabled by configuration` at startup when it is off.
+
+Leave it on for any deployment that wants a governance trail. Turn it off only when audit is handled entirely elsewhere, or for a throwaway local gateway where the trail has no value.
+
+```toml
+[openshell.gateway.audit]
+enabled = false
+```
+
+```shell
+OPENSHELL_AUDIT_EVENTS=false openshell-gateway --config gateway.toml
+```
+
+When `enabled` is off, none of the toggles below have any effect.
+
+## The Authentication Ledger
+
+`auth_success_events` decides whether the gateway records successful authentications in addition to failed ones.
+
+Authentication failures are always emitted while audit is enabled. They are bounded in volume and high in value: a rejected credential or a missing client certificate is exactly what a security team wants to see. Successes are different. With the ledger on, the gateway emits one Authentication event for every authenticated request, which multiplies audit volume by the request rate.
+
+Turn it on when you want a complete authentication record, with every call attributed to a principal, a source address, and a correlation id, so a whole session reconstructs as a sequence. Accept the volume first. Leave it off, the default, when failures alone meet your needs.
+
+```toml
+[openshell.gateway.audit]
+auth_success_events = true
+```
+
+With the ledger off, a rejected request still produces:
+
+```text
+AUTHN:LOGON [MED] FAILED openid user:unknown from 10.0.0.9:51044 to openshell-gateway [reason:token expired]
+```
+
+With the ledger on, every accepted request additionally produces:
+
+```text
+AUTHN:LOGON [INFO] OK openid user:alice(oidc|alice-123) from 10.0.0.9:51044 to openshell-gateway
+```
+
+## Command-Line Depth
+
+`exec_args` decides whether a sandbox exec audit event records the full command line or only the binary name.
+
+By default, the record carries the complete argument vector, which shows what an agent actually ran. In some deployments, command lines carry secrets passed as arguments. For those, reduce the record to the binary name so the arguments never enter the trail.
+
+```toml
+[openshell.gateway.audit]
+exec_args = false
+```
+
+With `exec_args` on, `unmapped.command` carries the argument vector:
+
+```json
+"command": ["curl", "-H", "Authorization: Bearer <token>", "https://api.example.com"]
+```
+
+With `exec_args` off, it carries only the binary name:
+
+```json
+"command": "curl"
+```
+
+Environment variables, stdin, and terminal output never enter the record in either mode.
+
+## Settings Value Capture
+
+`settings_values` decides whether a settings-change audit event records the before and after values or only the changed key.
+
+By default, the record carries `unmapped.before` and `unmapped.after`, so the trail shows exactly what changed. Set it to `false` when settings values are sensitive and their names are enough for the audit.
+
+```toml
+[openshell.gateway.audit]
+settings_values = false
+```
+
+Regardless of this toggle, values under keys that look like credentials are always recorded as `[REDACTED]`. Turning value capture on cannot expose a credential-shaped setting.
+
+## Export and Format Controls
+
+The toggles above decide what the gateway records. The following settings decide how the records leave the box and what shape they take.
+
+### export_logs
+
+`export_logs`, in `[openshell.gateway.otlp]`, exports the gateway's logs, including every audit event, to the configured collector as OTLP log records. Without it, audit events stay on the box unless you ship the JSONL file.
+
+```toml
+[openshell.gateway.otlp]
+endpoint    = "http://otel-collector:4317"
+export_logs = true
+```
+
+### ocsf_full_payload
+
+`ocsf_full_payload`, also in the OTLP table, carries the structured OCSF document on each exported OCSF record. Gateway events, including audit events, carry it as one `ocsf.raw` JSON attribute plus `ocsf.severity_id`. It defaults to `true` and has no effect unless `export_logs` is set. Set it to `false` to export only the shorthand line and cut record size. The record's OTLP severity still follows the OCSF severity either way.
+
+```toml
+[openshell.gateway.otlp]
+export_logs       = true
+ocsf_full_payload = false
+```
+
+When a gateway OCSF JSONL file is configured with a `schema_version`, `ocsf.raw` is rendered at the same version, so the file and OTLP carry the same document.
+
+### OPENSHELL_OCSF_PUSH_FORMAT
+
+`OPENSHELL_OCSF_PUSH_FORMAT`, an environment variable on the sandbox supervisor, selects how the supervisor shapes OCSF events it pushes to the gateway. It applies to sandbox events, not to gateway audit events. The default sends the complete document as one `ocsf.raw` field plus `ocsf.severity_id`. `flat` spreads the document across flattened `ocsf.*` fields, which costs one field per leaf. Any other value keeps the default. See [Structured OCSF Fields](/observability/accessing-logs#structured-ocsf-fields).
+
+## Coarse Log Levels Do Not Disable Audit
+
+Audit events use the OCSF tracing target. The gateway OCSF JSONL file, OTLP log export, and sandbox log streams receive every OCSF event regardless of `RUST_LOG`, so a coarse `RUST_LOG=warn` quiets ordinary diagnostics without severing the audit trail. Only the gateway console follows the log filter.
+
+The supported way to turn audit off is the `enabled` toggle, not the log filter.
+
+## Precedence in Practice
+
+Because a flag beats an environment variable, which beats the file, you can set a baseline in configuration and override it per launch without editing the file. A gateway configured with `auth_success_events = false` can be started once with the ledger on for an investigation:
+
+```shell
+openshell-gateway --config gateway.toml --audit-auth-success-events true
+```
+
+The same override works through the environment for orchestrated deployments:
+
+```shell
+OPENSHELL_AUDIT_AUTH_SUCCESS_EVENTS=true openshell-gateway --config gateway.toml
+```
+
+## Next Steps
+
+- [Browse the event reference](/observability/audit-event-reference) to see what each toggle changes in a real record.
+- [Review OTLP log export](/how-it-works/gateways/configuration#otlp-log-export) for record attributes, delivery, and TLS.
+- [Return to the audit overview](/observability/gateway-audit) for how records surface and export.

@@ -1,0 +1,320 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Audit Event Reference"
+sidebar-title: "Audit Event Reference"
+description: "Every OpenShell gateway audit event by OCSF class, with shorthand and JSON examples and what each one is useful for."
+keywords: "Generative AI, Cybersecurity, Audit, OCSF, Reference, SIEM, Events"
+---
+
+This page catalogs every gateway audit event, grouped by OCSF class. Each group lists the operations it covers, shows a shorthand line and the OCSF document, and describes what the records are useful for. For how records surface and leave the box, see [Gateway Audit Events](/observability/gateway-audit). For the switches that change them, see [Audit Configuration](/observability/audit-configuration).
+
+## Read These Examples
+
+Each event has two forms. The shorthand is a single greppable line for humans and agents. The OCSF document is the JSON written to the [gateway OCSF JSONL file](/observability/ocsf-json-export) and exported as the `ocsf.raw` attribute when [OTLP log export](/how-it-works/gateways/configuration#otlp-log-export) is on. Both carry the same information.
+
+Documents use OCSF v1.8.0 by default. When the gateway JSONL file sets an older `schema_version`, the file and `ocsf.raw` carry the downgraded document. The examples use placeholder identities. In a real record, the actor is the authenticated principal and identifiers are the gateway's own resource ids.
+
+Severity encodes how much attention a record deserves, and sets the exported record's OTLP severity so a collector can filter on it.
+
+| Severity | Applies to |
+|---|---|
+| Informational | Successful operations |
+| Low | Failed mutations, including no-op deletes |
+| Medium | Authentication failures |
+| High | Detection findings |
+
+## Entity Management (3004)
+
+Entity Management records the creation, update, and deletion of control-plane resources. Each event names the resource type, its identity, the activity, and the outcome.
+
+| Operation | Activity | Entity type |
+|---|---|---|
+| Create, delete workspace | Create, Delete | `workspace` |
+| Add, remove workspace member | Create, Delete | `workspace_member` (OCSF type `User`) |
+| Create, update, delete provider | Create, Update, Delete | `provider` |
+| Import, update, delete provider profile | Create, Update, Delete | `provider_profile` |
+| Configure, delete credential refresh | Update, Delete | `provider_refresh` |
+| Rotate provider credential | Update | `credential` |
+| Create, delete sandbox | Create, Delete | `sandbox` |
+| Start, stop sandbox; attach, detach provider | Update | `sandbox` |
+| Exec, interactive exec, tcp forward | Update | `sandbox` |
+| Create, revoke ssh session | Create, Delete | `ssh_session` |
+| Issue, refresh sandbox token | Create, Update | `sandbox_token` |
+
+Updates to a sandbox name the operation in `unmapped.operation`: `start`, `stop`, `attach_provider`, `detach_provider`, `exec`, or `forward`. Events about a sandbox carry it in `container`, and event-specific context such as `workspace`, `provider_type`, or a tcp forward `target` travels in `unmapped`.
+
+The outcome is judged on the store's actual result. A delete or revoke that matched nothing records as a `Failure`, so a no-op is never mistaken for a state change.
+
+A workspace creation, in shorthand:
+
+```text
+ENTITY:CREATE [INFO] workspace "team-a" by alice(oidc|alice-123)
+```
+
+The same event as an OCSF document:
+
+```json
+{
+  "activity_id": 1,
+  "activity_name": "Create",
+  "actor": {
+    "user": { "name": "alice", "type": "User", "type_id": 1, "uid": "oidc|alice-123" }
+  },
+  "category_name": "Identity & Access Management",
+  "category_uid": 3,
+  "class_name": "Entity Management",
+  "class_uid": 3004,
+  "device": {
+    "hostname": "openshell-gateway-0",
+    "name": "openshell",
+    "os": { "name": "Linux" },
+    "type": "Server",
+    "type_id": 1,
+    "uid": "openshell"
+  },
+  "entity": {
+    "name": "team-a",
+    "type": "workspace",
+    "type_id": 99,
+    "uid": "e6f20269-bb3c-4b73-8a26-81fd692f6222"
+  },
+  "message": "workspace team-a created",
+  "metadata": {
+    "product": { "name": "OpenShell Gateway", "vendor_name": "OpenShell", "version": "0.1.3" },
+    "profiles": ["security_control", "container", "host"],
+    "uid": "f70e2854-89ea-48fe-acc9-8cabccfe52cc",
+    "version": "1.8.0"
+  },
+  "severity": "Informational",
+  "severity_id": 1,
+  "status": "Success",
+  "status_id": 1,
+  "time": 1790899372014,
+  "type_name": "Entity Management: Create",
+  "type_uid": 300401,
+  "unmapped": { "request_id": "08d7f59e-0e80-4773-af75-bb429b9a4ed0" }
+}
+```
+
+An exec session carries the command line in `unmapped.command`, subject to the `exec_args` toggle:
+
+```text
+ENTITY:UPDATE [INFO] sandbox "agent-01" by alice(oidc|alice-123)
+```
+
+```json
+"container": { "name": "agent-01", "uid": "4a1c9e52-6f0b-4d0e-9a51-0c6f3b2d7e10" },
+"message": "exec python3 accepted in sandbox agent-01",
+"unmapped": {
+  "command": ["python3", "train.py", "--epochs", "10"],
+  "operation": "exec",
+  "request_id": "c4bd8b4f-b409-4537-a244-8dab46c78ee6",
+  "workspace": "default"
+}
+```
+
+Interactive exec sessions also carry `"interactive": true`.
+
+What these records are useful for:
+
+- Answering who created, changed, or removed any control-plane resource, and when, from the trail alone.
+- Capacity and cost planning from sandbox lifecycle records: how many sandboxes, how long they live, and how often they restart.
+- Understanding agent behavior from exec records: which tools and commands agents run, which informs what to preinstall in the base image.
+- Confirming that provider and credential changes were made by the expected principals.
+
+## Device Config State Change (5019)
+
+Device Config State Change records transitions in configuration and policy: what sandboxes and the gateway are allowed to do, and how that changed. The state label is in `state` and in the shorthand.
+
+| Operation | State label |
+|---|---|
+| Update or delete a global or sandbox setting | `setting_updated`, `setting_deleted` |
+| Replace a sandbox or global policy | `updated` |
+| Merge an incremental policy change | `merged` |
+| Submit a policy analysis from a sandbox | `draft_submitted` |
+| Approve, reject, or edit a draft chunk | `approved`, `rejected`, `edited` |
+| Undo an approved chunk, clear pending drafts | `removed`, `cleared` |
+| Modify a request through a gateway interceptor | `request_modified` |
+| Expose or delete a service endpoint | `service_endpoint_created`, `service_endpoint_updated`, `service_endpoint_deleted` |
+
+A settings update names the scope and key, and captures the before and after values in `unmapped.before` and `unmapped.after`, subject to the `settings_values` toggle:
+
+```text
+CONFIG:SETTING_UPDATED [INFO] global setting proposal_approval_mode updated by alice(oidc|alice-123)
+```
+
+A policy replacement records the new version and hash:
+
+```text
+CONFIG:UPDATED [INFO] sandbox policy replaced for agent-01 [version:v2 hash:<policy-hash>] by alice(oidc|alice-123)
+```
+
+When a gateway interceptor rewrites a request before it reaches the handler, a companion record marks it. It is correlated to the handler's own event by `request_id`, so an interceptor-modified mutation is distinguishable from an unmodified one:
+
+```text
+CONFIG:REQUEST_MODIFIED [INFO] gateway interceptor(s) policy-guard modified /openshell.v1.OpenShell/UpdateConfig by alice(oidc|alice-123)
+```
+
+What these records are useful for:
+
+- Tracking policy drift over time: every widening or tightening of what a sandbox can reach, attributed and timestamped.
+- Capturing an agent's own reasoning about the access it needs. Draft-policy submissions record what a sandbox proposed, and approval records show who accepted it.
+- Distinguishing an operator-driven change from an interceptor-driven one, so an automated request transform is never invisible in the trail.
+
+## Authentication (3002)
+
+Authentication records outcomes at the authenticator boundary. Failures are always emitted while audit is enabled. Successes are emitted only with the `auth_success_events` toggle on. Authentication events are gateway-scoped and name the gateway as the target `service`.
+
+A failure carries the mechanism, a low-cardinality reason, the peer address, and the gateway-authored status detail. It never carries the credential.
+
+```text
+AUTHN:LOGON [MED] FAILED openid user:unknown from 10.0.0.9:51044 to openshell-gateway [reason:token expired]
+```
+
+```json
+"auth_protocol": "OpenID",
+"auth_protocol_id": 4,
+"service": { "name": "openshell-gateway", "uid": "openshell", "version": "0.1.3" },
+"src_endpoint": { "ip": "10.0.0.9", "port": 51044 },
+"status": "Failure",
+"status_detail": "token expired",
+"unmapped": {
+  "mechanism": "bearer",
+  "path": "/openshell.v1.OpenShell/ListSandboxes",
+  "reason": "rejected_credential"
+},
+"user": { "name": "unknown", "type": "Unknown", "type_id": 0 }
+```
+
+`unmapped.reason` is drawn from a small, stable set so a dashboard can group on it.
+
+| Reason | Meaning |
+|---|---|
+| `rejected_credential` | An authenticator rejected the presented credential as invalid, expired, or unknown. |
+| `authenticator_error` | The authenticator could not reach its backing service, such as a key-set refresh or token review. |
+| `missing_credentials` | No credential was presented on an authenticated method. |
+| `missing_client_certificate` | mTLS is required and no client certificate was presented. |
+| `anonymous` | An anonymous caller reached an authenticated method. |
+
+Infrastructure faults report `authenticator_error`, distinct from `rejected_credential`, so an identity-provider outage does not read as a wave of credential rejections. The exact mechanism (`bearer`, `mtls`, `local_dev`, or `none`) travels in `unmapped.mechanism`, because the OCSF protocol vocabulary is coarse.
+
+With the ledger on, a successful authentication records the mechanism, the principal, and the source address:
+
+```text
+AUTHN:LOGON [INFO] OK openid user:alice(oidc|alice-123) from 10.0.0.9:51044 to openshell-gateway
+```
+
+What these records are useful for:
+
+- Detecting credential-stuffing and brute-force patterns from a rising rate of `rejected_credential`.
+- Separating an identity-provider outage from an attack, because the two carry different reasons.
+- Reconstructing a full session, with the ledger on, by joining success events on `request_id` to the operations they authorized.
+
+A caller cannot suppress a failure record, and an unauthenticated caller can generate failures at request rate. Under a sustained flood, the bounded OTLP export queue sheds load and accounts for it with a `telemetry_gap` record. Alert on `telemetry_gap`, and rate-limit upstream if the gateway is internet-exposed.
+
+## Detection Finding (2004)
+
+Detection Finding escalates a suspicious pattern into an alert-grade record, dual-emitted alongside the denial that the pattern already produced. The denial remains the primary record; the finding is the escalation for monitoring. Findings are about the offending sandbox, so they carry it in `container.uid` and also appear in its log stream.
+
+| Trigger | Finding uid | Title |
+|---|---|---|
+| A sandbox principal addresses a sandbox it does not own | `OSGW-CROSS-SANDBOX` | Cross-sandbox access attempt |
+| A sandbox principal switches `sandbox_id` mid-stream on a log push | `OSGW-CROSS-SANDBOX` | Cross-sandbox access attempt |
+| A sandbox principal calls a user or admin API | `OSGW-SANDBOX-ADMIN-ATTEMPT` | Sandbox principal attempted admin operation |
+
+Findings carry High severity and set `is_alert`:
+
+```text
+FINDING:CREATE [HIGH] "Cross-sandbox access attempt" [type:OSGW-CROSS-SANDBOX]
+```
+
+```json
+"class_uid": 2004,
+"class_name": "Detection Finding",
+"evidences": [
+  { "data": { "principal_sandbox_id": "sb-a", "requested_sandbox_id": "sb-b" } }
+],
+"finding_info": {
+  "desc": "a sandbox principal addressed a sandbox it does not own",
+  "title": "Cross-sandbox access attempt",
+  "uid": "OSGW-CROSS-SANDBOX"
+},
+"is_alert": true,
+"message": "cross-sandbox access denied: sb-a addressed sb-b",
+"severity": "High",
+"severity_id": 4
+```
+
+What these records are useful for:
+
+- Real-time alerting on boundary violations, keyed on `is_alert` and the High severity.
+- Catching the subtle variant of a cross-boundary attempt, where a principal authenticates as one sandbox and then switches identity mid-stream.
+- Feeding a detection pipeline a normalized, standard-schema signal rather than a bespoke log search.
+
+Routine authorization denials, such as a user calling a method their workspace role does not permit, stay ordinary log lines. They are a governance noise floor, not findings.
+
+## System Actor Events
+
+State changes that no request drives are attributed to a system actor named `system:<component>`, so a timer-driven or reconciliation-driven change appears in the same trail as a request-driven one.
+
+| Actor | Emits when |
+|---|---|
+| `system:provider-refresh` | A background worker rotates a provider credential on its schedule |
+| `system:compute-reconcile` | Reconciliation removes a sandbox or marks it `Error` after its backend diverges |
+| `system:gateway-startup` | The gateway creates the default workspace at startup |
+
+An out-of-band sandbox removal, detected by reconciliation:
+
+```text
+ENTITY:DELETE [INFO] sandbox "agent-01" by system:compute-reconcile
+```
+
+A scheduled credential rotation that failed:
+
+```text
+ENTITY:UPDATE [LOW] FAILED credential "acme/API_KEY" by system:provider-refresh
+```
+
+What these records are useful for:
+
+- Detecting out-of-band changes. A sandbox removed directly from the backend, outside the API, produces a reconcile-delete record.
+- Auditing automated credential rotation on the same trail as manual rotation, so the timer-driven path is never a blind spot.
+- Confirming first-boot provisioning.
+
+## Field Reference
+
+Fields common to every audit event:
+
+| Field | Meaning |
+|---|---|
+| `class_uid`, `class_name` | The OCSF event class. |
+| `activity_id`, `activity_name` | Create, Update, Delete, Logon, or Log. |
+| `time` | Outcome time, epoch milliseconds. |
+| `status_id`, `status` | `Success` or `Failure`. Findings carry no status. |
+| `severity_id`, `severity` | Informational, Low, Medium, or High. |
+| `message` | Greppable summary. Authentication events carry `status_detail` instead. |
+| `actor.user` | The authenticated principal, with `name`, `uid`, and `type`. Authentication events use `user`. |
+| `entity` | For Entity Management, the resource `type`, `uid`, and `name`. |
+| `container` | The sandbox the event is about. Absent on gateway-scoped events. |
+| `device` | The gateway: `name` and `uid` are the gateway name, `hostname` is the replica. |
+| `unmapped.request_id` | Request correlation id. |
+| `unmapped.*` | Event-specific fields, such as `operation`, `command`, `workspace`, `scope`, and `reason`. |
+
+Attributes on the exported OTLP log record:
+
+| Attribute | Meaning |
+|---|---|
+| `sandbox.id` | Present on events about a sandbox; absent on gateway-scoped events. |
+| `log.source` | `gateway` for audit events. |
+| `log.target` | `ocsf` for audit events. |
+| `log.level` | `OCSF` for audit events. The OTLP severity number follows the OCSF severity. |
+| `log.ocsf` | `true` for OCSF events. |
+| `ocsf.severity_id` | The OCSF severity. Present when `ocsf_full_payload` is on. |
+| `ocsf.raw` | The full OCSF document. Present when `ocsf_full_payload` is on. |
+
+## Next Steps
+
+- [Return to the audit overview](/observability/gateway-audit) for how records surface and export.
+- [Tune the toggles](/observability/audit-configuration) to change what these records carry.
+- [Review the gateway configuration reference](/how-it-works/gateways/configuration#gateway-audit) for the exact settings.

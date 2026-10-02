@@ -238,6 +238,29 @@ fails discovery within its control-request deadline. Permanent
 gateway errors and exhausted transient retries terminate startup; inspect those
 errors as connectivity, authorization, or lifecycle failures.
 
+OpenTelemetry export is diagnostic and never blocks startup or serving. The
+`[openshell.gateway.otlp]` table (Helm `server.otlp.*`) decides whether and
+where to export: `endpoint` turns on trace export, `export_logs = true`
+additionally ships gateway logs, sandbox-pushed logs and every OCSF event
+(including gateway audit events) as OTLP log records, and `ocsf_full_payload`
+(default true) carries the OCSF document as `ocsf.raw`. Collector
+authentication comes from `OTEL_EXPORTER_OTLP_HEADERS` or
+`OTEL_EXPORTER_OTLP_LOGS_HEADERS` in the gateway environment. A malformed
+endpoint only logs `OTLP exporting is configured but could not be started;
+continuing without it`, and an unreachable collector only produces export
+errors, so look in gateway logs rather than expecting a startup crash.
+
+```shell
+rg -n 'otlp|endpoint|export_logs|ocsf_full_payload' /etc/openshell/gateway.toml
+curl -s http://<metrics_bind_address>/metrics | rg 'openshell_otlp_log_|openshell_sandbox_log_push_dropped'
+```
+
+Gateway audit events are on by default. The `[openshell.gateway.audit]` table
+(Helm `server.audit.*`) controls them, and each field also has an
+`OPENSHELL_AUDIT_*` env var and `--audit-*` flag; precedence is flag > env >
+TOML > default. Helm renders the table only when a toggle differs from its
+default, so its absence from `gateway.toml` means defaults.
+
 ### Step 4: Check Docker-Backed Gateways
 
 ```bash
@@ -946,6 +969,7 @@ credential failures.
 | `openshell status` fails | Gateway endpoint unreachable or auth mismatch | `openshell gateway info`, gateway logs |
 | Gateway OCSF JSONL stops growing, has gaps, or is rejected by a SIEM | File errors, queue pressure, shipper falling behind retention, or a schema mismatch | Inspect gateway warnings and `openshell_ocsf_log_*` metrics; check `[openshell.gateway.ocsf_log]`, `schema_version`, directory permissions, free space, per-replica paths, and shipper rotation checkpoints. See the published [gateway configuration reference](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration). |
 | Expected gateway audit events (workspace, provider, sandbox, policy, authentication) are missing | `[openshell.gateway.audit] enabled = false`, `OPENSHELL_AUDIT_EVENTS=false`, `--audit-events false`, or Helm `server.audit.enabled: false`; authentication successes additionally need `auth_success_events` | Check the startup log line `gateway audit events disabled by configuration`, the rendered `gateway.toml`, and the gateway environment. Audit events are gateway OCSF events: confirm them in the `[openshell.gateway.ocsf_log]` file, since a coarse `RUST_LOG` hides them only on the console. |
+| OTLP collector receives traces but no logs, or logs stop arriving | `export_logs` not set, collector rejecting log records (auth headers, payload size), or the export queue dropping under a collector outage | Check `export_logs` in the rendered `gateway.toml`, gateway errors from the OTLP log exporter, and `openshell_otlp_log_dropped_total{reason}` / `openshell_otlp_log_export_errors_total`. Search the collector for `telemetry_gap` records, which carry the `dropped` count. Sandbox push loss shows as `openshell_sandbox_log_push_dropped_total{reason}`. |
 | `BatchSpanProcessor.ExportError` repeatedly reports connection refused on `127.0.0.1:4317` | The local gateway started with OTLP configured but the collector forwarding task later stopped, or the config was created manually | Restart `gateway:docker`, `gateway:podman`, or `gateway:vm` so it re-detects the listener; inspect the generated `gateway.toml` for `[openshell.gateway.otlp]` |
 | Gateway starts but sandbox create fails | Compute driver cannot reach runtime | Docker/Podman/Kubernetes/VM driver logs |
 | Docker or Podman sandbox never registers | Wrong gateway endpoint, unavailable host networking, or supervisor startup failure | Gateway logs and supervisor container logs |

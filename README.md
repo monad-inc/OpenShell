@@ -46,6 +46,7 @@ The installer sets up the CLI and a local gateway. The default sandbox image is 
 - [Gateways](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/overview): the control plane for sandboxes, policy, and access.
 - [Kubernetes](https://docs.nvidia.com/openshell/latest/kubernetes/setup): deploy the gateway with Helm. Your CNI must enforce `NetworkPolicy`.
 - [Extensibility](https://docs.nvidia.com/openshell/latest/extensibility/overview): middleware, interceptors, and compute drivers.
+- [Observability](docs/observability/logging.mdx): sandbox logging, [gateway audit events](docs/observability/gateway-audit.mdx), and OTLP export of logs and OCSF events to your own collector.
 - [Tutorials](https://docs.nvidia.com/openshell/latest/tutorials/first-network-policy): step-by-step policy and agent walkthroughs.
 - [Prerelease and development builds](https://docs.nvidia.com/openshell/latest/about/installation#prerelease-and-development-builds): try an upcoming release or the latest commit on `main`.
 

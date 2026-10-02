@@ -263,8 +263,23 @@ Inside the sandbox, logs are written to `/var/log/`:
 
 Both files rotate daily and retain the 3 most recent files to bound disk usage.
 
+## Export Logs with OTLP
+
+The supervisor also pushes each sandbox log line to the gateway, which keeps a bounded in-memory tail for `openshell logs` and the TUI. To retain sandbox logs and OCSF events off the box without shipping files, enable OTLP log export on the gateway:
+
+```toml
+[openshell.gateway.otlp]
+endpoint    = "http://otel-collector.observability.svc:4317"
+export_logs = true
+```
+
+The gateway then exports every line its sandboxes push, together with its own logs and [gateway audit events](/observability/gateway-audit), as OTLP/gRPC log records to the same collector that receives its traces. Sandbox lines carry `log.source = "sandbox"` and `sandbox.id`. OCSF lines carry the shorthand as the record body and, by default, the full OCSF document in `ocsf.raw`, so a SIEM can parse the structured event without reading the shorthand. Authenticate to a hosted collector with `OTEL_EXPORTER_OTLP_HEADERS`. For Helm installations, set `server.otlp.endpoint` and `server.otlp.exportLogs: true`.
+
+Delivery is accountable rather than lossless. When the push channel from a sandbox or the gateway's export queue drops lines, a `telemetry_gap` record with the `dropped` count reports the loss downstream. The log files inside the sandbox remain the complete record. See [Push Channel Loss Accounting](/observability/accessing-logs#push-channel-loss-accounting) and [OTLP Log Export](/how-it-works/gateways/configuration#otlp-log-export) for the bounds, metrics, and record attributes.
+
 ## Next Steps
 
 - [Access logs](/observability/accessing-logs) through the CLI, TUI, or sandbox filesystem.
 - [Enable OCSF JSON export](/observability/ocsf-json-export) for SIEM integration and compliance.
+- Read about [gateway audit events](/observability/gateway-audit), the control-plane trail that complements these per-sandbox logs.
 - Learn about [network policies](/how-it-works/policies/overview) that generate these events.

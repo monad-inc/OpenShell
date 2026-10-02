@@ -3,13 +3,15 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Gateway Audit Events"
 sidebar-title: "Gateway Audit"
-description: "The OCSF audit trail the OpenShell gateway emits for control-plane changes, authentication decisions, and suspicious authorization patterns, and the toggles that tune it."
-keywords: "Generative AI, Cybersecurity, Audit, OCSF, Observability, Gateway, SIEM"
+description: "The OCSF audit trail the OpenShell gateway emits for control-plane changes, authentication decisions, and suspicious authorization patterns, and how to get it off the box."
+keywords: "Generative AI, Cybersecurity, Audit, OCSF, Observability, Gateway, SIEM, OTLP"
 ---
 
-The OpenShell gateway emits a structured audit event for every state-changing operation it performs. Creating a workspace, rotating a credential, replacing a policy, opening an exec session, or rejecting a credential each produces one OCSF record. The record names the authenticated principal, the outcome, and a correlation id that ties it back to the request.
+The OpenShell gateway emits a structured audit event for every state-changing operation it performs. Creating a workspace, rotating a credential, replacing a policy, opening an exec session, or rejecting a credential each produces one [OCSF](https://ocsf.io) record. The record names the authenticated principal, the outcome, and a correlation id that ties it back to the request. Any OCSF-aware collector or SIEM reads the records without a custom parser.
 
-Gateway audit events describe changes to the control plane. Per-sandbox events, such as network connections and process lifecycle, are covered in [Sandbox Logging](/observability/logging). Audit events are on by default.
+Gateway audit events describe changes to the control plane that governs every sandbox. Per-sandbox events, such as network connections and process lifecycle, are covered in [Sandbox Logging](/observability/logging). Audit events are on by default.
+
+The [Audit Configuration](/observability/audit-configuration) page documents every toggle, and the [Audit Event Reference](/observability/audit-event-reference) catalogs every event with examples.
 
 ## What Gets Audited
 
@@ -19,7 +21,7 @@ Four OCSF event classes cover the surface.
 |---|---|---|
 | Entity Management (3004) | Resource create, update, and delete | Workspaces, workspace members, providers, provider profiles, provider refresh, credentials, sandboxes, sandbox provider attach and detach, ssh sessions, exec and tcp forward sessions, sandbox token issue and refresh |
 | Device Config State Change (5019) | Configuration and policy transitions | Settings updates, global and sandbox policy replacement, incremental merges, draft-policy submit, approve, reject, edit, undo and clear, service endpoint expose and delete, interceptor-modified requests |
-| Authentication (3002) | Outcomes at the authenticator boundary | Rejected or missing credentials, failed mTLS, anonymous callers, and, behind a toggle, every successful authentication |
+| Authentication (3002) | Outcomes at the authenticator boundary | Rejected or missing credentials, missing client certificates, anonymous callers, and, behind a toggle, every successful authentication |
 | Detection Finding (2004) | Suspicious patterns | A sandbox addressing another sandbox (including a mid-stream `sandbox_id` switch on log push), a sandbox principal calling a user or admin API |
 
 Background work also changes state. Timer-driven credential rotation, reconciliation that removes or fails a sandbox after its backend changes, and creation of the default workspace at startup each emit an Entity Management event attributed to a system actor named `system:<component>`.
@@ -28,11 +30,38 @@ Read and list RPCs are not audited. Exec and SSH session input and output never 
 
 ## Where Records Appear
 
-Audit events are gateway-origin OCSF events. Every gateway OCSF consumer receives them:
+Audit events are gateway-origin OCSF events, so every gateway OCSF consumer receives them. None of these consumers needs audit-specific configuration.
 
-- The gateway console prints each event as a shorthand line. The console follows `RUST_LOG`, so a coarse filter can hide these lines without stopping the other sinks.
-- The `[openshell.gateway.ocsf_log]` JSONL file records every audit event, including events without a sandbox. See [OCSF JSON Export](/observability/ocsf-json-export).
-- Events about a sandbox also appear in that sandbox's log stream (`openshell logs`, `WatchSandbox`).
+| Destination | Configuration | What it holds |
+|---|---|---|
+| Gateway console | None | One shorthand line per event. The console follows `RUST_LOG`, so a coarse filter can hide these lines without stopping the other sinks. |
+| Sandbox log stream | None | Events about a sandbox, through `openshell logs` and `WatchSandbox`. |
+| Gateway OCSF JSONL file | `[openshell.gateway.ocsf_log]` | Every audit event as one OCSF JSON object per line, including events without a sandbox. See [OCSF JSON Export](/observability/ocsf-json-export). |
+| OTLP collector | `[openshell.gateway.otlp]` with `export_logs = true` | Every audit event as an OTLP log record, alongside the gateway's other logs and the sandbox logs. |
+
+The JSONL file and OTLP export capture every OCSF event regardless of `RUST_LOG`. Use the `enabled` toggle, not the log filter, to turn audit off.
+
+## Export the Trail Off the Box
+
+The console and the in-memory log stream are enough for local inspection, but they live and die with the process. To retain and analyze the trail, write it to the JSONL file and ship that file, or export it straight to an OpenTelemetry collector. The two sinks are independent and can run together.
+
+To export over OTLP, add `export_logs` to the OTLP table. Log records use the same endpoint and resource attributes as gateway traces:
+
+```toml
+[openshell.gateway.otlp]
+endpoint    = "http://otel-collector.observability.svc:4317"
+export_logs = true
+```
+
+Each OCSF record carries the shorthand line as its body and the full OCSF document in the `ocsf.raw` attribute. Set `ocsf_full_payload = false` to export only the shorthand. Authenticate to a hosted collector with the standard OpenTelemetry header variable:
+
+```shell
+OTEL_EXPORTER_OTLP_HEADERS="authorization=Bearer <token>"
+```
+
+Export is accountable rather than lossless. Records that the gateway cannot deliver are counted and reported downstream as a `telemetry_gap` record, so alert on that record in the collector. For Helm installations, set `server.otlp.endpoint` and `server.otlp.exportLogs: true`. See [OTLP Log Export](/how-it-works/gateways/configuration#otlp-log-export) for record attributes, queue bounds, retries, metrics, and TLS.
+
+## Read a Record
 
 Events about a sandbox carry its id in `container.uid`. Gateway-scoped events, such as workspace changes and authentication outcomes, carry no `container` object. Every event names the gateway as the device (`device.type` is `Server`, `device.name` is the gateway name) and `metadata.product.name` is `OpenShell Gateway`. `metadata.uid` is a fresh identifier per event, not a sandbox id.
 
@@ -42,16 +71,17 @@ The shorthand form reads as `CLASS:ACTIVITY [SEVERITY] outcome subject by actor`
 ENTITY:CREATE [INFO] workspace "team-a" by alice(oidc|alice-123)
 ENTITY:UPDATE [LOW] FAILED credential "acme/API_KEY" by system:provider-refresh
 CONFIG:SETTING_UPDATED [INFO] global setting proposal_approval_mode updated by alice(oidc|alice-123)
-AUTHN:LOGON [MED] FAILED openid user:unknown from 10.0.0.9:51044 to openshell-gateway
+AUTHN:LOGON [MED] FAILED openid user:unknown from 10.0.0.9:51044 to openshell-gateway [reason:token expired]
+FINDING:CREATE [HIGH] "Cross-sandbox access attempt" [type:OSGW-CROSS-SANDBOX]
 ```
 
 The actor renders as `name(uid)`. A display name can be a self-asserted claim, so the stable identity travels with it.
 
-## Anatomy of an Audit Event
+Every audit event carries a common set of fields.
 
 | Field | Meaning |
 |---|---|
-| `actor.user` | The authenticated principal, taken from the session and never from the request body. An OIDC subject or certificate identity for users, `sandbox:<id>` for sandbox principals, `peer:<replica>` for gateway peers, and `system:<component>` for background work. Authentication events carry it as `user`. |
+| `actor.user` | The authenticated principal, taken from the session and never from the request body. An OIDC subject or certificate identity for users, `sandbox:<id>` for sandbox principals, `peer:<replica>` for gateway peers, `anonymous` for unauthenticated callers on a permissive gateway, and `system:<component>` for background work. Authentication events carry it as `user`. |
 | `entity` | For Entity Management events, the resource: `type` names it (`workspace`, `provider`, `sandbox`, `ssh_session`, ...), with its `uid` and `name` when known. Workspace members are OCSF `User` entities. |
 | `status` | `Success` or `Failure`. A mutation that changed nothing, such as deleting a resource that was already gone, records as `Failure`. |
 | `severity_id` | `Informational` for successes, `Low` for failed mutations, `Medium` for authentication failures, and `High` for findings. |
@@ -61,28 +91,20 @@ Secrets never enter a record. Credential values, refresh material, minted tokens
 
 Authorization denials by an authorized caller are not mutation failures. A routine workspace RBAC denial produces no Entity Management event; it remains a plain status and log line.
 
-## Toggles
+## Turn It Off
 
-The `[openshell.gateway.audit]` table, environment variables, and command-line flags control audit events. The gateway resolves them in this order, highest first: flag, environment variable, configuration file, built-in default.
-
-| Setting | Environment variable | Flag | Default | Effect |
-|---|---|---|---|---|
-| `enabled` | `OPENSHELL_AUDIT_EVENTS` | `--audit-events` | `true` | Master switch for every gateway audit event, including findings and the gateway's policy and service-endpoint config events. |
-| `auth_success_events` | `OPENSHELL_AUDIT_AUTH_SUCCESS_EVENTS` | `--audit-auth-success-events` | `false` | Also emit an Authentication event for every authenticated request. Failures are always emitted; successes multiply volume by the request rate. |
-| `exec_args` | `OPENSHELL_AUDIT_EXEC_ARGS` | `--audit-exec-args` | `true` | Record the full exec command line. Set `false` to record only the binary name when arguments may carry secrets. |
-| `settings_values` | `OPENSHELL_AUDIT_SETTINGS_VALUES` | `--audit-settings-values` | `true` | Record before and after values of changed settings. Set `false` to record key names only. |
+One switch silences every audit emission. The audited operations run unchanged.
 
 ```toml
 [openshell.gateway.audit]
-enabled             = true
-auth_success_events = false
-exec_args           = true
-settings_values     = true
+enabled = false
 ```
 
-On Kubernetes, set the Helm values `server.audit.enabled`, `server.audit.authSuccessEvents`, `server.audit.execArgs`, and `server.audit.settingsValues`.
+The same switch is available as `OPENSHELL_AUDIT_EVENTS=false`, `--audit-events false`, or the Helm value `server.audit.enabled: false`. See [Audit Configuration](/observability/audit-configuration) for the finer toggles that tune volume and sensitivity without turning the trail off.
 
 ## Next Steps
 
-- [Enable the gateway OCSF JSONL file](/observability/ocsf-json-export) to retain the trail.
-- [Review the gateway configuration reference](/how-it-works/gateways/configuration#gateway-audit).
+- [Configure audit toggles](/observability/audit-configuration) to tune what each record carries.
+- [Browse the event reference](/observability/audit-event-reference) for every event and what it is useful for.
+- [Enable the gateway OCSF JSONL file](/observability/ocsf-json-export) to retain the trail on disk.
+- [Review the gateway configuration reference](/how-it-works/gateways/configuration#gateway-audit) for the exact settings.
