@@ -11,20 +11,23 @@
 # supervisor, and sandbox-runtime images alike, keeping them one build.
 global:
   image:
+    # Monad's OpenShell build (monad/main, see MONAD.md), not upstream's images.
+    # Private: the `ghcr-monad` pull secret below must exist in this namespace.
+    registry: ghcr.io/monad-inc
     # Chart appVersion is 0.0.0 (dev placeholder), so a tag must be given.
     #
-    # PIN IT. `latest` is not a version: this deployment silently upgraded itself
-    # when the pod restarted and re-pulled, which removed the `providers_v2_enabled`
-    # setting and left the gateway a different build from the pinned CLI in the
-    # launcher image. The symptom was a corrupted workspace name on the wire
-    # ("workspace '\n\roncall-triage' not found") — a wire-format mismatch, not a
-    # workspace problem. Keep this tag and the launcher's OPENSHELL_VERSION equal.
-    #
-    # Still 0.1.1 from the pre-v0.1.3 deployment. Point it (and the launcher's
-    # OPENSHELL_VERSION) at the internal v0.1.3 build before redeploying: this
-    # chart expects the gateway, supervisor, and sandbox images of one build.
-    tag: "0.1.1"
+    # PIN IT to an immutable `sha-` tag. A moving tag let this deployment silently
+    # upgrade itself when the pod restarted and re-pulled, which left the gateway a
+    # different build from the CLI in the launcher image. The symptom was a
+    # corrupted workspace name on the wire ("workspace '\n\roncall-triage' not
+    # found") — a wire-format mismatch, not a workspace problem. Keep this tag and
+    # the launcher's OPENSHELL_CLI_IMAGE tag equal.
+    tag: "sha-a67777d0c7be"
     pullPolicy: IfNotPresent
+
+# Gateway pods.
+imagePullSecrets:
+  - name: ghcr-monad
 
 workload:
   kind: statefulset
@@ -54,9 +57,12 @@ server:
   # not clear it. Moving the database file gives the new gateway a clean store
   # without deleting the volume. Bump the suffix on a future incompatible
   # upgrade, or migrate deliberately.
-  dbUrl: "sqlite:/var/openshell/openshell-0.1.1.db"
+  dbUrl: "sqlite:/var/openshell/openshell-0.1.3-monad.db"
   # Sandbox pods land in the release namespace.
   sandboxNamespace: ""
+  # Sandbox pods (supervisor + sandbox runtime) pull Monad's private images too.
+  sandboxImagePullSecrets:
+    - name: ghcr-monad
   # Local-only: plaintext gRPC over a port-forward.
   disableTls: true
   auth:

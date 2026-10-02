@@ -208,8 +208,16 @@ v1.0.0 serves `v1beta1`, which the chart accepts.
 
 ### 2. Install the gateway
 
+The gateway, supervisor, sandbox runtime, and launcher CLI all come from Monad's
+private OpenShell build (`ghcr.io/monad-inc/openshell/*`, see `MONAD.md`), so the
+namespace needs a pull secret first. Use a GitHub token with `read:packages`.
+
 ```shell
 kubectl --kubeconfig ~/.kube/config --context kind-kind create namespace openshell-experiments
+
+kubectl --kubeconfig ~/.kube/config --context kind-kind -n openshell-experiments \
+  create secret docker-registry ghcr-monad \
+  --docker-server=ghcr.io --docker-username=<github-user> --docker-password="$GITHUB_TOKEN"
 
 helm --kubeconfig ~/.kube/config --kube-context kind-kind \
   upgrade --install openshell deploy/helm/openshell \
@@ -220,13 +228,13 @@ helm --kubeconfig ~/.kube/config --kube-context kind-kind \
 
 Notes on the values, both learned the hard way:
 
-- **`global.image.tag` must be set.** The chart's `appVersion` is the `0.0.0`
-  dev placeholder, so the default tag resolves to an image that does not exist.
-  Before v0.1.3 this was `image.tag`; Helm ignores the old key silently, so a
-  stale values file falls back to `0.0.0` without an error. The tag must name a
-  build of this branch: the v0.1.3 chart also renders the separate
-  `openshell/supervisor` and `openshell/sandbox` images from RFC 0012, which
-  pre-0.1.3 releases did not publish.
+- **`global.image.tag` must be set, to a `sha-` tag of a `monad/main` build.**
+  The chart's `appVersion` is the `0.0.0` dev placeholder, so the default tag
+  resolves to an image that does not exist. Before v0.1.3 this was `image.tag`;
+  Helm ignores the old key silently, so a stale values file falls back to `0.0.0`
+  without an error. Keep it equal to the tag in the launcher's
+  `OPENSHELL_CLI_IMAGE`, and run `docker login ghcr.io` before building the
+  launcher image.
 - **`pkiInitJob.enabled` must stay `true` even with `server.disableTls: true`.**
   The certgen pre-install hook is gated on
   `pkiInitJob.enabled || certManager.enabled`, and it creates the sandbox JWT
