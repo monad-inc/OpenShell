@@ -220,8 +220,13 @@ helm --kubeconfig ~/.kube/config --kube-context kind-kind \
 
 Notes on the values, both learned the hard way:
 
-- **`image.tag` must be set.** The chart's `appVersion` is the `0.0.0` dev
-  placeholder, so the default tag resolves to an image that does not exist.
+- **`global.image.tag` must be set.** The chart's `appVersion` is the `0.0.0`
+  dev placeholder, so the default tag resolves to an image that does not exist.
+  Before v0.1.3 this was `image.tag`; Helm ignores the old key silently, so a
+  stale values file falls back to `0.0.0` without an error. The tag must name a
+  build of this branch: the v0.1.3 chart also renders the separate
+  `openshell/supervisor` and `openshell/sandbox` images from RFC 0012, which
+  pre-0.1.3 releases did not publish.
 - **`pkiInitJob.enabled` must stay `true` even with `server.disableTls: true`.**
   The certgen pre-install hook is gated on
   `pkiInitJob.enabled || certManager.enabled`, and it creates the sandbox JWT
