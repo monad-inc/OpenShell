@@ -56,8 +56,77 @@ pub async fn handle_get_current_user(
     }))
 }
 
-#[allow(clippy::result_large_err, clippy::unused_async)]
+/// Emit the Entity Management \[3004\] audit event for a token mint or
+/// refresh: credential issuance with the sandbox principal as actor. The
+/// minted JWT never enters the record — only the subject sandbox and expiry.
+/// Marked as about the sandbox on success, gateway-scoped on failure.
+fn emit_token_audit<T>(
+    state: &ServerState,
+    principal: &Principal,
+    request_id: Option<&str>,
+    operation: &'static str,
+    activity: openshell_ocsf::EntityActivityId,
+    result: &Result<Response<T>, Status>,
+    expiration: impl FnOnce(&T) -> Option<prost_types::Timestamp>,
+) {
+    let success = match result {
+        Ok(_) => true,
+        Err(status) if crate::audit::audited_failure(status) => false,
+        Err(_) => return,
+    };
+    let sandbox_id = match principal {
+        Principal::Sandbox(sandbox) => sandbox.sandbox_id.clone(),
+        _ => String::new(),
+    };
+    let mut unmapped = vec![
+        ("operation", serde_json::Value::from(operation)),
+        ("sandbox_id", serde_json::Value::from(sandbox_id.clone())),
+    ];
+    if let Ok(response) = result
+        && let Some(expires_at_ms) = expiration(response.get_ref())
+            .as_ref()
+            .and_then(|ts| openshell_core::time::timestamp_to_millis(ts).ok())
+    {
+        unmapped.push(("expires_at_ms", serde_json::Value::from(expires_at_ms)));
+    }
+    crate::audit::emit_entity(
+        &state.config.audit,
+        success,
+        crate::audit::EntityOutcome {
+            activity,
+            entity: crate::audit::entity("sandbox_token", Some(sandbox_id.clone()), None),
+            sandbox: (success && !sandbox_id.is_empty()).then_some((sandbox_id.as_str(), "")),
+            principal,
+            request_id,
+            success_message: format!("sandbox token {operation} for {sandbox_id}"),
+            failure_message: format!("sandbox token {operation} failed"),
+            unmapped,
+        },
+    );
+}
+
+#[allow(clippy::result_large_err)]
 pub async fn handle_issue_sandbox_token(
+    state: &Arc<ServerState>,
+    request: Request<IssueSandboxTokenRequest>,
+) -> Result<Response<IssueSandboxTokenResponse>, Status> {
+    let principal = crate::audit::principal(&request);
+    let request_id = crate::audit::request_id(&request);
+    let result = handle_issue_sandbox_token_inner(state, request).await;
+    emit_token_audit(
+        state,
+        &principal,
+        request_id.as_deref(),
+        "issued",
+        openshell_ocsf::EntityActivityId::Create,
+        &result,
+        |response| response.expiration_time,
+    );
+    result
+}
+
+#[allow(clippy::result_large_err, clippy::unused_async)]
+async fn handle_issue_sandbox_token_inner(
     state: &Arc<ServerState>,
     request: Request<IssueSandboxTokenRequest>,
 ) -> Result<Response<IssueSandboxTokenResponse>, Status> {
@@ -147,8 +216,28 @@ pub async fn handle_issue_sandbox_token(
     }))
 }
 
-#[allow(clippy::result_large_err, clippy::unused_async)]
+#[allow(clippy::result_large_err)]
 pub async fn handle_refresh_sandbox_token(
+    state: &Arc<ServerState>,
+    request: Request<RefreshSandboxTokenRequest>,
+) -> Result<Response<RefreshSandboxTokenResponse>, Status> {
+    let principal = crate::audit::principal(&request);
+    let request_id = crate::audit::request_id(&request);
+    let result = handle_refresh_sandbox_token_inner(state, request).await;
+    emit_token_audit(
+        state,
+        &principal,
+        request_id.as_deref(),
+        "refreshed",
+        openshell_ocsf::EntityActivityId::Update,
+        &result,
+        |response| response.expiration_time,
+    );
+    result
+}
+
+#[allow(clippy::result_large_err, clippy::unused_async)]
+async fn handle_refresh_sandbox_token_inner(
     state: &Arc<ServerState>,
     request: Request<RefreshSandboxTokenRequest>,
 ) -> Result<Response<RefreshSandboxTokenResponse>, Status> {
@@ -602,6 +691,42 @@ mod tests {
         assert_eq!(response.roles, ["openshell-user"]);
         assert_eq!(response.scopes, ["sandbox:read"]);
         assert_eq!(response.identity_provider, "oidc");
+    }
+
+    /// Token minting is credential issuance: it leaves a 3004 record
+    /// carrying the sandbox actor and expiry — and never the JWT itself.
+    #[tokio::test]
+    async fn token_refresh_emits_an_audit_record_without_the_jwt() {
+        let state = state_with_issuer().await;
+        let mut req = Request::new(RefreshSandboxTokenRequest {
+            extension_service_names: Vec::new(),
+        });
+        req.extensions_mut().insert(sandbox_principal("sandbox-a"));
+        let presented = authorize_refresh(&state, &mut req).await;
+
+        let (captured, guard) = crate::audit::test_capture::install();
+        let resp = handle_refresh_sandbox_token(&state, req)
+            .await
+            .expect("refresh OK")
+            .into_inner();
+        drop(guard);
+
+        let records = captured.json();
+        assert_eq!(records.len(), 1, "{records:?}");
+        let record = &records[0];
+        assert_eq!(record["class_uid"], 3004);
+        assert_eq!(record["entity"]["type"], "sandbox_token");
+        assert_eq!(record["actor"]["user"]["uid"], "sandbox-a");
+        assert_eq!(record["container"]["uid"], "sandbox-a");
+        assert_eq!(record["unmapped"]["operation"], "refreshed");
+        assert!(record["unmapped"]["expires_at_ms"].is_i64());
+        let rendered = record.to_string();
+        for secret in [&resp.token, &resp.sandbox_token, &presented] {
+            assert!(
+                !rendered.contains(secret.as_str()),
+                "token material must never appear in the audit record"
+            );
+        }
     }
 
     #[tokio::test]

@@ -42,6 +42,13 @@ pub fn ensure_sandbox_scope(principal: &Principal, claimed_sandbox_id: &str) -> 
                     requested_sandbox_id = %claimed_sandbox_id,
                     "cross-sandbox access denied"
                 );
+                // Dual-emit: the denial log above stays the domain record;
+                // the finding escalates the pattern for security monitoring.
+                crate::audit::emit_cross_sandbox_finding(
+                    crate::audit::global_config(),
+                    &p.sandbox_id,
+                    claimed_sandbox_id,
+                );
                 Err(Status::permission_denied(
                     "cross-sandbox access denied: principal does not own this sandbox",
                 ))
@@ -122,6 +129,24 @@ mod tests {
             },
             trust_domain: Some("openshell".to_string()),
         })
+    }
+
+    #[test]
+    fn cross_sandbox_denial_dual_emits_a_high_finding() {
+        let (captured, guard) = crate::audit::test_capture::install();
+        ensure_sandbox_scope(&sandbox("sbx-1"), "sbx-2").expect_err("must deny");
+        ensure_sandbox_scope(&sandbox("sbx-1"), "sbx-1").expect("own sandbox");
+        drop(guard);
+
+        let events = captured.json();
+        assert_eq!(events.len(), 1, "only the denial emits: {events:?}");
+        assert_eq!(events[0]["class_uid"], 2004);
+        assert_eq!(events[0]["severity_id"], 4);
+        assert_eq!(events[0]["container"]["uid"], "sbx-1");
+        assert_eq!(
+            events[0]["finding_info"]["title"],
+            "Cross-sandbox access attempt"
+        );
     }
 
     #[test]

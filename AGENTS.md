@@ -149,6 +149,8 @@ Use `info!()`, `debug!()`, `warn!()` for **internal operational plumbing** that 
 | Security alerts | `DetectionFindingBuilder` | Nonce replay, bypass detection, unsafe policy. Dual-emit with the domain event. |
 | Policy/config changes | `ConfigStateChangeBuilder` | Policy load, Landlock apply, TLS setup, provider attachments, settings |
 | Supervisor lifecycle | `AppLifecycleBuilder` | Sandbox start, SSH server ready/failed |
+| Gateway resource CRUD | `EntityManagementBuilder` | Gateway audit events for workspace, member, provider, sandbox and credential changes. Carry the authenticated principal. |
+| Authentication outcomes | `AuthenticationBuilder` | Gateway authentication failures, and successes when the audit toggle enables them. Never carry token or credential material. |
 
 ### Severity guidelines
 
@@ -189,6 +191,7 @@ ocsf_emit!(event);
 - The shorthand layer and JSONL layer extract the event from the thread-local. The shorthand format is derived automatically from the builder fields.
 - For security findings, **dual-emit**: one domain event (e.g., `SshActivityBuilder`) AND one `DetectionFindingBuilder` for the same incident.
 - Never log secrets, credentials, or query parameters in OCSF messages. The OCSF JSONL file may be shipped to external systems.
+- A new state-changing gateway RPC must emit one audit event carrying the authenticated principal. Use the `crates/openshell-server/src/audit.rs` helpers (`emit_entity_outcome`, `emit_entity`, `emit_config_outcome`, and `emit_system_entity` with a `system:<component>` actor for background work) so the `[openshell.gateway.audit] enabled` toggle applies. Failed mutations emit at `Low`, successes at `Informational`.
 - The `message` field should be a concise, grep-friendly summary. Details go in builder fields (dst_endpoint, firewall_rule, etc.).
 
 ## Sandbox Infra Changes

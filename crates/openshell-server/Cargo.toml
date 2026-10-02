@@ -138,6 +138,7 @@ harness = false
 
 [dev-dependencies]
 criterion = { workspace = true }
+openshell-ocsf = { path = "../openshell-ocsf", features = ["test-support"] }
 # Tests import the example profiles from providers/ the way an operator
 # would; the feature is test-only and never reaches a release binary.
 openshell-providers = { path = "../openshell-providers", features = ["example-profiles"] }

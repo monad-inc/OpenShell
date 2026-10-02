@@ -312,6 +312,27 @@ Metrics include `openshell_ocsf_log_queued_total`, `openshell_ocsf_log_written_t
 
 Allow enough retention and disk space for shipper outages. Graceful shutdown allows five seconds for draining; outstanding OS writes remain uncertain if they outlast that budget. Flush does not mean fsync. The file is a best-effort collection boundary, not durable acceptance, a replay protocol, or proof of a complete audit history. See [OCSF JSON export](/observability/ocsf-json-export) for the separate sandbox-local output.
 
+## Gateway Audit
+
+`[openshell.gateway.audit]` controls the control-plane audit trail: OCSF events for state-changing RPCs, authentication outcomes, and suspicious authorization patterns, each carrying the authenticated principal. Audit events are gateway-origin OCSF events, so they reach the `[openshell.gateway.ocsf_log]` file, the console, and the affected sandbox's log stream. Omit the table to keep the defaults. Restart the gateway after changing this configuration.
+
+```toml
+[openshell.gateway.audit]
+enabled             = true
+auth_success_events = false
+exec_args           = true
+settings_values     = true
+```
+
+| Field | Default | Behavior |
+|---|---|---|
+| `enabled` | `true` | Master switch for every gateway audit event, including detection findings and the gateway's policy and service-endpoint events. The audited operations run unchanged when it is off. |
+| `auth_success_events` | `false` | Also emit an Authentication event per successfully authenticated request. Failures are always emitted while `enabled` is true. |
+| `exec_args` | `true` | Record the full exec command line. `false` records only the binary name. |
+| `settings_values` | `true` | Record before and after values of changed settings. `false` records key names only. Keys that look like credentials are always redacted. |
+
+Each field also accepts an environment variable and a command-line flag, which take precedence over the file: `OPENSHELL_AUDIT_EVENTS` / `--audit-events`, `OPENSHELL_AUDIT_AUTH_SUCCESS_EVENTS` / `--audit-auth-success-events`, `OPENSHELL_AUDIT_EXEC_ARGS` / `--audit-exec-args`, and `OPENSHELL_AUDIT_SETTINGS_VALUES` / `--audit-settings-values`. Unknown fields are rejected. For Helm installations, set `server.audit.enabled`, `server.audit.authSuccessEvents`, `server.audit.execArgs`, and `server.audit.settingsValues`; the chart renders the table only when a value differs from the default. See [Gateway Audit Events](/observability/gateway-audit) for the event catalog and record anatomy.
+
 ## OTLP Export
 
 `[openshell.gateway.otlp]` enables OpenTelemetry export over OTLP/gRPC. Omit the table to disable export; there is no separate `enabled` flag.

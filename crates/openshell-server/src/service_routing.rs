@@ -841,13 +841,31 @@ fn is_gateway_auth_cookie(name: &str) -> bool {
     name.eq_ignore_ascii_case("CF_Authorization") || name.eq_ignore_ascii_case("cf-authorization")
 }
 
-pub fn emit_service_endpoint_config_event(endpoint: &ServiceEndpoint, url: &str, created: bool) {
-    let event = build_service_endpoint_config_event(endpoint, url, created);
+/// Emit the service-endpoint create/update event (5019) carrying the
+/// authenticated principal as actor.
+pub fn emit_service_endpoint_config_event(
+    principal: &crate::auth::principal::Principal,
+    endpoint: &ServiceEndpoint,
+    url: &str,
+    created: bool,
+) {
+    let event = build_service_endpoint_config_event(
+        endpoint,
+        url,
+        created,
+        Some(crate::audit::actor_user(principal)),
+    );
     openshell_ocsf::ocsf_emit!(event);
 }
 
-pub fn emit_service_endpoint_delete_event(endpoint: &ServiceEndpoint) {
-    let event = build_service_endpoint_delete_event(endpoint);
+/// Emit the service-endpoint delete event (5019) carrying the authenticated
+/// principal as actor.
+pub fn emit_service_endpoint_delete_event(
+    principal: &crate::auth::principal::Principal,
+    endpoint: &ServiceEndpoint,
+) {
+    let event =
+        build_service_endpoint_delete_event(endpoint, Some(crate::audit::actor_user(principal)));
     openshell_ocsf::ocsf_emit!(event);
 }
 
@@ -896,6 +914,7 @@ fn build_service_endpoint_config_event(
     endpoint: &ServiceEndpoint,
     url: &str,
     created: bool,
+    actor: Option<openshell_ocsf::User>,
 ) -> OcsfEvent {
     let service_label = service_display_name(&endpoint.sandbox, &endpoint.name);
     let state_label = if created {
@@ -923,13 +942,20 @@ fn build_service_endpoint_config_event(
     if !url.is_empty() {
         builder = builder.unmapped("url", url.to_string());
     }
+    if let Some(actor) = actor {
+        builder = builder.actor_user(actor);
+    }
 
     builder.build()
 }
 
-fn build_service_endpoint_delete_event(endpoint: &ServiceEndpoint) -> OcsfEvent {
+fn build_service_endpoint_delete_event(
+    endpoint: &ServiceEndpoint,
+    actor: Option<openshell_ocsf::User>,
+) -> OcsfEvent {
     let service_label = service_display_name(&endpoint.sandbox, &endpoint.name);
-    ConfigStateChangeBuilder::new(&gateway_ocsf_ctx(&endpoint.sandbox_id, &endpoint.sandbox))
+    let ctx = gateway_ocsf_ctx(&endpoint.sandbox_id, &endpoint.sandbox);
+    let mut builder = ConfigStateChangeBuilder::new(&ctx)
         .state(StateId::Disabled, "service_endpoint_deleted")
         .severity(SeverityId::Informational)
         .status(StatusId::Success)
@@ -940,8 +966,11 @@ fn build_service_endpoint_delete_event(endpoint: &ServiceEndpoint) -> OcsfEvent 
         .unmapped(
             "authorization_mode",
             authorization_mode_label(endpoint.authorization_mode),
-        )
-        .build()
+        );
+    if let Some(actor) = actor {
+        builder = builder.actor_user(actor);
+    }
+    builder.build()
 }
 
 fn build_service_http_failure_event(
@@ -1318,8 +1347,12 @@ mod tests {
 
     #[test]
     fn service_endpoint_config_event_includes_endpoint_metadata() {
-        let event =
-            build_service_endpoint_config_event(&endpoint(), "http://my-sandbox--web.local/", true);
+        let event = build_service_endpoint_config_event(
+            &endpoint(),
+            "http://my-sandbox--web.local/",
+            true,
+            None,
+        );
         let json = event.to_json().unwrap();
 
         assert_eq!(json["class_uid"], 5019);
@@ -1335,8 +1368,27 @@ mod tests {
     }
 
     #[test]
+    fn service_endpoint_events_carry_the_acting_principal() {
+        let actor =
+            openshell_ocsf::User::new("alice", "oidc|alice-123", openshell_ocsf::UserTypeId::User);
+        let event = build_service_endpoint_config_event(
+            &endpoint(),
+            "http://my-sandbox--web.local/",
+            true,
+            Some(actor.clone()),
+        );
+        let json = event.to_json().unwrap();
+        assert_eq!(json["actor"]["user"]["name"], "alice");
+        assert_eq!(json["actor"]["user"]["uid"], "oidc|alice-123");
+
+        let event = build_service_endpoint_delete_event(&endpoint(), Some(actor));
+        let json = event.to_json().unwrap();
+        assert_eq!(json["actor"]["user"]["name"], "alice");
+    }
+
+    #[test]
     fn service_endpoint_delete_event_includes_endpoint_metadata() {
-        let event = build_service_endpoint_delete_event(&endpoint());
+        let event = build_service_endpoint_delete_event(&endpoint(), None);
         let json = event.to_json().unwrap();
 
         assert_eq!(json["class_uid"], 5019);
@@ -1863,11 +1915,17 @@ mod tests {
         let subscriber = tracing_subscriber::registry().with(probe.clone());
 
         let endpoint = endpoint();
-        let expected = build_service_endpoint_config_event(&endpoint, "https://example.test", true);
+        let principal = crate::auth::principal::Principal::Anonymous;
+        let expected = build_service_endpoint_config_event(
+            &endpoint,
+            "https://example.test",
+            true,
+            Some(crate::audit::actor_user(&principal)),
+        );
         let expected_shorthand = expected.format_shorthand();
 
         tracing::subscriber::with_default(subscriber, || {
-            emit_service_endpoint_config_event(&endpoint, "https://example.test", true);
+            emit_service_endpoint_config_event(&principal, &endpoint, "https://example.test", true);
         });
 
         let seen = probe.seen.lock().unwrap();

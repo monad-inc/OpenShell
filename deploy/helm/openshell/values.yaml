@@ -277,6 +277,26 @@ server:
     # -- Carry the structured OCSF document (ocsf.raw) on exported OCSF
     # records. Set false to export only the shorthand line.
     ocsfFullPayload: true
+  # Gateway control-plane audit toggles. Renders the
+  # [openshell.gateway.audit] table only when a value differs from the
+  # gateway's built-in default.
+  audit:
+    # -- Emit gateway audit events (OCSF records for state-changing RPCs,
+    # authentication failures and suspicious authorization patterns,
+    # carrying the authenticated principal).
+    enabled: true
+    # -- Also emit an Authentication event for every successfully
+    # authenticated request. Failures are always emitted; successes multiply
+    # volume by the request rate.
+    authSuccessEvents: false
+    # -- Record the full command line in sandbox exec audit events. Set false
+    # when command lines may carry secrets; records then carry only the
+    # binary name.
+    execArgs: true
+    # -- Record before/after values of changed settings in settings audit
+    # events. Set false to record key names only. Keys matching credential
+    # patterns are always redacted.
+    settingsValues: true
   # Gateway-native OCSF JSONL output.
   ocsfLog:
     # -- Write gateway OCSF events as JSONL.

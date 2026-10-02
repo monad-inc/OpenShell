@@ -43,6 +43,10 @@ pub struct EvaluationContext {
 #[derive(Debug, Clone)]
 pub struct InterceptedRequest {
     pub body: Vec<u8>,
+    /// Names of interceptors whose `modify_operation` patches actually
+    /// changed the request, in application order. Lets the gateway mark
+    /// interceptor-modified mutations in its audit trail.
+    pub modified_by: Vec<String>,
     selector: RpcSelector,
 }
 
@@ -139,7 +143,8 @@ impl GatewayInterceptorRuntime {
         let mut operation = ValidatedOperation::new(&self.codec, &input_type, operation)
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
 
-        operation = self
+        let modified_by;
+        (operation, modified_by) = self
             .evaluate_phase(
                 &selector,
                 Phase::ModifyOperation,
@@ -148,7 +153,7 @@ impl GatewayInterceptorRuntime {
                 context,
             )
             .await?;
-        operation = self
+        (operation, _) = self
             .evaluate_phase(&selector, Phase::Validate, &input_type, operation, context)
             .await?;
 
@@ -172,7 +177,11 @@ impl GatewayInterceptorRuntime {
         .encode()
         .map_err(|err| Status::invalid_argument(err.to_string()))?;
 
-        Ok(InterceptedRequest { body, selector })
+        Ok(InterceptedRequest {
+            body,
+            modified_by,
+            selector,
+        })
     }
 
     pub async fn evaluate_post_commit(
@@ -217,12 +226,13 @@ impl GatewayInterceptorRuntime {
         operation_type: &str,
         operation: ValidatedOperation,
         context: &EvaluationContext,
-    ) -> std::result::Result<ValidatedOperation, Status> {
+    ) -> std::result::Result<(ValidatedOperation, Vec<String>), Status> {
         let Some(plans) = self.plan.bindings(selector, phase) else {
-            return Ok(operation);
+            return Ok((operation, Vec::new()));
         };
 
         let mut operation = operation;
+        let mut modified_by = Vec::new();
         for plan in plans {
             let interceptor_view = self
                 .codec
@@ -236,10 +246,14 @@ impl GatewayInterceptorRuntime {
                     continue;
                 }
             };
+            let before = (phase == Phase::ModifyOperation).then(|| operation.encoded.clone());
             operation =
                 apply_evaluation_result(&self.codec, operation_type, plan, &result, operation)?;
+            if before.is_some_and(|before| before != operation.encoded) {
+                modified_by.push(plan.interceptor_name.clone());
+            }
         }
-        Ok(operation)
+        Ok((operation, modified_by))
     }
 }
 
