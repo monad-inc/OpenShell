@@ -18,7 +18,9 @@ version: 1
 
 slack:
   # Channel IDs carrying production alerts. Read-only.
-  channels: []
+  # C0C6777N7SP = #triage-bot-test
+  channels:
+    - C0C6777N7SP
   # Messages from these bot/app user IDs are treated as alerts. Left empty, the
   # agent falls back to `alert_patterns` against the message text.
   alert_bot_user_ids: []
@@ -47,8 +49,17 @@ github:
   # Repositories in triage scope. The agent will not clone outside this list
   # even though the profile permits the whole org, so that widening scope is a
   # reviewable config change rather than an accident.
+  # The agent will not clone outside this list even though the provider profile
+  # permits the whole org, so widening scope stays a reviewable config change.
   repos:
-    - monad-inc/OpenShell
+    - monad-inc/infra
+    - monad-inc/fleet-infra
+    - monad-inc/helm
+    - monad-inc/inputs
+    - monad-inc/outputs
+    - monad-inc/enrichments
+    - monad-inc/transforms
+    - monad-inc/core
   base_branch: main
   branch_prefix: oncall/
   # Durable cross-cycle state: a fenced ```json openshell-oncall-state block in

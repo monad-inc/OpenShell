@@ -129,7 +129,7 @@ mcp_servers:
       - -enabled-tools
       - search,datasource,prometheus,loki,alerting,dashboard,incident,oncall,annotations,sift
     env:
-      GRAFANA_URL: http://kube-prometheus-stack-grafana.grafana.svc.cluster.local
+      GRAFANA_URL: https://grafana.monad.com
       # Resolved by Claude Code from the sandbox environment, where it is an
       # OpenShell placeholder. mcp-grafana forwards it as
       # `Authorization: Bearer <value>` and the proxy substitutes the real

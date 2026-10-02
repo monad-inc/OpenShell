@@ -259,6 +259,36 @@ fi
 # Providers come from the agent's own manifest rather than being hardcoded
 # here, so this script works unchanged for any agent. Each line is
 # "<profile-id> <credential-env> [<credential-env>...]".
+# An MCP server's upstream appears twice: as the URL the server dials
+# (mcp_servers[].env.*_URL in the manifest) and as the endpoint the proxy
+# permits (the provider profile). Only the second is enforced, so a mismatch
+# produces an agent that tries and is refused — and the refusal looks like a
+# policy bug rather than a typo. Assert they agree instead of templating one
+# from the other, which would mean a render step in two build scripts.
+ruby -ryaml -e '
+  manifest = YAML.load_file(ARGV[0]) || {}
+  providers_dir = ARGV[1]
+  failures = []
+  (manifest["mcp_servers"] || []).each do |server|
+    url = (server["env"] || {}).find { |k, _| k.end_with?("_URL") }&.last
+    next unless url
+    want = URI.parse(url).host rescue nil
+    next unless want
+    profile = File.join(providers_dir, "#{server.fetch("id")}.yaml")
+    next unless File.exist?(profile)
+    hosts = ((YAML.load_file(profile) || {})["endpoints"] || []).map { |e| e["host"] }.compact
+    next if hosts.include?(want)
+    failures << "mcp_servers[#{server.fetch("id")}] dials #{want}, but #{File.basename(profile)} permits #{hosts.join(", ")}"
+  end
+  unless failures.empty?
+    warn "upstream host mismatch:"
+    failures.each { |f| warn "  #{f}" }
+    exit 1
+  end
+' -ruri "$AGENT_DIR/agent.yaml" "$AGENT_DIR/providers" \
+    || fail "an MCP server dials a host its provider profile does not permit; rebuild the images after changing an upstream URL"
+log "Upstream hosts verified: every MCP server dials a host its profile permits."
+
 PROVIDER_SPEC="$(ruby -ryaml -e '
   manifest = YAML.load_file(ARGV[0]) || {}
   (manifest["providers"] || []).each do |provider|

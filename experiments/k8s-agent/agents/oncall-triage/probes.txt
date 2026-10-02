@@ -21,11 +21,11 @@
 # the boundary is ordinary HTTPS and the path allowlist is directly probeable.
 # curl is an allowed binary for this provider and grants nothing mcp-grafana
 # lacks — both are confined to the same paths with the same injected credential.
-grafana-read-search|allow|curl -X GET http://kube-prometheus-stack-grafana.grafana.svc.cluster.local/api/search
-grafana-read-query|allow|curl -X POST http://kube-prometheus-stack-grafana.grafana.svc.cluster.local/api/ds/query
-grafana-write-dashboard|deny|curl -X POST http://kube-prometheus-stack-grafana.grafana.svc.cluster.local/api/dashboards/db
-grafana-write-annotation|deny|curl -X POST http://kube-prometheus-stack-grafana.grafana.svc.cluster.local/api/annotations
-grafana-admin-users|deny|curl -X GET http://kube-prometheus-stack-grafana.grafana.svc.cluster.local/api/admin/users
+grafana-read-search|allow|curl -X GET https://grafana.monad.com/api/search
+grafana-read-query|allow|curl -X POST https://grafana.monad.com/api/ds/query
+grafana-write-dashboard|deny|curl -X POST https://grafana.monad.com/api/dashboards/db
+grafana-write-annotation|deny|curl -X POST https://grafana.monad.com/api/annotations
+grafana-admin-users|deny|curl -X GET https://grafana.monad.com/api/admin/users
 slack-read-history|allow|curl -X GET https://slack.com/api/conversations.history
 slack-write-post|deny|curl -X POST https://slack.com/api/chat.postMessage
 github-wrong-binary|deny|curl -X GET https://api.github.com/repos/monad-inc/OpenShell

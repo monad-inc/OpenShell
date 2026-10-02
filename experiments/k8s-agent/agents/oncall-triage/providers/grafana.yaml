@@ -43,13 +43,10 @@ credentials:
 discovery:
   credentials: [service_account_token]
 endpoints:
-  - host: kube-prometheus-stack-grafana.grafana.svc.cluster.local
-    port: 80
+  - host: grafana.monad.com
+    port: 443
     protocol: rest
     enforcement: enforce
-    # An in-cluster Service resolves into RFC 1918 space, which policy
-    # otherwise treats as an SSRF risk.
-    allowed_ips: ["10.0.0.0/8"]
     rules:
       # Identity and reachability preflight. mcp-grafana calls these on startup.
       - allow: { method: GET, path: "/api/health" }
