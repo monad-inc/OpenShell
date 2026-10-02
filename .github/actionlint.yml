@@ -9,6 +9,9 @@ self-hosted-runner:
     - linux-arm64-gpu-l4-latest-1
     - nv
     - ubuntu-26.04
+    # Monad fork: org-hosted larger runners used by monad-images.yml.
+    - ubuntu-24.04-8core
+    - ubuntu-24.04-arm-8core
     - windows-arm64
     - wsl-amd64-gpu-rtxpro6000-latest-1
 

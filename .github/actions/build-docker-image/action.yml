@@ -20,13 +20,21 @@ inputs:
   github-token:
     description: Token used to push the image
     required: true
+  registry:
+    description: Image repository prefix the component name is appended to
+    required: false
+    default: ghcr.io/nvidia/openshell
+  buildkitd-config:
+    description: Path to a buildkitd.toml for the builder; empty uses BuildKit defaults
+    required: false
+    default: /etc/buildkit/buildkitd.toml
 
 runs:
   using: composite
   steps:
     - uses: ./.github/actions/setup-buildx
       with:
-        buildkitd-config: /etc/buildkit/buildkitd.toml
+        buildkitd-config: ${{ inputs.buildkitd-config }}
 
     - name: Log in to GHCR
       uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
@@ -60,6 +68,8 @@ runs:
       env:
         COMPONENT: ${{ inputs.component }}
         IMAGE_TAG: ${{ inputs.image-tag }}
+        REGISTRY: ${{ inputs.registry }}
+        SOURCE_URL: ${{ github.server_url }}/${{ github.repository }}
       run: |
         install -d artifacts/images
         docker buildx build \
@@ -67,7 +77,8 @@ runs:
           --platform linux/amd64,linux/arm64 \
           --file deploy/docker/Dockerfile.${COMPONENT} \
           --target ${COMPONENT} \
-          --tag ghcr.io/nvidia/openshell/${COMPONENT}:${IMAGE_TAG} \
+          --tag ${REGISTRY}/${COMPONENT}:${IMAGE_TAG} \
+          --label org.opencontainers.image.source=${SOURCE_URL} \
           --cache-from type=gha,scope=${COMPONENT} \
           --cache-to type=gha,mode=max,scope=${COMPONENT} \
           --provenance=mode=min \
@@ -79,7 +90,7 @@ runs:
     - name: Verify SBOM attestation
       shell: bash
       env:
-        IMAGE_REF: ghcr.io/nvidia/openshell/${{ inputs.component }}:${{ inputs.image-tag }}
+        IMAGE_REF: ${{ inputs.registry }}/${{ inputs.component }}:${{ inputs.image-tag }}
       run: tasks/scripts/verify-image-sbom.sh "${IMAGE_REF}" --require-cargo
 
     - name: Upload ${{ inputs.component }} image

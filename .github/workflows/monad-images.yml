@@ -1,0 +1,156 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Builds Monad's OpenShell images (gateway, supervisor, sandbox) and pushes
+# them to ghcr.io/monad-inc/openshell. See MONAD.md.
+
+name: Monad Images
+
+on:
+  push:
+    branches: [monad/main]
+    tags: ["monad-v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: monad-images-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  version:
+    name: Resolve version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      cargo-version: ${{ steps.resolve.outputs.cargo-version }}
+      image-tag: ${{ steps.resolve.outputs.image-tag }}
+      extra-tags: ${{ steps.resolve.outputs.extra-tags }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve version and tags
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The fork does not carry upstream's release tags; fetch them to find our base release.
+          git fetch --no-tags --quiet https://github.com/NVIDIA/OpenShell.git '+refs/tags/v*:refs/tags/v*'
+          base="$(git describe --tags --abbrev=0 --match 'v[0-9]*' HEAD)"
+          base="${base#v}"
+
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            version="${GITHUB_REF_NAME#monad-v}"
+          else
+            sep="-"
+            [[ "${base}" == *-* ]] && sep="."
+            version="${base}${sep}monad.${GITHUB_RUN_NUMBER}"
+          fi
+          if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::'${version}' is not a valid version (tag monad-v<semver>, e.g. monad-v0.1.3-monad.1)"
+            exit 1
+          fi
+
+          extra="${version}"
+          [[ "${GITHUB_REF}" == "refs/heads/monad/main" ]] && extra="${extra} main"
+          [[ "${GITHUB_REF_TYPE}" == "tag" ]] && extra="${extra} latest"
+
+          {
+            echo "cargo-version=${version}"
+            echo "image-tag=sha-${GITHUB_SHA::12}"
+            echo "extra-tags=${extra}"
+          } >> "${GITHUB_OUTPUT}"
+          echo "base=${base} version=${version} image-tag=sha-${GITHUB_SHA::12} extra-tags=${extra}"
+
+  binaries:
+    name: ${{ matrix.binary }} (${{ matrix.triple }})
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { package: openshell-gateway, binary: openshell-gateway, triple: x86_64-unknown-linux-gnu, runner: ubuntu-24.04-8core }
+          - { package: openshell-gateway, binary: openshell-gateway, triple: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm-8core }
+          - { package: openshell-supervisor, binary: openshell-supervisor, triple: x86_64-unknown-linux-gnu, runner: ubuntu-24.04-8core }
+          - { package: openshell-supervisor, binary: openshell-supervisor, triple: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm-8core }
+          - { package: openshell-sandbox, binary: openshell-sandbox, triple: x86_64-unknown-linux-musl, runner: ubuntu-24.04-8core }
+          - { package: openshell-sandbox, binary: openshell-sandbox, triple: aarch64-unknown-linux-musl, runner: ubuntu-24.04-arm-8core }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    env:
+      # Compiled-in defaults, so a gateway built here launches Monad's supervisor and sandbox runtime.
+      OPENSHELL_SUPERVISOR_IMAGE_REPO: ghcr.io/monad-inc/openshell/supervisor
+      OPENSHELL_SANDBOX_RUNTIME_IMAGE_REPO: ghcr.io/monad-inc/openshell/sandbox
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # No Cachix token: reads upstream's public cache, never writes to it.
+      - uses: ./.github/actions/setup-nix
+
+      - uses: ./.github/actions/build-rust-binary
+        with:
+          package: ${{ matrix.package }}
+          binary: ${{ matrix.binary }}
+          triple: ${{ matrix.triple }}
+          cargo-version: ${{ needs.version.outputs.cargo-version }}
+          supervisor-image-tag: ${{ needs.version.outputs.image-tag }}
+
+  images:
+    name: ${{ matrix.component }} image
+    needs: [version, binaries]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { component: gateway, binary: openshell-gateway, target-suffix: unknown-linux-gnu }
+          - { component: supervisor, binary: openshell-supervisor, target-suffix: unknown-linux-gnu }
+          - { component: sandbox, binary: openshell-sandbox, target-suffix: unknown-linux-musl }
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    env:
+      REGISTRY: ghcr.io/monad-inc/openshell
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/build-docker-image
+        with:
+          component: ${{ matrix.component }}
+          binary: ${{ matrix.binary }}
+          target-suffix: ${{ matrix.target-suffix }}
+          image-tag: ${{ needs.version.outputs.image-tag }}
+          registry: ${{ env.REGISTRY }}
+          buildkitd-config: ""
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Add version and channel tags
+        shell: bash
+        env:
+          COMPONENT: ${{ matrix.component }}
+          IMAGE_TAG: ${{ needs.version.outputs.image-tag }}
+          EXTRA_TAGS: ${{ needs.version.outputs.extra-tags }}
+        run: |
+          set -euo pipefail
+          src="${REGISTRY}/${COMPONENT}:${IMAGE_TAG}"
+          for tag in ${EXTRA_TAGS}; do
+            docker buildx imagetools create --tag "${REGISTRY}/${COMPONENT}:${tag}" "${src}"
+          done
+          digest="$(docker buildx imagetools inspect "${src}" --format '{{ json .Manifest }}' | jq -r .digest)"
+          {
+            echo "### ${COMPONENT}"
+            echo
+            echo "- \`${src}\`"
+            for tag in ${EXTRA_TAGS}; do echo "- \`${REGISTRY}/${COMPONENT}:${tag}\`"; done
+            echo "- digest \`${digest}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
