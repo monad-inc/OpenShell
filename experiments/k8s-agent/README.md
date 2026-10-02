@@ -178,6 +178,23 @@ kubectl --kubeconfig ~/.kube/config --context kind-kind get nodes
 
 Expect a single `kind-control-plane` node on v1.35.0. If you see EKS nodes, stop.
 
+**`--kubeconfig ~/.kube/config` is not optional here, and omitting it looks like
+a missing cluster.** `mise.toml` sets `KUBECONFIG` to `{{config_root}}/kubeconfig`
+for any shell inside this repo. That file does not exist unless you created a
+k3d cluster with the `helm:k3s` task, so a bare `kubectl` sees an empty
+kubeconfig: `config get-contexts` lists nothing and `--context kind-kind` fails
+with "context does not exist" even though the context is fine.
+
+Either pass `--kubeconfig ~/.kube/config` on every command, as this runbook
+does, or override it for the shell:
+
+```shell
+export KUBECONFIG=~/.kube/config
+```
+
+Running from a directory outside the repo also avoids it, since the override is
+scoped to this project.
+
 ### 1. Install the Agent Sandbox controller
 
 OpenShell provisions sandbox pods through the Kubernetes SIG
@@ -285,12 +302,13 @@ than a release resource. That is the same split described in [There Is No
 Declarative Sandbox](#there-is-no-declarative-sandbox), and orphaned resources
 are its cost at upgrade time. Clear them as part of the version jump:
 
-```text
-delete sandboxes.agents.x-k8s.io --all -n openshell-experiments
+```shell
+kubectl --kubeconfig ~/.kube/config --context kind-kind \
+  -n openshell-experiments delete sandboxes.agents.x-k8s.io --all
 ```
 
-(with `kubectl`, against the `kind-kind` context). Do it after uninstalling the
-gateway and before installing the new one.
+Do it after uninstalling the gateway and before installing the new one. Note the
+explicit `--kubeconfig`, for the reason in [step 0](#0-pin-the-context).
 
 ### 3. Register the CLI
 
