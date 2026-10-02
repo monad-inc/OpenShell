@@ -1,5 +1,9 @@
 # syntax=docker/dockerfile:1
 
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+
 # SPDX-License-Identifier: Apache-2.0
 
 # repo-watcher sandbox image: a thin payload layer over the shared base.

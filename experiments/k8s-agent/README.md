@@ -147,7 +147,8 @@ experiments/k8s-agent/
       providers/             # grafana-reader, github-triage, slack-oncall-reader, claude-*
       probes.txt             # policy assertions checked at deploy time
   launcher/Dockerfile        # deploy-Job image; bakes one agent's definition
-  chart/                     # Helm chart, agent-agnostic
+  chart/                     # Helm chart for an agent, agent-agnostic
+  registry-auth/             # Helm chart: ghcr pull secret for Monad's images
   deploy/
     oncall-triage.values.yaml
     oncall-triage.credentials.DUMMY.yaml
@@ -210,14 +211,24 @@ v1.0.0 serves `v1beta1`, which the chart accepts.
 
 The gateway, supervisor, sandbox runtime, and launcher CLI all come from Monad's
 private OpenShell build (`ghcr.io/monad-inc/openshell/*`, see `MONAD.md`), so the
-namespace needs a pull secret first. Use a GitHub token with `read:packages`.
+namespace needs a pull secret before any pod pulls.
+
+That secret is its own Helm release rather than something applied by hand: a
+chart cannot create a prerequisite for a release installed earlier than it, so
+it installs first and uninstalls last, and `--create-namespace` makes the
+namespace Helm's too. Nothing in this runbook is applied imperatively.
+
+Use a GitHub token with `read:packages`. On a SAML-enforced org it must also be
+SSO-authorized for that org — scopes alone are not enough, and `docker login`
+succeeds either way, so an unauthorized token surfaces later as a `403` on the
+manifest pull, which reads like a missing image.
 
 ```shell
-kubectl --kubeconfig ~/.kube/config --context kind-kind create namespace openshell-experiments
-
-kubectl --kubeconfig ~/.kube/config --context kind-kind -n openshell-experiments \
-  create secret docker-registry ghcr-monad \
-  --docker-server=ghcr.io --docker-username=<github-user> --docker-password="$GITHUB_TOKEN"
+helm --kubeconfig ~/.kube/config --kube-context kind-kind \
+  upgrade --install registry-auth experiments/k8s-agent/registry-auth \
+  -n openshell-experiments --create-namespace \
+  --set registry.username=<github-user> \
+  --set registry.password="$GITHUB_TOKEN"
 
 helm --kubeconfig ~/.kube/config --kube-context kind-kind \
   upgrade --install openshell deploy/helm/openshell \
@@ -253,6 +264,33 @@ helm template openshell deploy/helm/openshell -n openshell-experiments \
   -f experiments/k8s-agent/manifests/values-kind-experiments.yaml \
   --api-versions agents.x-k8s.io/v1beta1 --kube-version 1.35.0
 ```
+
+#### Orphaned Sandbox resources after a gateway version jump
+
+An incompatible gateway upgrade means a fresh database (the `server.dbUrl`
+suffix above), and that strands the `Sandbox` custom resources the previous
+gateway created. The new gateway discovers them but refuses to manage them:
+
+```text
+Sandbox resource admission revalidation failed sandbox_id=896f45ef…
+  reason=sandbox driver config is disabled or lacks admission provenance; recreate it
+```
+
+`openshell sandbox delete` then reports success — it removes its own record —
+while the resource itself persists, so the next create fails with `sandbox
+already exists`. It is not a race; the resource stays indefinitely.
+
+Nothing in Helm can clean this up, because a sandbox is gateway state rather
+than a release resource. That is the same split described in [There Is No
+Declarative Sandbox](#there-is-no-declarative-sandbox), and orphaned resources
+are its cost at upgrade time. Clear them as part of the version jump:
+
+```text
+delete sandboxes.agents.x-k8s.io --all -n openshell-experiments
+```
+
+(with `kubectl`, against the `kind-kind` context). Do it after uninstalling the
+gateway and before installing the new one.
 
 ### 3. Register the CLI
 
@@ -305,13 +343,17 @@ IMAGE_REPO=ghcr.io/monad-inc/repo-watcher \
 
 ### 6. Provide credentials
 
+Agent credentials are chart-rendered, never applied by hand. For local bring-up
+the DUMMY values file carries deliberately non-functional placeholders:
+
 ```shell
-kubectl --kubeconfig ~/.kube/config --context kind-kind \
-  -n openshell-experiments create secret generic repo-watcher-credentials \
-  --from-literal=GITHUB_TOKEN="$GITHUB_TOKEN" \
-  --from-literal=SLACK_BOT_TOKEN="$SLACK_BOT_TOKEN" \
-  --from-literal=ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY"
+-f experiments/k8s-agent/deploy/oncall-triage.credentials.DUMMY.yaml
 ```
+
+For anything real, have External Secrets or the 1Password operator own a Secret
+and point the release at it with `credentials.existingSecret`, which keeps
+credential material out of both git and the shell. Per-token scopes and the
+rotation caveat are in [deploy/CREDENTIALS.md](deploy/CREDENTIALS.md).
 
 Supply `CLAUDE_CODE_OAUTH_TOKEN` instead of `ANTHROPIC_API_KEY` for the
 subscription-billing variant. Setting both is rejected by the launcher and again
@@ -322,9 +364,6 @@ Slack scopes are read-only: `channels:history`, `groups:history`,
 `chat.postMessage` path, so the agent cannot post even if given a token that
 could.
 
-This cluster already runs External Secrets and the 1Password operator; a real
-deployment should source the Secret from one of those rather than an operator's
-shell.
 
 ### 7. Deploy the agent
 

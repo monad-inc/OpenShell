@@ -1,0 +1,14 @@
+{{ if .Values.createSecret -}}
+Pull secret {{ .Values.secret.name }} created in {{ .Release.Namespace }}.
+
+Referenced by manifests/values-kind-experiments.yaml, as both `imagePullSecrets`
+and `server.sandboxImagePullSecrets`.
+
+Install this release before the gateway — the secret must exist before any pod
+pulls — and uninstall it last:
+  helm uninstall {{ .Release.Name }} -n {{ .Release.Namespace }}
+{{- else -}}
+createSecret is false: this release manages nothing. {{ .Values.secret.name }}
+must be supplied by External Secrets, the 1Password operator, or another owner
+before the gateway is installed.
+{{- end }}

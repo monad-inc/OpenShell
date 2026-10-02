@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+
 # SPDX-License-Identifier: Apache-2.0
 
 # Deploy an agent from experiments/k8s-agent/agents/<name> onto an OpenShell
@@ -293,16 +297,29 @@ while read -r profile_id credential_envs; do
     PROVIDER_ARGS+=(--provider "$profile_id")
 done <<< "$PROVIDER_SPEC"
 
-if osh sandbox list 2>/dev/null | grep -qE "^${SANDBOX_NAME}[[:space:]]"; then
-    if [[ "$RECREATE" == "1" ]]; then
-        log "Deleting existing sandbox: $SANDBOX_NAME"
-        osh sandbox delete "$SANDBOX_NAME" >/dev/null
+# Deliberately does not parse `sandbox list`. Scraping its table is a silent
+# dependency on human-readable output: the 0.1.x CLI changed that format, the
+# name stopped matching, RECREATE looked like a no-op, and the create then
+# failed with "sandbox already exists" — a confusing way to learn about a
+# column change. Ask the API instead, and let create itself be the arbiter.
+if [[ "$RECREATE" == "1" ]]; then
+    log "Replacing any existing sandbox: $SANDBOX_NAME"
+    # Report why a delete failed rather than swallowing it. Proceeding to a
+    # create that is certain to fail turns a clear "could not delete, because
+    # X" into a misleading "sandbox already exists".
+    if delete_output="$(osh sandbox delete "$SANDBOX_NAME" 2>&1)"; then
+        log "Deleted existing sandbox: $SANDBOX_NAME"
+    elif [[ "$delete_output" == *"not found"* || "$delete_output" == *"NotFound"* ]]; then
+        log "No existing sandbox to delete."
     else
-        log "Sandbox '$SANDBOX_NAME' already exists; set RECREATE=1 to replace it."
-        # Not an early exit: probes should still run so a re-deploy re-asserts
-        # that the live policy still matches what the profiles declare.
-        SKIP_CREATE=1
+        printf '%s\n' "$delete_output" >&2
+        fail "could not delete existing sandbox '$SANDBOX_NAME'; resolve the above before redeploying"
     fi
+elif osh sandbox get "$SANDBOX_NAME" >/dev/null 2>&1; then
+    log "Sandbox '$SANDBOX_NAME' already exists; set RECREATE=1 to replace it."
+    # Not an early exit: probes should still run so a re-deploy re-asserts
+    # that the live policy still matches what the profiles declare.
+    SKIP_CREATE=1
 fi
 
 # Sandbox label values accept only alphanumerics, '-', '_', and '.', so an

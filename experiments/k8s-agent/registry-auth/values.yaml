@@ -1,0 +1,39 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# SPDX-License-Identifier: Apache-2.0
+
+# Monad's OpenShell images are private (see MONAD.md), so the gateway pods and
+# the sandbox pods both need an image pull secret in their namespace.
+#
+# This is its own Helm release rather than a template in the gateway or agent
+# chart, for one reason: the secret has to exist *before* the gateway pulls, and
+# a chart cannot create a prerequisite for a release installed earlier. As a
+# separate release it installs first and uninstalls last, and its whole
+# lifecycle is Helm — nothing here is applied imperatively.
+
+secret:
+  # Referenced by `imagePullSecrets` in the gateway values and by
+  # `server.sandboxImagePullSecrets` for sandbox pods. Changing it means
+  # changing both.
+  name: ghcr-monad
+
+registry:
+  server: ghcr.io
+  username: ""
+  # NEVER commit a real token. Supply it at install time:
+  #   --set registry.password="$GITHUB_TOKEN"
+  # or from a values file kept outside the working tree.
+  #
+  # The token needs `read:packages`, and on a SAML-enforced org it must also be
+  # SSO-authorized for that org. Scopes alone are not enough, and `docker login`
+  # succeeds either way, so an unauthorized token fails later as a 403 on the
+  # manifest pull rather than at login — which reads like a missing image.
+  password: ""
+  # Optional; some registries want it, ghcr.io does not.
+  email: ""
+
+# Preferred for anything long-lived: have External Secrets or the 1Password
+# operator own the Secret, and set this false so the chart documents the
+# dependency without holding credential material.
+createSecret: true
