@@ -1,0 +1,42 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Credentials for the gateway's OTLP log export.
+#
+# Its own release, for the same reason as the ghcr pull secret: the Secret has
+# to exist before the gateway starts, and a chart cannot create a prerequisite
+# for a release installed earlier than itself. Installs before the gateway,
+# uninstalls after it, and its whole lifecycle is Helm.
+#
+# The gateway authenticates with the standard OpenTelemetry header variable —
+# there is no `headers` field in the gateway TOML — so this chart's job is to
+# assemble that one string and hold it in a Secret.
+
+# Namespaced under `otlp` so the same credentials file can also carry the
+# agent's `credentials:` block; each release reads only its own section.
+otlp:
+  secret:
+    # Referenced by server.otlp.headersSecret.name in the gateway values.
+    name: openshell-otlp-headers
+    key: OTEL_EXPORTER_OTLP_HEADERS
+
+  # How the header is assembled: "<name>=<prefix><apiKey>". Defaults to
+  # `authorization=Bearer <key>`. Monad's OTel docs put it this way: the value
+  # "is sent exactly as stored, so include the scheme (for example
+  # `Bearer <token>`)", and for a vendor API-key header, "use the vendor's
+  # header name (for example `X-API-Key`) and store the bare key" — in which
+  # case set name: X-API-Key and prefix: "".
+  header:
+    name: authorization
+    prefix: "Bearer "
+
+  # Merged in as `key=value` pairs. Use this if the receiver wants the pipeline
+  # id as a header rather than in the endpoint path.
+  extraHeaders: {}
+
+  # NEVER commit a real key. Supply it at install time from a file kept outside
+  # the working tree, or set createSecret=false and let External Secrets or the
+  # 1Password operator own the Secret instead.
+  apiKey: ""
+
+  createSecret: true

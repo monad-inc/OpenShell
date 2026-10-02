@@ -1,0 +1,27 @@
+{{- /* SPDX-License-Identifier: Apache-2.0 */ -}}
+{{- if .Values.otlp.createSecret }}
+{{- if not .Values.otlp.apiKey }}
+{{- fail "otlp.apiKey is required — pass it at install time, e.g. -f ~/oncall-creds.yaml" }}
+{{- end }}
+{{- $pairs := list (printf "%s=%s%s" .Values.otlp.header.name .Values.otlp.header.prefix .Values.otlp.apiKey) }}
+{{- range $k, $v := .Values.otlp.extraHeaders }}
+{{- $pairs = append $pairs (printf "%s=%s" $k $v) }}
+{{- end }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ .Values.otlp.secret.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version }}
+    app.kubernetes.io/name: {{ .Chart.Name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+type: Opaque
+stringData:
+  {{- /*
+    One comma-separated string, which is the format the OpenTelemetry
+    exporter expects for OTEL_EXPORTER_OTLP_HEADERS.
+  */}}
+  {{ .Values.otlp.secret.key }}: {{ join "," $pairs | quote }}
+{{- end }}
