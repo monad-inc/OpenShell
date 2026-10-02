@@ -20226,6 +20226,145 @@ mod tests {
         );
     }
 
+    /// Full policy replacements and incremental merges driven through
+    /// `handle_update_config` audit as 5019 records at the revision commit:
+    /// a sandbox replacement (`updated`, about the sandbox), no record for an
+    /// idempotent re-set, a merge (`merged` summary plus one per op), and a
+    /// global replacement (`updated`, `scope=global`, gateway-scoped).
+    #[tokio::test]
+    async fn update_config_full_policy_replacements_and_merges_emit_audit_events() {
+        let state = test_server_state().await;
+        let policy = test_policy_with_rule("sandbox_only", "sandbox.example.com");
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-audit-replace",
+                "audit-replace",
+                policy.clone(),
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+        let scope = || {
+            Some(openshell_core::proto::workspace_selector(
+                "default".to_string(),
+            ))
+        };
+
+        let (captured, guard) = crate::audit::test_capture::install();
+        let mut replaced = policy.clone();
+        replaced
+            .network_policies
+            .extend(test_policy_with_rule("extra_rule", "extra.example.com").network_policies);
+        handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                sandbox: "audit-replace".to_string(),
+                workspace_scope: scope(),
+                policy: Some(replaced.clone()),
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap();
+        let after_replace = captured.json().len();
+
+        // Idempotent re-set: no revision, no audit record.
+        handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                sandbox: "audit-replace".to_string(),
+                workspace_scope: scope(),
+                policy: Some(replaced),
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap();
+        let after_reset = captured.json().len();
+
+        handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                sandbox: "audit-replace".to_string(),
+                workspace_scope: scope(),
+                merge_operations: vec![PolicyMergeOperation {
+                    operation: Some(policy_merge_operation::Operation::AddRule(
+                        openshell_core::proto::AddNetworkRule {
+                            rule_name: "allow_api_example".to_string(),
+                            rule: Some(NetworkPolicyRule {
+                                name: "allow_api_example".to_string(),
+                                endpoints: vec![NetworkEndpoint {
+                                    host: "api.example.com".to_string(),
+                                    port: 443,
+                                    ..Default::default()
+                                }],
+                                ..Default::default()
+                            }),
+                        },
+                    )),
+                }],
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap();
+        handle_update_config(
+            &state,
+            authed_request(UpdateConfigRequest {
+                global: true,
+                policy: Some(test_policy_with_rule("global_rule", "global.example.com")),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let after_global = captured.json().len();
+        drop(guard);
+
+        let records: Vec<_> = captured
+            .json()
+            .into_iter()
+            .filter(|record| record["class_uid"] == 5019)
+            .collect();
+        assert_eq!(after_replace, 1, "{records:?}");
+        assert_eq!(after_reset, 1, "idempotent re-set must not audit");
+        assert_eq!(after_global, 4, "{records:?}");
+        assert_eq!(records.len(), 4, "{records:?}");
+
+        let sandbox_replace = &records[0];
+        assert_eq!(sandbox_replace["state"], "updated");
+        assert_eq!(sandbox_replace["status"], "Success");
+        assert!(sandbox_replace["unmapped"]["policy_version"].is_string());
+        assert!(
+            sandbox_replace["actor"]["user"]["name"].is_string(),
+            "full replacements carry the acting principal"
+        );
+        assert!(
+            sandbox_replace.to_string().contains("sb-audit-replace"),
+            "sandbox replacement is about the sandbox: {sandbox_replace}"
+        );
+
+        let merge_summary = &records[1];
+        assert_eq!(merge_summary["state"], "merged");
+        assert_eq!(merge_summary["status"], "Success");
+        assert_eq!(merge_summary["unmapped"]["operation_count"], 1);
+        assert!(merge_summary["actor"]["user"]["name"].is_string());
+        let merge_op = &records[2];
+        assert_eq!(merge_op["state"], "merged");
+        assert!(
+            merge_op["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("incremental policy op")),
+            "{merge_op}"
+        );
+
+        let global_replace = &records[3];
+        assert_eq!(global_replace["state"], "updated");
+        assert_eq!(global_replace["unmapped"]["scope"], "global");
+        assert!(!global_replace.to_string().contains("sb-audit-replace"));
+    }
+
     /// The `update_config` settings paths audit through the gateway OCSF
     /// path: a global set emits a 5019 record with before/after values, a
     /// failed mutation attempt emits with `Failure`, and an authorization

@@ -3570,6 +3570,77 @@ mod tests {
         );
     }
 
+    /// A timer-driven rotation audits as a 3004 Update with the
+    /// `system:provider-refresh` actor — a failed one with `Failure` — and
+    /// carries identity fields only, never refresh material.
+    #[tokio::test]
+    async fn refresh_worker_rotation_emits_system_actor_audit_event() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "invalid_grant",
+            })))
+            .mount(&server)
+            .await;
+        let store = test_store().await;
+        let provider = provider("audited-refresh", "outlook");
+        store.put_message(&provider).await.unwrap();
+        let mut state = new_refresh_state(
+            &provider,
+            "default",
+            "MS_GRAPH_ACCESS_TOKEN",
+            NewRefreshStateConfig {
+                strategy: ProviderCredentialRefreshStrategy::Oauth2RefreshToken,
+                material: HashMap::from([(
+                    "refresh_token".to_string(),
+                    "rt-super-secret".to_string(),
+                )]),
+                secret_material_keys: Vec::new(),
+                expires_at_ms: 0,
+                token_url: format!("{}/token", server.uri()),
+                scopes: Vec::new(),
+                refresh_before: Some(proto_duration(30)),
+                max_lifetime: Some(proto_duration(60)),
+                additional_output_keys: HashMap::new(),
+            },
+        )
+        .unwrap();
+        state.status = "rotation_requested".to_string();
+        state.next_refresh_at_ms = 0;
+        put_refresh_state(&store, &state).await.unwrap();
+
+        let (captured, guard) = crate::audit::test_capture::install();
+        Box::pin(run_refresh_worker_tick(
+            &store,
+            Some(&test_credentials()),
+            None,
+        ))
+        .await
+        .unwrap();
+        drop(guard);
+
+        let records: Vec<_> = captured
+            .json()
+            .into_iter()
+            .filter(|record| record["class_uid"] == 3004)
+            .collect();
+        assert_eq!(records.len(), 1, "{records:?}");
+        let record = &records[0];
+        assert_eq!(record["actor"]["user"]["name"], "system:provider-refresh");
+        assert_eq!(record["activity_id"], 3);
+        assert_eq!(record["status"], "Failure");
+        assert_eq!(record["entity"]["type"], "credential");
+        assert_eq!(record["unmapped"]["operation"], "auto_rotate");
+        assert_eq!(record["unmapped"]["provider"], "audited-refresh");
+        assert_eq!(
+            record["unmapped"]["credential_key"],
+            "MS_GRAPH_ACCESS_TOKEN"
+        );
+        assert_eq!(record["unmapped"]["trigger"], "rotation_requested");
+        assert!(!record.to_string().contains("rt-super-secret"));
+    }
+
     #[tokio::test]
     async fn refresh_worker_finalizes_tombstoned_refresh_material() {
         let store = test_store().await;

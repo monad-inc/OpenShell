@@ -1930,6 +1930,31 @@ mod tests {
     use http::{Request, StatusCode};
     use tower::ServiceExt;
 
+    /// Startup's default-workspace creation audits as a 3004 Create with the
+    /// `system:gateway-startup` actor; a later startup that finds it already
+    /// present emits nothing.
+    #[tokio::test]
+    async fn default_workspace_creation_emits_system_actor_audit_event() {
+        let store = crate::persistence::test_store().await;
+
+        let (captured, guard) = crate::audit::test_capture::install();
+        super::ensure_default_workspace(&store).await.unwrap();
+        super::ensure_default_workspace(&store).await.unwrap();
+        drop(guard);
+
+        let records = captured.json();
+        assert_eq!(records.len(), 1, "{records:?}");
+        let record = &records[0];
+        assert_eq!(record["class_uid"], 3004);
+        assert_eq!(record["activity_id"], 1);
+        assert_eq!(record["status"], "Success");
+        assert_eq!(record["actor"]["user"]["name"], "system:gateway-startup");
+        assert_eq!(
+            record["entity"]["name"],
+            crate::grpc::workspace::DEFAULT_WORKSPACE_NAME
+        );
+    }
+
     fn tls_enabled_config() -> Config {
         Config::new(Some(openshell_core::TlsConfig {
             cert_path: "/tmp/cert.pem".into(),

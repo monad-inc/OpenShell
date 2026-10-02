@@ -1990,6 +1990,74 @@ mod tests {
         task.abort();
     }
 
+    /// An interceptor that rewrites a request leaves a companion 5019
+    /// `request_modified` audit record naming the interceptor and path,
+    /// correlated with the request's `x-request-id`.
+    #[tokio::test]
+    async fn interceptor_request_modification_emits_audit_marker() {
+        let interceptor = ReplayTestInterceptor::default();
+        *interceptor.name.lock().unwrap() = "rewritten-name".into();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = interceptor.clone();
+        let task = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(GatewayInterceptorServer::new(server))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        let runtime = openshell_gateway_interceptors::initialize(vec![GatewayInterceptorConfig {
+            name: "modify-test".into(),
+            grpc_endpoint: format!("http://{address}"),
+            ..Default::default()
+        }])
+        .await
+        .unwrap();
+        let state = crate::grpc::test_support::test_server_state().await;
+        let inner = tower::service_fn(|_request: Request<BoxBody>| async move {
+            let mut trailers = http::HeaderMap::new();
+            trailers.insert("grpc-status", HeaderValue::from_static("0"));
+            Ok::<_, Infallible>(Response::new(tonic_body_from_bytes_and_trailers(
+                Bytes::new(),
+                Some(trailers),
+            )))
+        });
+        let mut service = GatewayInterceptorGrpcService::new(inner, runtime, Some(state));
+        let input = CreateSandboxRequest {
+            name: "client-original".into(),
+            ..Default::default()
+        };
+        let request = Request::builder()
+            .uri("/openshell.v1.OpenShell/CreateSandbox")
+            .header("content-type", "application/grpc")
+            .header("x-request-id", "req-modified-1")
+            .body(boxed_body_from_bytes(grpc_frame(&input.encode_to_vec())))
+            .unwrap();
+
+        let (captured, guard) = crate::audit::test_capture::install();
+        let _ = service.ready().await.unwrap().call(request).await.unwrap();
+        drop(guard);
+        task.abort();
+
+        assert_eq!(interceptor.modifications.load(Ordering::SeqCst), 1);
+        let records: Vec<_> = captured
+            .json()
+            .into_iter()
+            .filter(|record| record["state"] == "request_modified")
+            .collect();
+        assert_eq!(records.len(), 1, "{records:?}");
+        let record = &records[0];
+        assert_eq!(record["class_uid"], 5019);
+        assert_eq!(record["status"], "Success");
+        assert_eq!(
+            record["unmapped"]["path"],
+            "/openshell.v1.OpenShell/CreateSandbox"
+        );
+        assert_eq!(record["unmapped"]["interceptors"][0], "modify-test");
+        assert_eq!(record["unmapped"]["request_id"], "req-modified-1");
+    }
+
     #[test]
     fn grpc_trailer_status_takes_precedence_over_headers() {
         let response = Response::builder()

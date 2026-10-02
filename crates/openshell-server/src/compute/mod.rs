@@ -12475,6 +12475,44 @@ mod tests {
         );
     }
 
+    /// Reconciliation mutations audit as 3004 events with the
+    /// `system:compute-reconcile` actor, about the affected sandbox.
+    #[tokio::test]
+    async fn reconcile_mutations_emit_system_actor_audit_events() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        let errored = sandbox_record("sb-err", "sandbox-err", SandboxPhase::Provisioning);
+        runtime.store.put_message(&errored).await.unwrap();
+        let removed = sandbox_record("sb-gone", "sandbox-gone", SandboxPhase::Ready);
+        runtime.store.put_message(&removed).await.unwrap();
+
+        let (captured, guard) = crate::audit::test_capture::install();
+        runtime
+            .mark_sandbox_error(&errored, "ImagePullFailed", "image not found")
+            .await;
+        runtime.apply_deleted("sb-gone").await.unwrap();
+        drop(guard);
+
+        let records: Vec<_> = captured
+            .json()
+            .into_iter()
+            .filter(|record| record["class_uid"] == 3004)
+            .collect();
+        assert_eq!(records.len(), 2, "{records:?}");
+        for record in &records {
+            assert_eq!(record["actor"]["user"]["name"], "system:compute-reconcile");
+            assert_eq!(record["status"], "Success");
+            assert_eq!(record["entity"]["type"], "sandbox");
+        }
+        assert_eq!(records[0]["activity_id"], 3);
+        assert_eq!(records[0]["entity"]["uid"], "sb-err");
+        assert_eq!(records[0]["unmapped"]["operation"], "mark_error");
+        assert_eq!(records[0]["unmapped"]["reason"], "ImagePullFailed");
+        assert_eq!(records[1]["activity_id"], 4);
+        assert_eq!(records[1]["entity"]["uid"], "sb-gone");
+        assert_eq!(records[1]["unmapped"]["operation"], "reconcile_delete");
+    }
+
     #[tokio::test]
     async fn apply_deleted_removes_store_record_even_when_driver_cleanup_fails() {
         // The driver has already told us (via the watch/prune path that led

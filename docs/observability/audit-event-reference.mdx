@@ -37,12 +37,16 @@ Entity Management records the creation, update, and deletion of control-plane re
 | Configure, delete credential refresh | Update, Delete | `provider_refresh` |
 | Rotate provider credential | Update | `credential` |
 | Create, delete sandbox | Create, Delete | `sandbox` |
+| Create, delete sandbox template | Create, Delete | `sandbox_template` |
 | Start, stop sandbox; attach, detach provider | Update | `sandbox` |
 | Exec, interactive exec, tcp forward | Update | `sandbox` |
 | Create, revoke ssh session | Create, Delete | `ssh_session` |
 | Issue, refresh sandbox token | Create, Update | `sandbox_token` |
+| Exchange provider subject token | Create | `provider_token` |
 
 Updates to a sandbox name the operation in `unmapped.operation`: `start`, `stop`, `attach_provider`, `detach_provider`, `exec`, or `forward`. Events about a sandbox carry it in `container`, and event-specific context such as `workspace`, `provider_type`, or a tcp forward `target` travels in `unmapped`.
+
+A provider subject-token exchange is credential issuance: a supervisor trades a stored provider subject token for an intermediate token, and the record names the provider as the entity and the sandbox principal as the actor, with `unmapped.operation` set to `exchanged`, the `credential_key`, and `expires_after_seconds`. Cached exchanges are recorded too. Neither the subject token, the supervisor JWT-SVID, nor the issued token enters the record.
 
 The outcome is judged on the store's actual result. A delete or revoke that matched nothing records as a `Failure`, so a no-op is never mistaken for a state change.
 

@@ -1074,7 +1074,54 @@ pub(super) async fn handle_list_sandboxes(
     }))
 }
 
+/// The audited entity for a sandbox template: the persisted id when known,
+/// otherwise just the requested name.
+fn sandbox_template_entity(id: Option<String>, name: &str) -> openshell_ocsf::ManagedEntity {
+    audit::entity("sandbox_template", id, Some(name.to_string()))
+}
+
 pub(super) async fn handle_create_sandbox_template(
+    state: &Arc<ServerState>,
+    request: Request<CreateSandboxTemplateRequest>,
+) -> Result<Response<SandboxTemplateResponse>, Status> {
+    let principal = audit::principal(&request);
+    let request_id = audit::request_id(&request);
+    let workspace =
+        super::workspace::audit_workspace_name(request.get_ref().workspace_scope.as_ref());
+    let requested_name = request
+        .get_ref()
+        .template
+        .as_ref()
+        .and_then(|template| template.metadata.as_ref())
+        .map(|metadata| metadata.name.clone())
+        .unwrap_or_default();
+    let result = handle_create_sandbox_template_inner(state, request).await;
+    let created = result
+        .as_ref()
+        .ok()
+        .and_then(|response| response.get_ref().template.as_ref())
+        .and_then(|template| template.metadata.as_ref());
+    let name = created.map_or(requested_name.as_str(), |metadata| metadata.name.as_str());
+    audit::emit_entity_outcome(
+        &state.config.audit,
+        &result,
+        audit::EntityOutcome {
+            activity: EntityActivityId::Create,
+            entity: sandbox_template_entity(created.map(|metadata| metadata.id.clone()), name),
+            sandbox: None,
+            principal: &principal,
+            request_id: request_id.as_deref(),
+            success_message: format!("sandbox template {name} created in workspace {workspace}"),
+            failure_message: format!(
+                "sandbox template {name} create in workspace {workspace} failed"
+            ),
+            unmapped: vec![("workspace", serde_json::Value::from(workspace.clone()))],
+        },
+    );
+    result
+}
+
+async fn handle_create_sandbox_template_inner(
     state: &Arc<ServerState>,
     request: Request<CreateSandboxTemplateRequest>,
 ) -> Result<Response<SandboxTemplateResponse>, Status> {
@@ -1258,6 +1305,37 @@ pub(super) async fn handle_list_sandbox_templates(
 }
 
 pub(super) async fn handle_delete_sandbox_template(
+    state: &Arc<ServerState>,
+    request: Request<DeleteSandboxTemplateRequest>,
+) -> Result<Response<DeleteSandboxTemplateResponse>, Status> {
+    let principal = audit::principal(&request);
+    let request_id = audit::request_id(&request);
+    let workspace =
+        super::workspace::audit_workspace_name(request.get_ref().workspace_scope.as_ref());
+    let name = request.get_ref().name.clone();
+    let result = handle_delete_sandbox_template_inner(state, request).await;
+    // An `allow_missing` no-op delete is not a state change.
+    audit::emit_entity_outcome_judged(
+        &state.config.audit,
+        &result,
+        |response| audit::deletion_changed_state(response.outcome),
+        audit::EntityOutcome {
+            activity: EntityActivityId::Delete,
+            entity: sandbox_template_entity(None, &name),
+            sandbox: None,
+            principal: &principal,
+            request_id: request_id.as_deref(),
+            success_message: format!("sandbox template {name} deleted from workspace {workspace}"),
+            failure_message: format!(
+                "sandbox template {name} delete from workspace {workspace} failed"
+            ),
+            unmapped: vec![("workspace", serde_json::Value::from(workspace.clone()))],
+        },
+    );
+    result
+}
+
+async fn handle_delete_sandbox_template_inner(
     state: &Arc<ServerState>,
     request: Request<DeleteSandboxTemplateRequest>,
 ) -> Result<Response<DeleteSandboxTemplateResponse>, Status> {
@@ -9248,6 +9326,72 @@ mod tests {
         assert_eq!(records[0]["activity_id"], 4);
         assert_eq!(
             records[0]["status"], "Failure",
+            "no-op delete is not a change"
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_template_create_and_delete_emit_entity_audit() {
+        let state = test_server_state().await;
+
+        let (captured, guard) = audit::test_capture::install();
+        let created = handle_create_sandbox_template(
+            &state,
+            authed_request(CreateSandboxTemplateRequest {
+                request_id: String::new(),
+                template: Some(test_workload_template("audited-tpl")),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            }),
+        )
+        .await
+        .expect("template create should succeed")
+        .into_inner()
+        .template
+        .expect("template response");
+        handle_delete_sandbox_template(
+            &state,
+            authed_request(DeleteSandboxTemplateRequest {
+                request_id: String::new(),
+                allow_missing: false,
+                name: "audited-tpl".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            }),
+        )
+        .await
+        .expect("template delete should succeed");
+        handle_delete_sandbox_template(
+            &state,
+            authed_request(DeleteSandboxTemplateRequest {
+                request_id: String::new(),
+                allow_missing: true,
+                name: "audited-tpl".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            }),
+        )
+        .await
+        .expect("allow_missing delete should succeed");
+        drop(guard);
+
+        let records = captured.json();
+        assert_eq!(records.len(), 3, "{records:?}");
+        for record in &records {
+            assert_eq!(record["class_uid"], 3004);
+            assert_eq!(record["entity"]["type"], "sandbox_template");
+            assert_eq!(record["entity"]["name"], "audited-tpl");
+            assert_eq!(record["unmapped"]["workspace"], "default");
+            assert!(record["actor"]["user"]["name"].is_string(), "{record}");
+        }
+        assert_eq!(records[0]["activity_id"], 1);
+        assert_eq!(records[0]["status"], "Success");
+        assert_eq!(
+            records[0]["entity"]["uid"],
+            created.metadata.as_ref().unwrap().id.as_str()
+        );
+        assert_eq!(records[1]["activity_id"], 4);
+        assert_eq!(records[1]["status"], "Success");
+        assert_eq!(records[2]["activity_id"], 4);
+        assert_eq!(
+            records[2]["status"], "Failure",
             "no-op delete is not a change"
         );
     }

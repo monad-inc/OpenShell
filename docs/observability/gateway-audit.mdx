@@ -19,7 +19,7 @@ Four OCSF event classes cover the surface.
 
 | Class | Covers | Examples |
 |---|---|---|
-| Entity Management (3004) | Resource create, update, and delete | Workspaces, workspace members, providers, provider profiles, provider refresh, credentials, sandboxes, sandbox provider attach and detach, ssh sessions, exec and tcp forward sessions, sandbox token issue and refresh |
+| Entity Management (3004) | Resource create, update, and delete | Workspaces, workspace members, providers, provider profiles, provider refresh, credentials, sandboxes, sandbox templates, sandbox provider attach and detach, ssh sessions, exec and tcp forward sessions, sandbox token issue and refresh, provider subject-token exchange |
 | Device Config State Change (5019) | Configuration and policy transitions | Settings updates, global and sandbox policy replacement, incremental merges, draft-policy submit, approve, reject, edit, undo and clear, service endpoint expose and delete, interceptor-modified requests |
 | Authentication (3002) | Outcomes at the authenticator boundary | Rejected or missing credentials, missing client certificates, anonymous callers, and, behind a toggle, every successful authentication |
 | Detection Finding (2004) | Suspicious patterns | A sandbox addressing another sandbox (including a mid-stream `sandbox_id` switch on log push), a sandbox principal calling a user or admin API |
@@ -27,6 +27,8 @@ Four OCSF event classes cover the surface.
 Background work also changes state. Timer-driven credential rotation, reconciliation that removes or fails a sandbox after its backend changes, and creation of the default workspace at startup each emit an Entity Management event attributed to a system actor named `system:<component>`.
 
 Read and list RPCs are not audited. Exec and SSH session input and output never enter a record; session start and the command line do.
+
+Supervisor status reports are not audited either. These RPCs report observed sandbox state rather than change control-plane state: `ReportPolicyStatus`, `ReportProviderReadiness`, `ReportEndpointStatus`, `ReportSandboxConfiguration`, and `FinalizeMainProcessExit`. Their effects surface as sandbox status and platform events in the sandbox log stream. `BeginRootfsTarStaging`, which allocates a short-lived gateway staging slot for a rootfs upload, is also not audited; the sandbox lifecycle event that uses the upload is.
 
 ## Where Records Appear
 

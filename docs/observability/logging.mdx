@@ -252,6 +252,8 @@ OCSF CONFIG:OTHER [MED] Skipping inaccessible Landlock path (best-effort) [path:
 
 Set `landlock.compatibility` to `hard_requirement` in the policy to make these failures fatal instead of degraded.
 
+The sandbox boundary process, not the supervisor, emits these Landlock events along with its other boundary-side OCSF events, such as the Landlock-unavailable finding and process signal failures. The boundary process is the workload container's entrypoint and writes them to its own stderr, filtered by its `OPENSHELL_LOG_LEVEL` (default `warn`). They land in the container log, not in the supervisor's log files. The supervisor does not push them to the gateway, so they do not appear in `openshell logs` or in OTLP log export. Collect the container log, for example with `kubectl logs` or `docker logs`, to retain them.
+
 ## Log File Location
 
 Inside the sandbox, logs are written to `/var/log/`:

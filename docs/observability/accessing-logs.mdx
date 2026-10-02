@@ -61,6 +61,8 @@ The gateway ingests at most 100 lines per push request. If a request exceeds tha
 
 Lines still in flight when the gateway connection breaks, and lines logged after the supervisor stops pushing because the gateway rejected its credentials, are not counted.
 
+Only the supervisor pushes. OCSF events emitted by the sandbox boundary process, such as Landlock setup and the Landlock-unavailable finding, are written to the container log and never reach the push channel, so neither a `telemetry_gap` line nor OTLP export accounts for them. See [Filesystem Sandbox Logs](/observability/logging#filesystem-sandbox-logs).
+
 ## Loss Awareness and Resume
 
 The watch stream behind `openshell logs` is loss-aware. Each resumable event (log line or platform event) carries an opaque `cursor` token. Status snapshots and warnings carry an empty cursor.

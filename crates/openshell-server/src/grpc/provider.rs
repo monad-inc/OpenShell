@@ -4226,7 +4226,60 @@ async fn handle_update_provider_inner(
     }
 }
 
+/// Audit one provider subject-token exchange as an Entity Management \[3004\]
+/// `Create`: credential issuance to the calling supervisor, like sandbox
+/// token minting. Cache hits are audited too — each one hands a token out of
+/// the gateway. Neither the subject token, the supervisor JWT-SVID nor the
+/// issued access token enters the record.
 pub(super) async fn handle_exchange_provider_subject_token(
+    state: &Arc<ServerState>,
+    request: Request<ExchangeProviderSubjectTokenRequest>,
+) -> Result<Response<ExchangeProviderSubjectTokenResponse>, Status> {
+    let principal = audit::principal(&request);
+    let request_id = audit::request_id(&request);
+    let sandbox_id = request.get_ref().sandbox_id.clone();
+    let provider_name = request.get_ref().provider.clone();
+    let credential_key = request.get_ref().credential_key.clone();
+    let result = handle_exchange_provider_subject_token_inner(state, request).await;
+    let success = result.is_ok();
+    let mut unmapped = vec![
+        ("operation", serde_json::Value::from("exchanged")),
+        ("sandbox_id", serde_json::Value::from(sandbox_id.clone())),
+        (
+            "credential_key",
+            serde_json::Value::from(credential_key.clone()),
+        ),
+    ];
+    if let Ok(response) = &result
+        && let Some(expires_after) = response.get_ref().expires_after.as_ref()
+    {
+        unmapped.push((
+            "expires_after_seconds",
+            serde_json::Value::from(expires_after.seconds),
+        ));
+    }
+    audit::emit_entity_outcome(
+        &state.config.audit,
+        &result,
+        audit::EntityOutcome {
+            activity: EntityActivityId::Create,
+            entity: audit::entity("provider_token", None, Some(provider_name.clone())),
+            sandbox: (success && !sandbox_id.is_empty()).then_some((sandbox_id.as_str(), "")),
+            principal: &principal,
+            request_id: request_id.as_deref(),
+            success_message: format!(
+                "provider {provider_name} subject token exchanged for {credential_key} by sandbox {sandbox_id}"
+            ),
+            failure_message: format!(
+                "provider {provider_name} subject token exchange for {credential_key} by sandbox {sandbox_id} failed"
+            ),
+            unmapped,
+        },
+    );
+    result
+}
+
+async fn handle_exchange_provider_subject_token_inner(
     state: &Arc<ServerState>,
     request: Request<ExchangeProviderSubjectTokenRequest>,
 ) -> Result<Response<ExchangeProviderSubjectTokenResponse>, Status> {
@@ -9746,6 +9799,51 @@ mod tests {
             resolved.get("OPENAI_API_KEY").map(String::as_str),
             Some("sk-winner")
         );
+    }
+
+    /// A subject-token exchange is credential issuance: it audits as a 3004
+    /// `Create` on a `provider_token` with the sandbox principal as actor,
+    /// and the supervisor JWT-SVID never enters the record.
+    #[tokio::test]
+    async fn provider_subject_token_exchange_emits_entity_audit_without_secrets() {
+        use crate::auth::principal::{SandboxIdentitySource, SandboxPrincipal};
+
+        let state = test_server_state().await;
+        let mut request = Request::new(ExchangeProviderSubjectTokenRequest {
+            sandbox_id: "sb-exchange".to_string(),
+            provider: "corp-idp".to_string(),
+            credential_key: "ACCESS_TOKEN".to_string(),
+            supervisor_jwt_svid: "svid-super-secret".to_string(),
+        });
+        request
+            .extensions_mut()
+            .insert(Principal::Sandbox(SandboxPrincipal {
+                sandbox_id: "sb-exchange".to_string(),
+                source: SandboxIdentitySource::BootstrapJwt {
+                    issuer: "gateway".to_string(),
+                },
+                trust_domain: None,
+            }));
+
+        let (captured, guard) = audit::test_capture::install();
+        let error = handle_exchange_provider_subject_token(&state, request)
+            .await
+            .expect_err("unknown sandbox should fail");
+        drop(guard);
+        assert_eq!(error.code(), Code::NotFound);
+
+        let records = captured.json();
+        assert_eq!(records.len(), 1, "{records:?}");
+        let record = &records[0];
+        assert_eq!(record["class_uid"], 3004);
+        assert_eq!(record["activity_id"], 1);
+        assert_eq!(record["status"], "Failure");
+        assert_eq!(record["entity"]["type"], "provider_token");
+        assert_eq!(record["entity"]["name"], "corp-idp");
+        assert_eq!(record["actor"]["user"]["uid"], "sb-exchange");
+        assert_eq!(record["unmapped"]["operation"], "exchanged");
+        assert_eq!(record["unmapped"]["credential_key"], "ACCESS_TOKEN");
+        assert!(!record.to_string().contains("svid-super-secret"));
     }
 
     /// Provider-family mutations leave a 3004 audit trail, and credential
