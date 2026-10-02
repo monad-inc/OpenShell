@@ -91,6 +91,8 @@ runs:
       shell: bash
       env:
         IMAGE_REF: ${{ inputs.registry }}/${{ inputs.component }}:${{ inputs.image-tag }}
+        # Hosted runners ship podman too; attestations only exist on the buildx path.
+        CONTAINER_ENGINE: docker
       run: tasks/scripts/verify-image-sbom.sh "${IMAGE_REF}" --require-cargo
 
     - name: Upload ${{ inputs.component }} image
