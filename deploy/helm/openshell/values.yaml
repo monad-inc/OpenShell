@@ -270,6 +270,19 @@ server:
     endpoint: ""
     # -- Gateway OpenTelemetry service name. Empty uses openshell-gateway.
     serviceName: ""
+    # Authentication for a hosted OTLP collector.
+    #
+    # The gateway authenticates through the standard OpenTelemetry header
+    # variables -- there is no `headers` field in the gateway TOML -- so this
+    # has to reach the process as an environment variable. Reference a Secret
+    # holding the full header string, for example
+    # `authorization=Bearer <token>`, rather than putting a token in values.
+    headersSecret:
+      # -- Name of an existing Secret holding the OTLP header string. Empty
+      # disables the env var entirely.
+      name: ""
+      # -- Key within that Secret. Defaults to OTEL_EXPORTER_OTLP_HEADERS.
+      key: ""
     # -- Also export gateway and sandbox logs (including OCSF events) as OTLP
     # log records to the same endpoint. Drops are reported downstream as
     # telemetry_gap records.

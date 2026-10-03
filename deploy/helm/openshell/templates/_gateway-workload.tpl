@@ -122,6 +122,20 @@ spec:
         - name: SSL_CERT_FILE
           value: /etc/openshell-tls/oidc-ca/ca.crt
         {{- end }}
+        {{- with .Values.server.otlp.headersSecret }}
+        {{- if .name }}
+        # OTLP collector authentication. The gateway reads the standard
+        # OpenTelemetry header variables; there is no `headers` field in the
+        # gateway TOML, so a hosted collector can only be authenticated through
+        # the process environment. Sourced from a Secret so the token is never
+        # a chart value or a rendered manifest literal.
+        - name: OTEL_EXPORTER_OTLP_HEADERS
+          valueFrom:
+            secretKeyRef:
+              name: {{ .name | quote }}
+              key: {{ .key | default "OTEL_EXPORTER_OTLP_HEADERS" | quote }}
+        {{- end }}
+        {{- end }}
         - name: OPENSHELL_TELEMETRY_ENABLED
           value: {{ .Values.server.telemetryEnabled | quote }}
         {{- if .Values.server.providerTokenGrants.spiffe.enabled }}
