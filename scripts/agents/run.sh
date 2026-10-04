@@ -806,6 +806,11 @@ case "$HARNESS" in
             "CODEX_REASONING=${CODEX_REASONING:-$HARNESS_REASONING}"
         )
         ;;
+    claude)
+        HARNESS_ENV_ARGS+=(
+            "CLAUDE_MODEL=${CLAUDE_MODEL:-$HARNESS_MODEL}"
+        )
+        ;;
 esac
 
 SANDBOX_CREATE_CMD=(
