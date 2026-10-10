@@ -142,9 +142,14 @@ final_result_text() {
     local stream="$1"
 
     if command -v jq >/dev/null 2>&1; then
-        # Only the last result line reaches jq: the stream can be hundreds of
-        # MB, and slurping it would hold all of it in memory.
-        grep -E '^\{"type":"result"' "$stream" | tail -n 1 | jq -r '.result // empty' 2>/dev/null || true
+        # Only candidate lines reach jq: the stream can be hundreds of MB, and
+        # slurping it would hold all of it in memory. Claude Code does not keep
+        # a stable key order (the result event has led with "type" in one
+        # release and with "is_error" in another), so match the key anywhere
+        # and let jq pick the top-level result event.
+        grep -F '"type":"result"' "$stream" \
+            | jq -nrR '[inputs | fromjson? | select(type == "object" and .type == "result")]
+                       | last | .result // empty' 2>/dev/null || true
         return
     fi
     python3 -c '

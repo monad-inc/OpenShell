@@ -32,7 +32,9 @@ fi
 printf '%s\n' '{"type":"system","subtype":"init","session_id":"s-1"}'
 printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"echo hi"}}]},"session_id":"s-1"}'
 printf '%s\n' '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"hi"}]},"session_id":"s-1"}'
-printf '%s\n' '{"type":"result","subtype":"success","result":"All quiet.\nOPENSHELL_AGENT_RESULT {\"status\":\"complete\",\"reason\":\"no alerts\"}","total_cost_usd":0.01,"session_id":"s-1"}'
+# Key order as Claude Code actually emits it: `type` is not first, and a
+# nested object carries a "type" of its own.
+printf '%s\n' '{"is_error":false,"num_turns":3,"usage":{"type":"usage"},"result":"All quiet.\nOPENSHELL_AGENT_RESULT {\"status\":\"complete\",\"reason\":\"no alerts\"}","total_cost_usd":0.01,"session_id":"s-1","subtype":"success","type":"result"}'
 exit "${MOCK_EXIT:-0}"
 MOCK
 chmod +x "$TMP_DIR/claude"
@@ -48,7 +50,7 @@ run_adapter() {
 
 run_adapter || { cat "$TMP_DIR/stderr" >&2; echo "not ok - adapter failed" >&2; exit 1; }
 
-[[ "$(grep -c '^{"type":' "$TMP_DIR/stdout")" -eq 4 ]] \
+[[ "$(grep -c '^{' "$TMP_DIR/stdout")" -eq 4 ]] \
     || { echo "not ok - stream-json events missing from stdout" >&2; exit 1; }
 sentinel="$(grep '^OPENSHELL_AGENT_RESULT ' "$TMP_DIR/stdout")"
 [[ "$sentinel" == 'OPENSHELL_AGENT_RESULT {"status":"complete","reason":"no alerts"}' ]] \
