@@ -201,8 +201,14 @@ emit "HARNESS_REASONING", harness_config.fetch("reasoning", "")
 # The harness is installed into the image at build time, at this version. No
 # default: the version decides the event format the supervisor exports, so an
 # upgrade is a deliberate edit here, and `latest` is accepted only when written.
-harness_version = harness_config.fetch("version", "").to_s
-abort "harness.supported.#{harness}.version is not set: pin the #{harness} version (use \"latest\" only deliberately)" if harness_version.empty?
+# A string, never a YAML number: an unquoted `0.162` parses as a Float, which
+# npm would treat as a range and install a version the sandbox then refuses.
+harness_version = harness_config["version"]
+abort "harness.supported.#{harness}.version is not set: pin the #{harness} version (use \"latest\" only deliberately)" if harness_version.nil? || harness_version.to_s.empty?
+abort "harness.supported.#{harness}.version must be a quoted string, got #{harness_version.inspect}" unless harness_version.is_a?(String)
+unless harness_version == "latest" || harness_version.match?(/\A(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?\z/)
+  abort "harness.supported.#{harness}.version #{harness_version.inspect} is not an exact version such as 0.162.1, or \"latest\""
+end
 emit "HARNESS_VERSION", harness_version
 emit "SANDBOX_NAME_PREFIX", manifest.dig("sandbox", "name_prefix") || manifest.fetch("id")
 emit "SANDBOX_FROM_DEFAULT", manifest.dig("sandbox", "from") || "agent://."
@@ -720,6 +726,21 @@ RUBY
     log "Building sandbox image '$image_tag' with $CONTAINER_ENGINE ($HARNESS $HARNESS_VERSION)."
     ce_build --load --build-arg "$version_arg=$HARNESS_VERSION" \
         --file "$build_dockerfile" --tag "$image_tag" "$build_context"
+
+    # Check the pin against the image now, while the launcher is still in
+    # front of the operator. The sandbox entrypoint refuses a mismatch too, but
+    # a detached, ephemeral sandbox that exits at start is easy to never see.
+    # Runs the same version.sh the entrypoint does, so a payload-local binary
+    # (--codex-bin) is what gets checked.
+    if [[ "$HARNESS_VERSION" != "latest" ]]; then
+        local image_version
+        image_version="$("$CONTAINER_ENGINE" run --rm --entrypoint bash "$image_tag" \
+            "$PAYLOAD_IMAGE_DIR/runtime/harnesses/$HARNESS/version.sh")" \
+            || fail "could not read the $HARNESS version from '$image_tag'"
+        [[ "$image_version" == "$HARNESS_VERSION" ]] \
+            || fail "image '$image_tag' carries $HARNESS ${image_version:-unknown}, but agent.yaml pins $HARNESS_VERSION"
+        log "Image carries $HARNESS $image_version, matching the pin."
+    fi
     SANDBOX_FROM="$image_tag"
 }
 
