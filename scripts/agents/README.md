@@ -36,7 +36,12 @@ sections:
 - `id`, `display_name`, `description`: human and runtime identity.
 - `sandbox`: default sandbox name prefix, gateway, and source image or Dockerfile.
 - `harness`: default harness and per-harness settings such as model and
-  reasoning effort.
+  reasoning effort. Each harness also pins its `version`, which is required.
+  The launcher passes it to the image build as a build argument
+  (`CLAUDE_CODE_VERSION` or `CODEX_VERSION`), and the sandbox entrypoint refuses
+  to start if the image carries a different version. The version decides the
+  event format the supervisor exports, so an upgrade is a deliberate edit;
+  `latest` is accepted only when written explicitly, and skips the check.
 - `runtime`: in-sandbox run mode (`once` or `watch`), watch poll interval, and
   transient failure logging threshold.
 - `profile_paths`: ordered directories to scan for provider profile YAML files.
