@@ -256,7 +256,7 @@ Workspace storage settings cannot change after a sandbox is created. Delete and 
 
 ### Kubernetes PVC Mounts
 
-Mount existing PersistentVolumeClaims into the agent container through driver config. Any mount under `/sandbox` replaces the default workspace PVC for that sandbox.
+Mount existing PersistentVolumeClaims into the agent container through driver config. Any PVC mount under `/sandbox` replaces the default workspace PVC for that sandbox.
 
 ```shell
 openshell sandbox create \
@@ -330,7 +330,7 @@ openshell sandbox create \
 | `volumes[].config_map.default_mode` | Optional mode for projected files, as a decimal integer. Kubernetes defaults to `0644`. |
 | `volumes[].config_map.optional` | Must be `false` or unset, because admission requires the ConfigMap to exist. |
 
-ConfigMap mounts are always read-only, and the driver rejects `read_only: false` on them. Mount targets follow the same rules as PVC mounts, so paths under `/etc/openshell` and other OpenShell control paths are rejected. Kubernetes refreshes mounted files after the ConfigMap changes, except files mounted with `sub_path`.
+ConfigMap mounts are always read-only, and the driver rejects `read_only: false` on them. Mount targets follow the same rules as PVC mounts, so paths under `/etc/openshell` and other OpenShell control paths are rejected. Kubernetes refreshes mounted files after the ConfigMap changes, except files mounted with `sub_path`. A ConfigMap mount under `/sandbox` keeps the default workspace PVC.
 
 Label the ConfigMap for the sandbox's workspace before you create the sandbox, as you would a PVC. [External Resource Admission](/how-it-works/gateways/configuration#external-resource-admission) lists the labels:
 

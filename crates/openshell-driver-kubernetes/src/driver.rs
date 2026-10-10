@@ -393,12 +393,19 @@ impl KubernetesSandboxDriverConfig {
         )
     }
 
+    /// Whether a PVC mount under `/sandbox` takes ownership of workspace
+    /// persistence. `ConfigMap` mounts are read-only content, not persistence,
+    /// so they never suppress the default workspace volume.
     fn has_explicit_sandbox_data_mount(&self) -> bool {
         self.containers.agent.volume_mounts.iter().any(|mount| {
-            driver_mounts::path_is_or_under(
-                Path::new(&mount.mount_path),
-                Path::new(WORKSPACE_MOUNT_PATH),
-            )
+            let is_pvc = self.volumes.iter().any(|volume| {
+                volume.name == mount.name && volume.persistent_volume_claim.is_some()
+            });
+            is_pvc
+                && driver_mounts::path_is_or_under(
+                    Path::new(&mount.mount_path),
+                    Path::new(WORKSPACE_MOUNT_PATH),
+                )
         })
     }
 }
@@ -6278,7 +6285,7 @@ fn sandbox_to_k8s_spec(
     let mut root = serde_json::Map::new();
 
     // Determine early whether OpenShell should inject its default workspace
-    // PVC. Explicit Kubernetes driver-config mounts under /sandbox/ take
+    // PVC. Explicit Kubernetes driver-config PVC mounts under /sandbox/ take
     // ownership of workspace persistence.
     // We need this flag before building the podTemplate because the workspace
     // persistence transforms are applied inside sandbox_template_to_k8s.
@@ -9697,6 +9704,51 @@ mod tests {
             err.contains("conflicts with reserved OpenShell path '/etc/openshell'"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn driver_config_config_map_under_sandbox_keeps_default_workspace_pvc() {
+        let template = config_map_driver_config(
+            serde_json::json!({"name": "agent-payload-triage"}),
+            serde_json::json!({"name": "agent-payload", "mount_path": "/sandbox/.agent-payload"}),
+        );
+        let config = KubernetesSandboxDriverConfig::from_template(&template)
+            .expect("ConfigMap mount under /sandbox should validate");
+        assert!(!config.has_explicit_sandbox_data_mount());
+
+        let spec = SandboxSpec {
+            template: Some(template),
+            ..SandboxSpec::default()
+        };
+        let cr = sandbox_to_k8s_spec_for_test(Some(&spec), &SandboxPodParams::default());
+        let pod_spec = &cr["spec"]["podTemplate"]["spec"];
+
+        assert!(
+            cr["spec"]["volumeClaimTemplates"]
+                .as_array()
+                .is_some_and(|templates| !templates.is_empty()),
+            "a ConfigMap mount under /sandbox must keep the default workspace VCT"
+        );
+        assert!(
+            pod_spec["initContainers"]
+                .as_array()
+                .is_some_and(|containers| containers
+                    .iter()
+                    .any(|container| container["name"] == WORKSPACE_INIT_CONTAINER_NAME)),
+            "a ConfigMap mount under /sandbox must keep the workspace init container"
+        );
+        let mounts = pod_spec["containers"][0]["volumeMounts"]
+            .as_array()
+            .expect("volumeMounts should exist");
+        assert!(
+            mounts
+                .iter()
+                .any(|mount| mount["name"] == WORKSPACE_VOLUME_NAME
+                    && mount["mountPath"] == WORKSPACE_MOUNT_PATH)
+        );
+        assert!(mounts.iter().any(|mount| mount["name"] == "agent-payload"
+            && mount["mountPath"] == "/sandbox/.agent-payload"
+            && mount["readOnly"] == true));
     }
 
     #[test]

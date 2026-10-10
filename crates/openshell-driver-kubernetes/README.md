@@ -291,8 +291,9 @@ openshell sandbox create \
   -- claude
 ```
 
-Any explicit driver-config mount under `/sandbox` disables the driver's
-default `/sandbox` workspace PVC injection for that sandbox. Only the explicit
+Any explicit driver-config PVC mount under `/sandbox` disables the driver's
+default `/sandbox` workspace PVC injection for that sandbox. ConfigMap mounts
+are read-only content, not persistence, so they never disable it. Only the explicit
 mount paths persist through the external PVC; other `/sandbox` paths come from
 the current sandbox image.
 
