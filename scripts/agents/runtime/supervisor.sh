@@ -188,7 +188,10 @@ classify_transient_failure() {
     # for a transport failure.
     {
         cat "$cycle_dir/stderr"
-        grep -E '^\{"type":"(error|turn\.failed)"|^\{"type":"result".*"is_error":true' "$cycle_dir/stdout" || true
+        # Key order is not stable across harness releases, so match the
+        # event type and the error flag anywhere in the line.
+        grep -E '"type":"(error|turn\.failed)"' "$cycle_dir/stdout" || true
+        grep -F '"type":"result"' "$cycle_dir/stdout" | grep -F '"is_error":true' || true
     } | grep -Eiq 'stream disconnected before completion|failed to connect to websocket|Reconnecting\.\.\.|Broken pipe|Connection to sandbox closed by remote host|peer closed connection without sending TLS close_notify'
 }
 
