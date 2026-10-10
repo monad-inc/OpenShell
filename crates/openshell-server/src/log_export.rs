@@ -41,7 +41,7 @@
 //! `openshell_ocsf_log_*` convention: `openshell_otlp_log_queued_total`,
 //! `openshell_otlp_log_exported_total`, `openshell_otlp_log_export_errors_total`
 //! and `openshell_otlp_log_dropped_total{reason}` with `reason` one of
-//! `queue_full`, `export_failed`, `closed`, `shutdown` or
+//! `queue_full`, `agent_budget`, `export_failed`, `closed`, `shutdown` or
 //! `shutdown_uncertain`. Loss at shutdown has no later export to carry a gap
 //! record, so the metrics are its only trace.
 //!
@@ -49,9 +49,9 @@
 //! collector committed the batch is retried, so consumers must tolerate
 //! occasional duplicate records.
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use openshell_core::proto::SandboxLogLine;
@@ -79,6 +79,141 @@ const QUEUE_CAPACITY: usize = 65_536;
 
 /// Maximum records per exported batch.
 const MAX_BATCH: usize = 512;
+
+/// Approximate payload bytes per exported batch. A sandbox exporting its
+/// agent's output pushes records of up to 64 KiB, so 512 of them could pass
+/// the 4 MiB default gRPC receive limit of an OpenTelemetry Collector and be
+/// rejected on every attempt. A batch closes once it carries this much.
+const MAX_BATCH_BYTES: usize = 2 * 1024 * 1024;
+
+/// Approximate bytes held by queued lines. Bounds export memory during a
+/// collector outage when lines are large, alongside [`QUEUE_CAPACITY`] for
+/// when they are many. Lines beyond it are counted like a full queue.
+const QUEUE_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+/// Bytes of the queue that agent output lines, from all sandboxes together,
+/// may hold. The rest is reserved for OCSF, audit and diagnostic records, so a
+/// sandbox flooding its agent's output cannot get other records dropped.
+const AGENT_QUEUE_MAX_BYTES: usize = QUEUE_MAX_BYTES / 4;
+
+/// Bytes of the queue one sandbox's agent output may hold, so one sandbox
+/// cannot take the whole agent share from the others.
+const AGENT_QUEUE_MAX_BYTES_PER_SANDBOX: usize = 4 * 1024 * 1024;
+
+/// Queue slots agent output lines may hold, from all sandboxes together.
+const AGENT_QUEUE_MAX_LINES: usize = QUEUE_CAPACITY / 2;
+
+fn is_agent_line(line: &SandboxLogLine) -> bool {
+    line.source == openshell_core::agent_output::AGENT_LOG_SOURCE
+}
+
+/// Agent output's share of the queue, and what it had to drop.
+#[derive(Debug, Default)]
+struct AgentQueue {
+    bytes: usize,
+    lines: usize,
+    bytes_by_sandbox: HashMap<String, usize>,
+    /// Agent lines refused since the last report, per sandbox.
+    dropped_by_sandbox: BTreeMap<String, u64>,
+}
+
+/// Byte accounting for the export queue, shared by the handle that admits
+/// lines and the worker that takes them.
+#[derive(Debug)]
+struct QueueBudget {
+    bytes: AtomicUsize,
+    max_bytes: usize,
+    agent: Mutex<AgentQueue>,
+}
+
+/// Why [`QueueBudget::admit`] refused a line.
+enum Refusal {
+    /// The queue as a whole is full; counted toward the shared gap record.
+    QueueFull,
+    /// Agent output is over its share; reported per sandbox.
+    AgentBudget,
+}
+
+impl QueueBudget {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            bytes: AtomicUsize::new(0),
+            max_bytes,
+            agent: Mutex::new(AgentQueue::default()),
+        }
+    }
+
+    fn admit(&self, line: &SandboxLogLine, bytes: usize) -> Result<(), Refusal> {
+        let agent = is_agent_line(line);
+        if agent {
+            let mut queue = self.agent.lock().expect("agent queue lock poisoned");
+            let sandbox_bytes = queue
+                .bytes_by_sandbox
+                .get(&line.sandbox_id)
+                .copied()
+                .unwrap_or(0);
+            if queue.bytes + bytes > AGENT_QUEUE_MAX_BYTES
+                || sandbox_bytes + bytes > AGENT_QUEUE_MAX_BYTES_PER_SANDBOX
+                || queue.lines >= AGENT_QUEUE_MAX_LINES
+            {
+                *queue
+                    .dropped_by_sandbox
+                    .entry(line.sandbox_id.clone())
+                    .or_default() += 1;
+                return Err(Refusal::AgentBudget);
+            }
+            queue.bytes += bytes;
+            queue.lines += 1;
+            *queue
+                .bytes_by_sandbox
+                .entry(line.sandbox_id.clone())
+                .or_default() += bytes;
+        }
+        let queued = self.bytes.fetch_add(bytes, Ordering::Relaxed);
+        if queued + bytes > self.max_bytes {
+            self.release(agent, &line.sandbox_id, bytes);
+            return Err(Refusal::QueueFull);
+        }
+        Ok(())
+    }
+
+    /// Return an admitted line's bytes: to the queue total and, for agent
+    /// output, to the agent share.
+    fn release(&self, agent: bool, sandbox_id: &str, bytes: usize) {
+        self.bytes.fetch_sub(bytes, Ordering::Relaxed);
+        if !agent {
+            return;
+        }
+        let mut queue = self.agent.lock().expect("agent queue lock poisoned");
+        queue.bytes -= bytes;
+        queue.lines -= 1;
+        if let Some(sandbox_bytes) = queue.bytes_by_sandbox.get_mut(sandbox_id) {
+            *sandbox_bytes -= bytes;
+            if *sandbox_bytes == 0 {
+                queue.bytes_by_sandbox.remove(sandbox_id);
+            }
+        }
+    }
+
+    fn release_line(&self, line: &SandboxLogLine) {
+        self.release(is_agent_line(line), &line.sandbox_id, line_bytes(line));
+    }
+
+    fn take_agent_drops(&self) -> BTreeMap<String, u64> {
+        let mut queue = self.agent.lock().expect("agent queue lock poisoned");
+        std::mem::take(&mut queue.dropped_by_sandbox)
+    }
+}
+
+/// Rough size of a queued line, for the byte bounds above.
+fn line_bytes(line: &SandboxLogLine) -> usize {
+    let fields: usize = line
+        .fields
+        .iter()
+        .map(|(key, value)| key.len() + value.len())
+        .sum();
+    line.message.len() + line.target.len() + line.sandbox_id.len() + fields + 64
+}
 
 /// Attempts per batch before it is dropped and accounted. With the backoff
 /// below this rides out ~30s of collector unavailability per batch while
@@ -109,6 +244,7 @@ fn count_dropped(reason: &'static str, n: usize) {
 #[derive(Clone, Debug)]
 pub struct LogExportHandle {
     tx: mpsc::Sender<SandboxLogLine>,
+    budget: Arc<QueueBudget>,
     dropped: Arc<AtomicU64>,
     dropped_since_ms: Arc<AtomicI64>,
 }
@@ -120,15 +256,36 @@ impl LogExportHandle {
     /// `telemetry_gap`; a stopped worker (shutdown) cannot carry a gap record
     /// any more, so that loss is counted in metrics only.
     pub fn enqueue(&self, line: SandboxLogLine) {
+        let bytes = line_bytes(&line);
+        match self.budget.admit(&line, bytes) {
+            Ok(()) => {}
+            Err(Refusal::QueueFull) => {
+                self.count_queue_full();
+                return;
+            }
+            Err(Refusal::AgentBudget) => {
+                // Reported per sandbox by the worker's next export.
+                count_dropped("agent_budget", 1);
+                return;
+            }
+        }
         match self.tx.try_send(line) {
             Ok(()) => metrics::counter!("openshell_otlp_log_queued_total").increment(1),
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                note_drop_window(&self.dropped_since_ms, openshell_core::time::now_ms());
-                self.dropped.fetch_add(1, Ordering::Relaxed);
-                count_dropped("queue_full", 1);
+            Err(mpsc::error::TrySendError::Full(line)) => {
+                self.budget.release_line(&line);
+                self.count_queue_full();
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => count_dropped("closed", 1),
+            Err(mpsc::error::TrySendError::Closed(line)) => {
+                self.budget.release_line(&line);
+                count_dropped("closed", 1);
+            }
         }
+    }
+
+    fn count_queue_full(&self) {
+        note_drop_window(&self.dropped_since_ms, openshell_core::time::now_ms());
+        self.dropped.fetch_add(1, Ordering::Relaxed);
+        count_dropped("queue_full", 1);
     }
 }
 
@@ -241,7 +398,13 @@ pub fn spawn<E>(
 where
     E: LogExporter + 'static,
 {
-    spawn_with_capacity(exporter, resource, ocsf_full_payload, QUEUE_CAPACITY)
+    spawn_with_capacity(
+        exporter,
+        resource,
+        ocsf_full_payload,
+        QUEUE_CAPACITY,
+        QUEUE_MAX_BYTES,
+    )
 }
 
 fn spawn_with_capacity<E>(
@@ -249,6 +412,7 @@ fn spawn_with_capacity<E>(
     resource: Resource,
     ocsf_full_payload: bool,
     capacity: usize,
+    max_queued_bytes: usize,
 ) -> (LogExportHandle, LogExportWorker)
 where
     E: LogExporter + 'static,
@@ -257,12 +421,16 @@ where
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let dropped = Arc::new(AtomicU64::new(0));
     let dropped_since_ms = Arc::new(AtomicI64::new(0));
+    let budget = Arc::new(QueueBudget::new(max_queued_bytes));
 
     exporter.set_resource(&resource);
 
     let task = tokio::spawn(run_export_loop(
         exporter,
-        rx,
+        QueueReceiver {
+            rx,
+            budget: Arc::clone(&budget),
+        },
         shutdown_rx,
         Arc::clone(&dropped),
         Arc::clone(&dropped_since_ms),
@@ -273,6 +441,7 @@ where
     (
         LogExportHandle {
             tx,
+            budget,
             dropped,
             dropped_since_ms,
         },
@@ -297,9 +466,38 @@ impl Batch {
     }
 }
 
+/// The worker's end of the export queue, releasing each line's bytes from the
+/// shared byte budget as it is taken.
+struct QueueReceiver {
+    rx: mpsc::Receiver<SandboxLogLine>,
+    budget: Arc<QueueBudget>,
+}
+
+impl QueueReceiver {
+    fn release(&self, line: &SandboxLogLine) {
+        self.budget.release_line(line);
+    }
+
+    async fn recv(&mut self) -> Option<SandboxLogLine> {
+        let line = self.rx.recv().await?;
+        self.release(&line);
+        Some(line)
+    }
+
+    fn try_recv(&mut self) -> Option<SandboxLogLine> {
+        let line = self.rx.try_recv().ok()?;
+        self.release(&line);
+        Some(line)
+    }
+
+    fn len(&self) -> usize {
+        self.rx.len()
+    }
+}
+
 async fn run_export_loop<E: LogExporter>(
     exporter: E,
-    mut rx: mpsc::Receiver<SandboxLogLine>,
+    mut rx: QueueReceiver,
     mut shutdown_rx: watch::Receiver<bool>,
     dropped: Arc<AtomicU64>,
     dropped_since_ms: Arc<AtomicI64>,
@@ -326,11 +524,19 @@ async fn run_export_loop<E: LogExporter>(
             },
             _ = shutdown_rx.wait_for(|&stop| stop) => break,
         };
+        let first_bytes = line_bytes(&first);
         batch
             .records
             .push(record_for(&logger, first, ocsf_full_payload));
-        fill(&mut batch.records, &mut rx, &logger, ocsf_full_payload);
+        fill(
+            &mut batch.records,
+            first_bytes,
+            &mut rx,
+            &logger,
+            ocsf_full_payload,
+        );
         batch.gap = push_gap_record(&mut batch.records, &logger, &dropped, &dropped_since_ms);
+        push_agent_gap_records(&mut batch.records, &logger, &rx.budget);
 
         match export_with_retry(&exporter, &batch.records, &scope, &mut shutdown_rx).await {
             ExportOutcome::Delivered => {
@@ -359,8 +565,9 @@ async fn run_export_loop<E: LogExporter>(
     // just failed is not coming back within it.
     loop {
         batch.records.clear();
-        fill(&mut batch.records, &mut rx, &logger, ocsf_full_payload);
+        fill(&mut batch.records, 0, &mut rx, &logger, ocsf_full_payload);
         batch.gap = push_gap_record(&mut batch.records, &logger, &dropped, &dropped_since_ms);
+        push_agent_gap_records(&mut batch.records, &logger, &rx.budget);
         if batch.records.is_empty() {
             break;
         }
@@ -375,17 +582,21 @@ async fn run_export_loop<E: LogExporter>(
     let _ = exporter.shutdown();
 }
 
+/// Top up `records` from the queue until the batch holds [`MAX_BATCH`]
+/// records or about [`MAX_BATCH_BYTES`], starting from `bytes` already in it.
 fn fill(
     records: &mut Vec<SdkLogRecord>,
-    rx: &mut mpsc::Receiver<SandboxLogLine>,
+    mut bytes: usize,
+    rx: &mut QueueReceiver,
     logger: &SdkLogger,
     ocsf_full_payload: bool,
 ) {
-    while records.len() < MAX_BATCH {
-        match rx.try_recv() {
-            Ok(line) => records.push(record_for(logger, line, ocsf_full_payload)),
-            Err(_) => break,
-        }
+    while records.len() < MAX_BATCH && bytes < MAX_BATCH_BYTES {
+        let Some(line) = rx.try_recv() else {
+            break;
+        };
+        bytes += line_bytes(&line);
+        records.push(record_for(logger, line, ocsf_full_payload));
     }
 }
 
@@ -500,6 +711,41 @@ fn push_gap_record(
     record.add_attribute(Key::from_static_str("dropped.since_ms"), since_ms);
     records.push(record);
     Some((n, since_ms))
+}
+
+/// Append one `telemetry_gap` record per sandbox whose agent output was
+/// refused for exceeding its share of the queue. Each names the sandbox, so
+/// the loss is attributed to the sandbox that caused it rather than folded
+/// into the shared count.
+fn push_agent_gap_records(
+    records: &mut Vec<SdkLogRecord>,
+    logger: &SdkLogger,
+    budget: &QueueBudget,
+) {
+    for (sandbox_id, n) in budget.take_agent_drops() {
+        let now = SystemTime::now();
+        let mut record = logger.create_log_record();
+        record.set_severity_number(Severity::Warn);
+        record.set_timestamp(now);
+        record.set_observed_timestamp(now);
+        record.set_body(AnyValue::String(
+            format!(
+                "telemetry gap: {n} agent output record(s) dropped over the sandbox's export share"
+            )
+            .into(),
+        ));
+        record.add_attribute(Key::from_static_str("log.source"), "gateway");
+        record.add_attribute(Key::from_static_str("log.target"), "telemetry_gap");
+        record.add_attribute(Key::from_static_str("log.level"), "WARN");
+        record.add_attribute(Key::from_static_str("log.ocsf"), false);
+        record.add_attribute(Key::from_static_str("sandbox.id"), sandbox_id);
+        record.add_attribute(Key::from_static_str("stream"), "agent");
+        record.add_attribute(
+            Key::from_static_str("dropped"),
+            i64::try_from(n).unwrap_or(i64::MAX),
+        );
+        records.push(record);
+    }
 }
 
 /// Convert a [`SandboxLogLine`] into an OTLP log record.
@@ -1014,6 +1260,7 @@ mod tests {
             Resource::builder_empty().build(),
             false,
             2,
+            usize::MAX,
         );
 
         for i in 0..10 {
@@ -1034,6 +1281,121 @@ mod tests {
             "the gap carries its window start"
         );
         assert!(body_of(gap).contains("8 gateway log record(s) dropped"));
+    }
+
+    #[tokio::test]
+    async fn queued_bytes_are_bounded_and_overflow_is_accounted() {
+        // Room for many lines but only about three 64 KiB ones.
+        let exporter = InMemoryLogExporter::default();
+        let (handle, worker) = spawn_with_capacity(
+            KeptExporter(exporter.clone()),
+            Resource::builder_empty().build(),
+            false,
+            1024,
+            3 * 64 * 1024 + 1024,
+        );
+
+        for _ in 0..10 {
+            handle.enqueue(plain_line(&"x".repeat(64 * 1024)));
+        }
+        worker.shutdown().await;
+
+        let emitted = exporter.get_emitted_logs().unwrap();
+        let (gaps, lines): (Vec<_>, Vec<_>) = emitted.iter().partition(|log| is_gap(&log.record));
+        assert_eq!(lines.len(), 3, "lines within the byte budget are exported");
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(
+            attribute(&gaps[0].record, "dropped"),
+            Some(AnyValue::Int(7))
+        );
+    }
+
+    fn agent_line(sandbox_id: &str, message: &str) -> SandboxLogLine {
+        SandboxLogLine {
+            sandbox_id: sandbox_id.to_string(),
+            source: openshell_core::agent_output::AGENT_LOG_SOURCE.to_string(),
+            target: openshell_core::agent_output::AGENT_STDOUT_TARGET.to_string(),
+            ..plain_line(message)
+        }
+    }
+
+    #[tokio::test]
+    async fn one_sandboxs_agent_output_cannot_crowd_out_other_records() {
+        let exporter = InMemoryLogExporter::default();
+        let (handle, worker) = spawn(
+            KeptExporter(exporter.clone()),
+            Resource::builder_empty().build(),
+            false,
+        );
+
+        // Far more than one sandbox's agent share, then ordinary records.
+        let big = "x".repeat(64 * 1024);
+        for _ in 0..1000 {
+            handle.enqueue(agent_line("sb-noisy", &big));
+        }
+        handle.enqueue(agent_line("sb-quiet", "quiet agent line"));
+        for i in 0..100 {
+            handle.enqueue(ocsf_line(&format!("NET:OPEN [INFO] ALLOWED {i}")));
+        }
+        worker.shutdown().await;
+
+        let emitted = exporter.get_emitted_logs().unwrap();
+        let ocsf = emitted
+            .iter()
+            .filter(|log| attribute(&log.record, "log.ocsf") == Some(AnyValue::Boolean(true)))
+            .count();
+        assert_eq!(ocsf, 100, "every OCSF record is exported");
+        assert!(
+            emitted
+                .iter()
+                .any(|log| body_of(&log.record) == "quiet agent line"),
+            "another sandbox's agent output keeps its own share"
+        );
+        let noisy = emitted
+            .iter()
+            .filter(|log| body_of(&log.record) == big)
+            .count();
+        assert!(noisy * 64 * 1024 <= AGENT_QUEUE_MAX_BYTES_PER_SANDBOX);
+
+        let gap = emitted
+            .iter()
+            .find(|log| is_gap(&log.record) && attribute(&log.record, "stream").is_some())
+            .expect("agent gap record");
+        assert_eq!(
+            attribute(&gap.record, "sandbox.id"),
+            Some(AnyValue::String("sb-noisy".into()))
+        );
+        assert_eq!(
+            attribute(&gap.record, "dropped"),
+            Some(AnyValue::Int(i64::try_from(1000 - noisy).unwrap()))
+        );
+        assert!(
+            !emitted
+                .iter()
+                .any(|log| is_gap(&log.record) && attribute(&log.record, "stream").is_none()),
+            "nothing else was dropped"
+        );
+    }
+
+    #[test]
+    fn fill_closes_a_batch_at_the_byte_cap() {
+        let (tx, rx) = mpsc::channel(1024);
+        let mut rx = QueueReceiver {
+            rx,
+            budget: Arc::new(QueueBudget::new(usize::MAX)),
+        };
+        for _ in 0..100 {
+            tx.try_send(plain_line(&"y".repeat(64 * 1024))).unwrap();
+        }
+        let factory = SdkLoggerProvider::builder().build();
+        let logger = openshell_otel::logger(&factory, INSTRUMENTATION_SCOPE);
+        let mut records = Vec::new();
+        fill(&mut records, 0, &mut rx, &logger, false);
+        assert!(
+            records.len() < 100,
+            "a byte-capped batch leaves lines queued"
+        );
+        assert!(records.len() * 64 * 1024 <= MAX_BATCH_BYTES + 64 * 1024);
     }
 
     #[tokio::test(start_paused = true)]

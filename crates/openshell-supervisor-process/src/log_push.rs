@@ -15,6 +15,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use openshell_core::agent_output::is_agent_output_target;
 use openshell_core::grpc_client::CachedOpenShellClient;
 use openshell_core::proto::{PushSandboxLogsRequest, SandboxLogLine};
 use tokio::sync::mpsc;
@@ -33,6 +34,43 @@ const ENQUEUE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_mi
 /// Lines per `PushSandboxLogsRequest`. Kept below the gateway's per-request
 /// ingest limit so a reconnect flush is never truncated there.
 const MAX_LINES_PER_REQUEST: usize = 50;
+
+/// Approximate payload bytes per `PushSandboxLogsRequest`. Exported agent
+/// output makes lines large enough that 50 of them could pass the gateway's
+/// 1 MiB gRPC message limit and fail the whole stream, so a request is also
+/// closed once it carries this much.
+const MAX_BYTES_PER_REQUEST: usize = 512 * 1024;
+
+/// Rough encoded size of a pushed line, for request sizing. Overestimates the
+/// fixed protobuf framing so the bound stays conservative.
+fn approx_line_bytes(line: &SandboxLogLine) -> usize {
+    let fields: usize = line
+        .fields
+        .iter()
+        .map(|(key, value)| key.len() + value.len() + 8)
+        .sum();
+    line.message.len() + line.target.len() + line.level.len() + line.sandbox_id.len() + fields + 48
+}
+
+/// Number of leading lines of `batch` that fit one request: at most
+/// [`MAX_LINES_PER_REQUEST`] lines and, past the first line, at most
+/// [`MAX_BYTES_PER_REQUEST`] bytes.
+fn request_len(batch: &[SandboxLogLine]) -> usize {
+    let mut bytes = 0;
+    for (index, line) in batch.iter().take(MAX_LINES_PER_REQUEST).enumerate() {
+        bytes += approx_line_bytes(line);
+        if index > 0 && bytes > MAX_BYTES_PER_REQUEST {
+            return index;
+        }
+    }
+    batch.len().min(MAX_LINES_PER_REQUEST)
+}
+
+/// Whether `batch` already holds a full request.
+fn request_full(batch: &[SandboxLogLine]) -> bool {
+    batch.len() >= MAX_LINES_PER_REQUEST
+        || batch.iter().map(approx_line_bytes).sum::<usize>() >= MAX_BYTES_PER_REQUEST
+}
 
 /// Target of the accounted loss line, shared with the gateway.
 pub const TELEMETRY_GAP_TARGET: &str = "telemetry_gap";
@@ -228,11 +266,32 @@ impl<S: Subscriber> Layer<S> for LogPushLayer {
     }
 }
 
+/// Asks the push task for a final flush before the process exits.
+#[derive(Clone, Debug)]
+pub struct LogPushFlush {
+    tx: mpsc::Sender<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl LogPushFlush {
+    /// Push everything queued so far and end the stream, waiting at most
+    /// `timeout` for the gateway to have received it. Lines logged after this
+    /// are not pushed. Without it, the lines of the last flush interval are
+    /// lost when the supervisor exits, and for an exporting agent those are
+    /// usually its final result.
+    pub async fn finish(&self, timeout: std::time::Duration) {
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        if self.tx.send(done_tx).await.is_ok() {
+            let _ = tokio::time::timeout(timeout, done_rx).await;
+        }
+    }
+}
+
 /// Spawn a background task that batches and pushes log lines to the server.
 ///
 /// Returns the sender half of the channel and the shared drop counter (both
-/// for the [`LogPushLayer`]), and the task handle. The task runs until the
-/// sender is dropped or authentication fails.
+/// for the [`LogPushLayer`]), the task handle, and a handle for the final
+/// flush at exit. The task runs until the sender is dropped, authentication
+/// fails, or a final flush completes.
 pub fn spawn_log_push_task(
     endpoint: String,
     sandbox_id: String,
@@ -240,8 +299,10 @@ pub fn spawn_log_push_task(
     mpsc::Sender<SandboxLogLine>,
     Arc<AtomicU64>,
     tokio::task::JoinHandle<()>,
+    LogPushFlush,
 ) {
     let (tx, rx) = mpsc::channel::<SandboxLogLine>(1024);
+    let (flush_tx, flush_rx) = mpsc::channel(1);
     let dropped = Arc::new(AtomicU64::new(0));
 
     let handle = tokio::spawn(run_push_loop(
@@ -249,9 +310,10 @@ pub fn spawn_log_push_task(
         sandbox_id,
         rx,
         Arc::clone(&dropped),
+        flush_rx,
     ));
 
-    (tx, dropped, handle)
+    (tx, dropped, handle, LogPushFlush { tx: flush_tx })
 }
 
 /// Build an accounted `telemetry_gap` line describing lines dropped since the
@@ -274,13 +336,40 @@ fn telemetry_gap_line(sandbox_id: &str, dropped: u64) -> SandboxLogLine {
     }
 }
 
-/// If any lines were dropped since the last check, reset the counter and add a
-/// single accounted gap line to `batch`.
-fn record_gap_if_any(sandbox_id: &str, dropped: &AtomicU64, batch: &mut Vec<SandboxLogLine>) {
+/// Accounted gap line for agent output lines dropped from the reconnect
+/// buffer, kept apart from the supervisor's own losses.
+fn agent_gap_line(sandbox_id: &str, dropped: u64) -> SandboxLogLine {
+    let mut line = telemetry_gap_line(sandbox_id, dropped);
+    line.message = format!("telemetry gap: {dropped} agent output line(s) dropped");
+    line.fields
+        .insert("stream".to_string(), "agent".to_string());
+    line
+}
+
+/// If any lines were dropped since the last check, reset the counters and add
+/// one accounted gap line per kind of loss to `batch`.
+fn record_gap_if_any(
+    sandbox_id: &str,
+    dropped: &AtomicU64,
+    agent_dropped: &AtomicU64,
+    batch: &mut Vec<SandboxLogLine>,
+) {
     let n = dropped.swap(0, Ordering::Relaxed);
     if n > 0 {
         batch.push(telemetry_gap_line(sandbox_id, n));
     }
+    let n = agent_dropped.swap(0, Ordering::Relaxed);
+    if n > 0 {
+        batch.push(agent_gap_line(sandbox_id, n));
+    }
+}
+
+/// Put a request that failed to send back at the front of `batch`, ahead of
+/// the lines that arrived after it, so the next connection retries it.
+fn restore_unsent(batch: &mut Vec<SandboxLogLine>, unsent: PushSandboxLogsRequest) {
+    let mut restored = unsent.logs;
+    restored.append(batch);
+    *batch = restored;
 }
 
 /// Maximum backoff delay between reconnection attempts.
@@ -293,8 +382,12 @@ async fn run_push_loop(
     sandbox_id: String,
     mut rx: mpsc::Receiver<SandboxLogLine>,
     dropped: Arc<AtomicU64>,
+    mut flush_rx: mpsc::Receiver<tokio::sync::oneshot::Sender<()>>,
 ) {
     let mut batch = Vec::with_capacity(MAX_LINES_PER_REQUEST);
+    // Agent output lines dropped from the reconnect buffer; reported apart
+    // from the supervisor's own losses.
+    let agent_dropped = AtomicU64::new(0);
     let mut backoff = INITIAL_BACKOFF;
     let mut attempt: u64 = 0;
 
@@ -315,7 +408,7 @@ async fn run_push_loop(
                 eprintln!("openshell: log push connect failed: {e}");
                 // Drain the channel during backoff so the tracing layer doesn't
                 // block, but discard lines we can't deliver.
-                drain_during_backoff(&mut rx, &mut batch, &dropped, backoff).await;
+                drain_during_backoff(&mut rx, &mut batch, &dropped, &agent_dropped, backoff).await;
                 backoff = (backoff * 2).min(MAX_BACKOFF);
                 continue;
             }
@@ -347,10 +440,10 @@ async fn run_push_loop(
         // Report outage loss first so it reaches the gateway immediately, then
         // send in request-sized chunks: the reconnect buffer can exceed the
         // gateway's per-request ingest limit.
-        record_gap_if_any(&sandbox_id, &dropped, &mut batch);
+        record_gap_if_any(&sandbox_id, &dropped, &agent_dropped, &mut batch);
         let mut flush_failed = false;
         while !batch.is_empty() {
-            let rest = batch.split_off(batch.len().min(MAX_LINES_PER_REQUEST));
+            let rest = batch.split_off(request_len(&batch));
             let lines = std::mem::replace(&mut batch, rest);
             if let Err(unsent) = push_tx
                 .send(PushSandboxLogsRequest {
@@ -385,23 +478,28 @@ async fn run_push_loop(
                     let Some(line) = line else {
                         // Tracing layer dropped — sandbox is shutting down.
                         // Flush remaining (including any final gap) and exit.
-                        record_gap_if_any(&sandbox_id, &dropped, &mut batch);
-                        if !batch.is_empty() {
-                            let lines = std::mem::take(&mut batch);
-                            let _ = push_tx.send(PushSandboxLogsRequest {
+                        record_gap_if_any(&sandbox_id, &dropped, &agent_dropped, &mut batch);
+                        while !batch.is_empty() {
+                            let rest = batch.split_off(request_len(&batch));
+                            let lines = std::mem::replace(&mut batch, rest);
+                            if push_tx.send(PushSandboxLogsRequest {
                                 sandbox_id: sandbox_id.clone(),
                                 logs: lines,
-                            }).await;
+                            }).await.is_err() {
+                                break;
+                            }
                         }
                         return;
                     };
                     batch.push(line);
-                    if batch.len() >= MAX_LINES_PER_REQUEST {
-                        let lines = std::mem::take(&mut batch);
-                        if push_tx.send(PushSandboxLogsRequest {
+                    if request_full(&batch) {
+                        let rest = batch.split_off(request_len(&batch));
+                        let lines = std::mem::replace(&mut batch, rest);
+                        if let Err(unsent) = push_tx.send(PushSandboxLogsRequest {
                             sandbox_id: sandbox_id.clone(),
                             logs: lines,
-                        }).await.is_err() {
+                        }).await {
+                            restore_unsent(&mut batch, unsent.0);
                             break true;
                         }
                     }
@@ -409,21 +507,51 @@ async fn run_push_loop(
                 _ = timer.tick() => {
                     // Report drops on the periodic flush, even while the
                     // channel is congested.
-                    record_gap_if_any(&sandbox_id, &dropped, &mut batch);
-                    if !batch.is_empty() {
-                        let lines = std::mem::take(&mut batch);
-                        if push_tx.send(PushSandboxLogsRequest {
+                    record_gap_if_any(&sandbox_id, &dropped, &agent_dropped, &mut batch);
+                    let mut send_failed = false;
+                    while !batch.is_empty() {
+                        let rest = batch.split_off(request_len(&batch));
+                        let lines = std::mem::replace(&mut batch, rest);
+                        if let Err(unsent) = push_tx.send(PushSandboxLogsRequest {
                             sandbox_id: sandbox_id.clone(),
                             logs: lines,
-                        }).await.is_err() {
-                            break true;
+                        }).await {
+                            restore_unsent(&mut batch, unsent.0);
+                            send_failed = true;
+                            break;
                         }
+                    }
+                    if send_failed {
+                        break true;
                     }
                 }
                 rpc_done = rpc_done_rx.recv() => {
                     // The gRPC streaming call ended (server closed / error).
                     fatal_auth = rpc_done.unwrap_or(false);
                     break true;
+                }
+                Some(done) = flush_rx.recv() => {
+                    // Final flush before exit: everything queued so far, then
+                    // end the stream and wait for the call to finish, so the
+                    // gateway has the lines before the process is gone.
+                    while let Ok(line) = rx.try_recv() {
+                        batch.push(line);
+                    }
+                    record_gap_if_any(&sandbox_id, &dropped, &agent_dropped, &mut batch);
+                    while !batch.is_empty() {
+                        let rest = batch.split_off(request_len(&batch));
+                        let lines = std::mem::replace(&mut batch, rest);
+                        if push_tx.send(PushSandboxLogsRequest {
+                            sandbox_id: sandbox_id.clone(),
+                            logs: lines,
+                        }).await.is_err() {
+                            break;
+                        }
+                    }
+                    drop(push_tx);
+                    let _ = rpc_done_rx.recv().await;
+                    let _ = done.send(());
+                    return;
                 }
             }
         };
@@ -435,7 +563,7 @@ async fn run_push_loop(
 
         if stream_broken {
             eprintln!("openshell: log push stream lost, reconnecting after backoff...");
-            drain_during_backoff(&mut rx, &mut batch, &dropped, backoff).await;
+            drain_during_backoff(&mut rx, &mut batch, &dropped, &agent_dropped, backoff).await;
             backoff = (backoff * 2).min(MAX_BACKOFF);
         }
     }
@@ -445,33 +573,61 @@ async fn run_push_loop(
 /// `try_send` doesn't fill up. Lines received during backoff are kept in `batch`
 /// (up to a limit) so they can be sent after reconnecting; lines beyond the
 /// limit are counted in `dropped` and reported as a `telemetry_gap`.
+///
+/// Agent output may hold at most half the buffer, and a supervisor line that
+/// finds the buffer full evicts the oldest agent line instead of being
+/// dropped, so an agent flooding stdout during an outage cannot push the
+/// supervisor's own records out. Agent losses are counted in `agent_dropped`.
 async fn drain_during_backoff(
     rx: &mut mpsc::Receiver<SandboxLogLine>,
     batch: &mut Vec<SandboxLogLine>,
     dropped: &AtomicU64,
+    agent_dropped: &AtomicU64,
     delay: tokio::time::Duration,
 ) {
-    // Keep at most 200 lines across reconnect attempts to bound memory.
-    const MAX_BUFFERED: usize = 200;
-
     let deadline = tokio::time::Instant::now() + delay;
     loop {
         tokio::select! {
             () = tokio::time::sleep_until(deadline) => { return; }
             line = rx.recv() => {
                 match line {
-                    Some(l) => {
-                        if batch.len() < MAX_BUFFERED {
-                            batch.push(l);
-                        } else {
-                            // Over the reconnect buffer limit: account it.
-                            dropped.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
+                    Some(l) => buffer_during_backoff(batch, l, dropped, agent_dropped),
                     None => return, // channel closed, sandbox shutting down
                 }
             }
         }
+    }
+}
+
+/// Lines kept across reconnect attempts, to bound memory.
+const MAX_BUFFERED: usize = 200;
+
+fn buffer_during_backoff(
+    batch: &mut Vec<SandboxLogLine>,
+    line: SandboxLogLine,
+    dropped: &AtomicU64,
+    agent_dropped: &AtomicU64,
+) {
+    let is_agent = |l: &SandboxLogLine| is_agent_output_target(&l.target);
+    if is_agent(&line) {
+        if batch.len() < MAX_BUFFERED
+            && batch.iter().filter(|l| is_agent(l)).count() < MAX_BUFFERED / 2
+        {
+            batch.push(line);
+        } else {
+            agent_dropped.fetch_add(1, Ordering::Relaxed);
+        }
+        return;
+    }
+    if batch.len() < MAX_BUFFERED {
+        batch.push(line);
+    } else if let Some(oldest_agent) = batch.iter().position(is_agent) {
+        batch.remove(oldest_agent);
+        agent_dropped.fetch_add(1, Ordering::Relaxed);
+        batch.push(line);
+    } else {
+        // Over the reconnect buffer limit: account it.
+        dropped.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -699,15 +855,47 @@ mod tests {
             .expect("gateway ingest accepts the gap line's timestamp");
     }
 
+    fn line_of(bytes: usize) -> SandboxLogLine {
+        SandboxLogLine {
+            message: "x".repeat(bytes),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn request_len_caps_line_count() {
+        let batch: Vec<_> = (0..120).map(|_| line_of(10)).collect();
+        assert_eq!(request_len(&batch), MAX_LINES_PER_REQUEST);
+        assert!(request_full(&batch));
+    }
+
+    #[test]
+    fn request_len_caps_payload_bytes() {
+        // Eleven 64 KiB agent output records exceed the byte budget well
+        // before the line cap; each request must stay under 1 MiB.
+        let batch: Vec<_> = (0..11).map(|_| line_of(64 * 1024)).collect();
+        let n = request_len(&batch);
+        assert!(n < batch.len());
+        let bytes: usize = batch[..n].iter().map(approx_line_bytes).sum();
+        assert!(bytes <= MAX_BYTES_PER_REQUEST);
+        assert!(request_full(&batch));
+    }
+
+    #[test]
+    fn request_len_always_takes_one_oversized_line() {
+        let batch = vec![line_of(MAX_BYTES_PER_REQUEST * 2), line_of(1)];
+        assert_eq!(request_len(&batch), 1);
+    }
+
     #[test]
     fn record_gap_resets_counter_and_pushes_once() {
         let dropped = AtomicU64::new(3);
         let mut batch = Vec::new();
-        record_gap_if_any("sb-1", &dropped, &mut batch);
+        record_gap_if_any("sb-1", &dropped, &AtomicU64::new(0), &mut batch);
         assert_eq!(batch.len(), 1);
         assert_eq!(dropped.load(Ordering::Relaxed), 0);
         // Nothing dropped since: no additional gap line.
-        record_gap_if_any("sb-1", &dropped, &mut batch);
+        record_gap_if_any("sb-1", &dropped, &AtomicU64::new(0), &mut batch);
         assert_eq!(batch.len(), 1);
     }
 
@@ -849,6 +1037,7 @@ mod tests {
             &mut rx,
             &mut batch,
             &dropped,
+            &AtomicU64::new(0),
             tokio::time::Duration::from_secs(30),
         )
         .await;
@@ -857,6 +1046,74 @@ mod tests {
         assert_eq!(dropped.load(Ordering::Relaxed), 50, "overflow is counted");
         assert_eq!(batch[0].message, "line 0");
         assert_eq!(batch[199].message, "line 199");
+    }
+
+    fn agent_line(message: &str) -> SandboxLogLine {
+        SandboxLogLine {
+            target: openshell_core::agent_output::AGENT_STDOUT_TARGET.to_string(),
+            ..test_line(message)
+        }
+    }
+
+    #[test]
+    fn agent_output_holds_at_most_half_the_reconnect_buffer() {
+        let dropped = AtomicU64::new(0);
+        let agent_dropped = AtomicU64::new(0);
+        let mut batch = Vec::new();
+        for i in 0..MAX_BUFFERED {
+            buffer_during_backoff(
+                &mut batch,
+                agent_line(&format!("a{i}")),
+                &dropped,
+                &agent_dropped,
+            );
+        }
+        assert_eq!(batch.len(), MAX_BUFFERED / 2);
+        assert_eq!(
+            agent_dropped.load(Ordering::Relaxed),
+            (MAX_BUFFERED / 2) as u64
+        );
+
+        // Supervisor lines fill the rest, then evict agent lines.
+        for i in 0..MAX_BUFFERED {
+            buffer_during_backoff(
+                &mut batch,
+                test_line(&format!("s{i}")),
+                &dropped,
+                &agent_dropped,
+            );
+        }
+        assert_eq!(batch.len(), MAX_BUFFERED);
+        assert!(batch.iter().all(|l| !is_agent_output_target(&l.target)));
+        assert_eq!(
+            dropped.load(Ordering::Relaxed),
+            0,
+            "no supervisor line was lost"
+        );
+        assert_eq!(agent_dropped.load(Ordering::Relaxed), MAX_BUFFERED as u64);
+
+        let mut gaps = Vec::new();
+        record_gap_if_any("sb-1", &dropped, &agent_dropped, &mut gaps);
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(
+            gaps[0].fields.get("stream").map(String::as_str),
+            Some("agent")
+        );
+        assert!(gaps[0].message.contains("agent output line(s) dropped"));
+    }
+
+    #[test]
+    fn a_failed_request_is_restored_ahead_of_newer_lines() {
+        let mut batch = vec![test_line("newer")];
+        restore_unsent(
+            &mut batch,
+            PushSandboxLogsRequest {
+                sandbox_id: "sb-1".to_string(),
+                logs: vec![test_line("older-1"), test_line("older-2")],
+            },
+        );
+        let messages: Vec<_> = batch.iter().map(|l| l.message.as_str()).collect();
+        assert_eq!(messages, vec!["older-1", "older-2", "newer"]);
     }
 
     #[tokio::test]
@@ -871,6 +1128,7 @@ mod tests {
             &mut rx,
             &mut batch,
             &dropped,
+            &AtomicU64::new(0),
             tokio::time::Duration::from_secs(30),
         )
         .await;
@@ -895,6 +1153,7 @@ mod tests {
                 &mut rx,
                 &mut batch,
                 &dropped,
+                &AtomicU64::new(0),
                 tokio::time::Duration::from_secs(30),
             ),
         )

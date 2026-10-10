@@ -84,6 +84,16 @@ impl RegisteredSetting {
 /// still applies when this flag is on.
 pub const AGENT_POLICY_PROPOSALS_ENABLED_KEY: &str = "agent_policy_proposals_enabled";
 
+/// Sandbox-level opt-in for exporting the agent's own output.
+///
+/// When true, the supervisor forwards every line the sandbox's main process
+/// writes to stdout or stderr to the gateway as a `source = "agent"` log line,
+/// and the gateway exports it with the rest of the sandbox's telemetry. The
+/// lines pass through unparsed: a harness that writes a JSON event stream
+/// (Claude Code `--output-format stream-json`, Codex `exec --json`) exports
+/// its full transcript. See [`crate::agent_output`]. Defaults to false.
+pub const AGENT_OUTPUT_EXPORT_ENABLED_KEY: &str = "agent_output_export_enabled";
+
 /// Approval mode for agent-authored policy proposals.
 ///
 /// `"manual"` (the default when unset): every proposal lands in the draft
@@ -145,6 +155,13 @@ pub const REGISTERED_SETTINGS: &[RegisteredSetting] = &[
         kind: SettingValueKind::String,
         allowed_string_values: Some(PROPOSAL_APPROVAL_MODE_VALUES),
     },
+    // Sandbox-level opt-in for exporting the agent's stdout and stderr. See
+    // AGENT_OUTPUT_EXPORT_ENABLED_KEY for details. Defaults to false.
+    RegisteredSetting {
+        key: AGENT_OUTPUT_EXPORT_ENABLED_KEY,
+        kind: SettingValueKind::Bool,
+        allowed_string_values: None,
+    },
 ];
 
 /// Resolve a setting descriptor from the registry by key.
@@ -176,9 +193,9 @@ pub fn parse_bool_like(raw: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::{
-        OCSF_SCHEMA_VERSION_VALUES, PROPOSAL_APPROVAL_MODE_KEY, PROPOSAL_APPROVAL_MODE_VALUES,
-        REGISTERED_SETTINGS, RegisteredSetting, SettingValueKind, parse_bool_like,
-        registered_keys_csv, setting_for_key,
+        AGENT_OUTPUT_EXPORT_ENABLED_KEY, OCSF_SCHEMA_VERSION_VALUES, PROPOSAL_APPROVAL_MODE_KEY,
+        PROPOSAL_APPROVAL_MODE_VALUES, REGISTERED_SETTINGS, RegisteredSetting, SettingValueKind,
+        parse_bool_like, registered_keys_csv, setting_for_key,
     };
 
     #[test]
@@ -195,6 +212,14 @@ mod tests {
     #[test]
     fn setting_for_key_rejects_removed_providers_v2_enabled() {
         assert!(setting_for_key("providers_v2_enabled").is_none());
+    }
+
+    #[test]
+    fn agent_output_export_enabled_is_a_registered_bool() {
+        let setting = setting_for_key(AGENT_OUTPUT_EXPORT_ENABLED_KEY)
+            .expect("agent_output_export_enabled should be registered");
+        assert_eq!(setting.kind, SettingValueKind::Bool);
+        assert_eq!(setting.allowed_string_values, None);
     }
 
     // ---- RegisteredSetting::validate_string_value ----

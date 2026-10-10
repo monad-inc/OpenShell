@@ -782,6 +782,13 @@ fn proto_to_log_line(log: openshell_core::proto::SandboxLogLine) -> LogLine {
     } else {
         log.source
     };
+    // Agent text can carry escape sequences and invisible formatting; escape
+    // it here, once, so no render or copy path sees it raw.
+    let message = if source == openshell_core::agent_output::AGENT_LOG_SOURCE {
+        openshell_core::agent_output::escape_for_display(&log.message).into_owned()
+    } else {
+        log.message
+    };
     LogLine {
         timestamp_ms: log
             .event_time
@@ -791,7 +798,7 @@ fn proto_to_log_line(log: openshell_core::proto::SandboxLogLine) -> LogLine {
         level: log.level,
         source,
         target: log.target,
-        message: log.message,
+        message,
         fields: log.fields,
     }
 }

@@ -10,6 +10,7 @@
 //! - Build version metadata
 
 pub mod activity;
+pub mod agent_output;
 pub mod auth;
 pub mod config;
 pub mod container_paths;

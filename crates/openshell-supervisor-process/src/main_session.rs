@@ -120,6 +120,18 @@ impl OutputLog {
             version,
         }
     }
+
+    /// Subscribe from the first event the process ever produced. Output
+    /// already evicted from the retained window surfaces as a
+    /// [`MainOutputLagged`] on the first receive instead of being skipped
+    /// silently.
+    fn subscribe_from_start(self: &Arc<Self>) -> MainOutputCursor {
+        MainOutputCursor {
+            output: Arc::clone(self),
+            next_sequence: 0,
+            version: self.version.subscribe(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -469,6 +481,11 @@ impl MainSession {
         self.output.publish(event);
     }
 
+    #[cfg(test)]
+    pub(crate) fn publish_for_test(&self, event: MainOutput) {
+        self.publish(event);
+    }
+
     fn reader_finished(&self) {
         if self.readers_remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.readers_done.notify_waiters();
@@ -537,6 +554,14 @@ impl MainSession {
 
     pub fn subscribe(&self) -> MainOutputCursor {
         self.output.subscribe()
+    }
+
+    /// Like [`Self::subscribe`], but starting from the process's first output
+    /// event, so output the retained window has already evicted is reported
+    /// as lag rather than skipped.
+    #[must_use]
+    pub fn subscribe_from_start(&self) -> MainOutputCursor {
+        self.output.subscribe_from_start()
     }
 
     /// Return the bounded output sequence range currently retained for a

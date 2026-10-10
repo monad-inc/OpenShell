@@ -41,6 +41,13 @@ impl BoundaryAccess {
         self.session_readiness.clone()
     }
 
+    /// The canonical process's retained I/O, when the access plane attached
+    /// to it.
+    #[must_use]
+    pub fn main_session(&self) -> Option<Arc<crate::main_session::MainSession>> {
+        self.main_session.clone()
+    }
+
     /// Publish the canonical process's terminal status to attached clients.
     pub async fn publish_main_exit(&self, exit_code: i32, attachment_expected: bool) {
         let Some(main_session) = self.main_session.as_ref() else {

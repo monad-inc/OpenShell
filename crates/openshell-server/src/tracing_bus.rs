@@ -56,6 +56,31 @@ struct PerSandbox {
     /// global seq (the other bus owns the missing seqs), so a resume gap can
     /// only be judged by what *this* bus actually dropped.
     last_trimmed_seq: u64,
+    /// Agent output lines held in `tail`, and their approximate bytes.
+    agent_lines: usize,
+    agent_bytes: usize,
+}
+
+/// Most agent output lines one sandbox's tail holds: half the tail, so the
+/// agent's own output can never push the supervisor's records out of it.
+const AGENT_TAIL_MAX_LINES: usize = 1000;
+
+/// Most agent output bytes one sandbox's tail holds. Agent lines run to
+/// 64 KiB, so a line cap alone would let one sandbox pin ~128 MiB of gateway
+/// memory.
+const AGENT_TAIL_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// Approximate size of an agent output line, or `None` for any other event.
+fn agent_line_bytes(event: &CursoredEvent) -> Option<usize> {
+    match event.event.payload.as_ref() {
+        Some(openshell_core::proto::sandbox_stream_event::Payload::Log(log))
+            if log.source == openshell_core::agent_output::AGENT_LOG_SOURCE =>
+        {
+            let fields: usize = log.fields.iter().map(|(k, v)| k.len() + v.len()).sum();
+            Some(log.message.len() + fields + 64)
+        }
+        _ => None,
+    }
 }
 
 impl PerSandbox {
@@ -65,7 +90,48 @@ impl PerSandbox {
             sender: tx,
             tail: VecDeque::new(),
             last_trimmed_seq: 0,
+            agent_lines: 0,
+            agent_bytes: 0,
         }
+    }
+
+    fn push(&mut self, event: CursoredEvent, tail_cap: usize) {
+        if let Some(bytes) = agent_line_bytes(&event) {
+            self.agent_lines += 1;
+            self.agent_bytes += bytes;
+        }
+        self.tail.push_back(event);
+        while self.tail.len() > tail_cap {
+            let Some(trimmed) = self.tail.pop_front() else {
+                break;
+            };
+            self.forget(&trimmed);
+        }
+        // Over the agent budget: evict the oldest agent lines, wherever they
+        // sit, rather than the oldest lines of any kind.
+        while self.agent_lines > AGENT_TAIL_MAX_LINES || self.agent_bytes > AGENT_TAIL_MAX_BYTES {
+            let Some(oldest) = self
+                .tail
+                .iter()
+                .position(|event| agent_line_bytes(event).is_some())
+            else {
+                break;
+            };
+            if let Some(trimmed) = self.tail.remove(oldest) {
+                self.forget(&trimmed);
+            }
+        }
+    }
+
+    /// Account an evicted event. Evictions can come from the middle of the
+    /// tail, so the trim mark only ever moves forward: a client resuming from
+    /// before any evicted event is told about the gap.
+    fn forget(&mut self, trimmed: &CursoredEvent) {
+        if let Some(bytes) = agent_line_bytes(trimmed) {
+            self.agent_lines -= 1;
+            self.agent_bytes -= bytes;
+        }
+        self.last_trimmed_seq = self.last_trimmed_seq.max(trimmed.seq);
     }
 }
 
@@ -341,12 +407,7 @@ impl TracingLogBus {
 
         let cursored = CursoredEvent { seq, event };
         let _ = per.sender.send(cursored.clone());
-        per.tail.push_back(cursored);
-        while per.tail.len() > tail_cap {
-            if let Some(trimmed) = per.tail.pop_front() {
-                per.last_trimmed_seq = trimmed.seq;
-            }
-        }
+        per.push(cursored, tail_cap);
     }
 }
 
@@ -648,6 +709,59 @@ mod tests {
         let tail: VecDeque<CursoredEvent> = [cursored(2), cursored(4)].into_iter().collect();
         let events = tail_after_impl(&tail, 0, 0).expect("no gap");
         assert_eq!(cursors(&events), vec![2, 4]);
+    }
+
+    fn agent_log(sandbox_id: &str, message: &str) -> SandboxLogLine {
+        SandboxLogLine {
+            source: openshell_core::agent_output::AGENT_LOG_SOURCE.to_string(),
+            target: openshell_core::agent_output::AGENT_STDOUT_TARGET.to_string(),
+            ..make_log_event(sandbox_id, message)
+        }
+    }
+
+    fn sources(bus: &TracingLogBus, sandbox_id: &str) -> (usize, usize) {
+        let tail = bus.tail(sandbox_id, usize::MAX);
+        let agent = tail
+            .iter()
+            .filter(|e| agent_line_bytes(e).is_some())
+            .count();
+        (agent, tail.len() - agent)
+    }
+
+    #[test]
+    fn agent_output_cannot_push_other_lines_out_of_the_tail() {
+        let bus = TracingLogBus::new();
+        let sandbox_id = "sb-agent";
+        for i in 0..10 {
+            bus.publish_external(make_log_event(sandbox_id, &format!("supervisor {i}")));
+        }
+        for i in 0..5000 {
+            bus.publish_external(agent_log(sandbox_id, &format!("agent {i}")));
+        }
+        let (agent, other) = sources(&bus, sandbox_id);
+        assert_eq!(agent, AGENT_TAIL_MAX_LINES);
+        assert_eq!(other, 10, "every supervisor line survives");
+        // The newest agent lines are the ones kept.
+        let tail = bus.tail(sandbox_id, 1);
+        assert!(matches!(
+            tail[0].event.payload.as_ref(),
+            Some(openshell_core::proto::sandbox_stream_event::Payload::Log(l)) if l.message == "agent 4999"
+        ));
+        // A resume from before the evicted agent lines is told about the gap.
+        assert!(bus.tail_after(sandbox_id, 0).is_err());
+    }
+
+    #[test]
+    fn agent_output_in_the_tail_is_byte_bounded() {
+        let bus = TracingLogBus::new();
+        let sandbox_id = "sb-agent-bytes";
+        let big = "x".repeat(64 * 1024);
+        for _ in 0..200 {
+            bus.publish_external(agent_log(sandbox_id, &big));
+        }
+        let (agent, _) = sources(&bus, sandbox_id);
+        assert!(agent * 64 * 1024 <= AGENT_TAIL_MAX_BYTES);
+        assert!(agent >= 60, "the budget holds ~4 MiB, kept {agent}");
     }
 
     #[test]

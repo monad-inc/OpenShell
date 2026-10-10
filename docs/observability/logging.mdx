@@ -279,6 +279,30 @@ The gateway then exports every line its sandboxes push, together with its own lo
 
 Delivery is accountable rather than lossless. When the push channel from a sandbox or the gateway's export queue drops lines, a `telemetry_gap` record with the `dropped` count reports the loss downstream. The log files inside the sandbox remain the complete record. See [Push Channel Loss Accounting](/observability/accessing-logs#push-channel-loss-accounting) and [OTLP Log Export](/how-it-works/gateways/configuration#otlp-log-export) for the bounds, metrics, and record attributes.
 
+## Export Agent Output
+
+The sandbox's main process, usually the agent, writes its own output to stdout and stderr. By default that output stays inside the sandbox. Set `agent_output_export_enabled` on a sandbox, or globally, to export it through the same push channel and OTLP export as the supervisor's lines:
+
+```shell
+openshell settings set my-sandbox --key agent_output_export_enabled --value true
+```
+
+The supervisor then forwards each output line to the gateway unchanged. The gateway exports it with `log.source = "agent"` and a `log.target` of `openshell.agent.stdout` or `openshell.agent.stderr`, and shows it in `openshell logs --source agent`. OpenShell does not parse, filter, or redact the line. Whatever reads the export owns that.
+
+The export carries everything the agent saw: whole file reads, command output, API response bodies, and text from any page it fetched. Treat the destination as holding the sandbox's data. A consumer that feeds these records to another model, such as an agent that reads the log index, must treat the body as untrusted input, because it can carry prompt-injection text or a JSON object shaped like an OCSF record. Identify agent records by `log.source = "agent"`, never by their content. When the main process runs on a terminal, what an attached operator types is echoed into its output and exported too.
+
+Run the agent so its output is a structured event stream, and the export carries its full transcript. For example, Claude Code with `--print --output-format stream-json --verbose` writes one JSON event per assistant turn, tool call, tool result, and final result, and `codex exec --json` writes one per item and turn. Each event leaves the sandbox as one record whose body is that JSON line.
+
+A line longer than 64 KiB is split into consecutive records rather than truncated. Each fragment carries `agent.chunk.index`, starting at 0, and the last carries `agent.chunk.final = true`. Concatenate the bodies in index order to rebuild the line. If the rest of a split line was never read, an empty final fragment with `agent.chunk.truncated = true` closes it. A record body is a string, so bytes that are not valid UTF-8 are replaced with U+FFFD; the 64 KiB limit applies after replacement.
+
+Agent output never displaces the sandbox's own records:
+
+- The forwarder uses at most half of the supervisor's push channel and never blocks the agent. During a gateway outage, agent lines hold at most half of the 200-line reconnect buffer, and supervisor lines evict them first. Agent losses are reported in their own `telemetry_gap` line with `stream = agent`.
+- The gateway's OTLP export queue gives agent output at most a quarter of its 64 MiB, and each sandbox at most 4 MiB of that. Agent records over a sandbox's share are dropped and reported in a gateway `telemetry_gap` record that carries that sandbox's `sandbox.id` and `stream = agent`, so other sandboxes' OCSF and audit records are unaffected.
+- The gateway's in-memory tail for `openshell logs` and the TUI keeps at most 1,000 agent lines and 4 MiB of them per sandbox, evicting the oldest agent lines first.
+
+The supervisor retains the most recent 1 MiB of output. If export falls further behind than that, including before the sandbox's first settings poll, the skipped output is reported as a `telemetry_gap` line with an `agent.skipped_reads` count, and the first partial line of each stream after the gap is dropped. On shutdown, the supervisor pushes its remaining lines before exiting, waiting up to 3 seconds for the gateway.
+
 ## Next Steps
 
 - [Access logs](/observability/accessing-logs) through the CLI, TUI, or sandbox filesystem.

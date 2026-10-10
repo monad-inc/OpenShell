@@ -63,7 +63,7 @@ var WithLogLines = types.WithLogLines
 // WithLogSince filters logs to entries at or after the given time.
 var WithLogSince = types.WithLogSince
 
-// WithLogSources filters logs by source (e.g., "gateway", "sandbox").
+// WithLogSources filters logs by source (e.g., "gateway", "sandbox", "agent").
 var WithLogSources = types.WithLogSources
 
 // WithLogMinLevel sets the minimum log level to include.

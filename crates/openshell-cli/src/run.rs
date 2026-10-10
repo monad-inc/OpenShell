@@ -6103,6 +6103,14 @@ fn format_log_line(log: &openshell_core::proto::SandboxLogLine) -> String {
     let timestamp_ms = proto_timestamp_ms(log.event_time.as_ref());
     let secs = timestamp_ms / 1000;
     let millis = timestamp_ms % 1000;
+    // An agent line is whatever the sandbox's process printed, including text
+    // from pages and tools it read. Escape it so it cannot drive or disguise
+    // itself in the operator's terminal.
+    let message: Cow<'_, str> = if source == openshell_core::agent_output::AGENT_LOG_SOURCE {
+        openshell_core::agent_output::escape_for_display(&log.message)
+    } else {
+        log.message.as_str().into()
+    };
     // `ocsf.*` fields carry the structured OCSF document (a full `ocsf.raw`
     // JSON by default) for export; the message is already its shorthand, so
     // the one-line view leaves them out.
@@ -6114,7 +6122,7 @@ fn format_log_line(log: &openshell_core::proto::SandboxLogLine) -> String {
     if entries.is_empty() {
         format!(
             "[{secs}.{millis:03}] [{source:<7}] [{:<5}] [{}] {}",
-            log.level, log.target, log.message
+            log.level, log.target, message
         )
     } else {
         let mut fields_str = String::new();
@@ -6129,7 +6137,7 @@ fn format_log_line(log: &openshell_core::proto::SandboxLogLine) -> String {
         }
         format!(
             "[{secs}.{millis:03}] [{source:<7}] [{:<5}] [{}] {} {}",
-            log.level, log.target, log.message, fields_str
+            log.level, log.target, message, fields_str
         )
     }
 }
@@ -8134,6 +8142,21 @@ mod tests {
                 .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
                 .collect(),
         }
+    }
+
+    #[test]
+    fn format_log_line_escapes_terminal_controls_in_agent_output() {
+        let agent = log_line(
+            "INFO",
+            "openshell.agent.stdout",
+            "{\"text\":\"hi\"}\u{1b}]52;c;aGk=\u{7}",
+            "agent",
+            &[],
+        );
+        assert_eq!(
+            format_log_line(&agent),
+            "[1234.567] [agent  ] [INFO ] [openshell.agent.stdout] {\"text\":\"hi\"}\\u{1b}]52;c;aGk=\\u{7}"
+        );
     }
 
     #[test]
