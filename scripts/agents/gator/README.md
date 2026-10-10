@@ -28,7 +28,7 @@ gateway drivers cannot run this local-image launcher.
 
 Use `--harness codex` to select Codex explicitly. Other harness names are rejected until their support is added to `agent.yaml` and `scripts/agents/runtime/harnesses/<name>/`. Agent directories do not carry their own harness implementations; they provide prompt templates and optional skills or subagents for the shared runtime to inject.
 
-Use `--codex-bin "$(command -v codex)"` only when the host executable is compatible with the sandbox OS and architecture.
+Use `--codex-bin "$(command -v codex)"` only when the host executable is compatible with the sandbox OS and architecture. The uploaded binary is the one the pin is checked against, so its version must match `harness.supported.codex.version`.
 
 The manifest-driven launcher at `scripts/agents/run.sh` reads `agent.yaml`, which defines the versioned immutable payload, prompt template, provider profile IDs, provider credential sources, gateway settings, skills, subagents, supporting resources, sandbox defaults, runtime mode, and harness defaults. The shared sandbox entrypoint at `scripts/agents/runtime/entrypoint.sh` starts the in-sandbox supervisor, which invokes the selected harness adapter for bounded cycles.
 

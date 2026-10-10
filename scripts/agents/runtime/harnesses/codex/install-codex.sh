@@ -14,7 +14,7 @@ if [[ -z "$version" ]]; then
     exit 2
 fi
 
-if [[ "$version" != "latest" && ! "$version" =~ ^[0-9]+(\.[0-9]+){0,2}(-[0-9A-Za-z.-]+)?$ ]]; then
+if [[ "$version" != "latest" && ! "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
     echo "unsupported Codex version: $version" >&2
     exit 2
 fi

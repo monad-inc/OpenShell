@@ -241,7 +241,7 @@ CODEX_MODEL=gpt-5.6-sol \
   "Review and monitor PR #${pr_number} through the gator-gate workflow. Scope this invocation only to PR #${pr_number}. This launch is intentionally testing Codex model gpt-5.6-sol via the CLI launcher."
 ```
 
-If the installed Codex CLI is too old for a model, create a temporary copy of `scripts/agents/gator/`, adjust only that temporary Dockerfile, and launch with that generated context. Keep the repo Dockerfile unchanged unless the version bump is the intended code change.
+If the pinned Codex CLI is too old for a model, create a temporary copy of `scripts/agents/gator/`, change `harness.supported.codex.version` in that copy's `agent.yaml`, and launch with that generated context. The Dockerfile installs whatever version `agent.yaml` pins, and the launcher and the sandbox entrypoint both refuse an image that carries a different one, so do not hardcode a version in the Dockerfile. Keep the repo `agent.yaml` unchanged unless the version bump is the intended code change.
 
 Example shape:
 
@@ -356,8 +356,9 @@ Actions:
 
 - Confirm the build context is `scripts/agents/gator/` or the intended temporary `--from` context.
 - Confirm Docker or the selected gateway runtime can pull `nvcr.io/nvidia/base/ubuntu:noble-20251013`.
-- For Codex CLI version experiments, adjust a temporary Docker context first.
-- Do not commit Dockerfile version changes unless the repo should permanently use that version.
+- For Codex CLI version experiments, change `harness.supported.codex.version` in a temporary copy's `agent.yaml` first.
+- If the launcher fails with `image ... carries codex X, but agent.yaml pins Y`, the image and the pin disagree: fix the pin, or the `--codex-bin` binary, which is checked against the same pin.
+- Do not commit version changes unless the repo should permanently use that version.
 
 ### Provider Or Credential Failure
 

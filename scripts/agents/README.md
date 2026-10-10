@@ -37,9 +37,12 @@ sections:
 - `sandbox`: default sandbox name prefix, gateway, and source image or Dockerfile.
 - `harness`: default harness and per-harness settings such as model and
   reasoning effort. Each harness also pins its `version`, which is required.
-  The launcher passes it to the image build as a build argument
-  (`CLAUDE_CODE_VERSION` or `CODEX_VERSION`), and the sandbox entrypoint refuses
-  to start if the image carries a different version. The version decides the
+  It must be a quoted, exact version (`"0.162.1"`); an unquoted `0.162` is a
+  YAML number and is rejected. The launcher passes it to the image build as a
+  build argument (`CLAUDE_CODE_VERSION` or `CODEX_VERSION`), checks the built
+  image before creating the sandbox, and the sandbox entrypoint refuses to start
+  (exit 78) if the image carries a different version. The check reads the binary
+  the adapter actually runs, including one uploaded with `--codex-bin`. The version decides the
   event format the supervisor exports, so an upgrade is a deliberate edit;
   `latest` is accepted only when written explicitly, and skips the check.
 - `runtime`: in-sandbox run mode (`once` or `watch`), watch poll interval, and

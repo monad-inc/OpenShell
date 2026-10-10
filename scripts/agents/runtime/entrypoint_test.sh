@@ -143,11 +143,88 @@ test_version_scripts_parse_real_output() {
     rm -rf "$tmp"
 }
 
+test_hung_version_check_times_out() {
+    local tmp status=0
+    tmp="$(mktemp -d)"
+    make_payload "$tmp/payload" 2.1.251
+    printf '#!/usr/bin/env bash\nsleep 30\n' > "$tmp/payload/runtime/harnesses/test/version.sh"
+
+    OPENSHELL_AGENT_HARNESS_VERSION_TIMEOUT=1 run_entrypoint "$tmp/payload" "$tmp/out" 2.1.251 || status=$?
+    [[ "$status" -eq 78 ]] || fail "hung version check should exit 78, got $status"
+    assert_contains "$tmp/out" "checking harness test version"
+    assert_contains "$tmp/out" "the image carries test unknown"
+    rm -rf "$tmp"
+}
+
+test_wrapped_command_runs_after_the_check() {
+    local tmp status=0
+    tmp="$(mktemp -d)"
+    make_payload "$tmp/payload" 2.1.251
+
+    set +e
+    OPENSHELL_AGENT_HARNESS=test OPENSHELL_AGENT_HARNESS_VERSION=2.1.251 \
+        bash "$tmp/payload/runtime/entrypoint.sh" echo listener-ran > "$tmp/out" 2>&1
+    status=$?
+    set -e
+    [[ "$status" -eq 0 ]] || fail "wrapped command exited $status"
+    assert_contains "$tmp/out" "listener-ran"
+    assert_not_contains "$tmp/out" "supervisor-ran"
+
+    status=0
+    set +e
+    OPENSHELL_AGENT_HARNESS=test OPENSHELL_AGENT_HARNESS_VERSION=2.1.296 \
+        bash "$tmp/payload/runtime/entrypoint.sh" echo listener-ran > "$tmp/out" 2>&1
+    status=$?
+    set -e
+    [[ "$status" -eq 78 ]] || fail "wrapped command with a mismatched pin should exit 78, got $status"
+    assert_not_contains "$tmp/out" "listener-ran"
+    rm -rf "$tmp"
+}
+
+# version.sh checks the binary the adapter runs: a payload-local one (what
+# run.sh --codex-bin uploads) wins over the one on PATH, as in exec.sh.
+test_version_scripts_check_the_payload_binary() {
+    local tmp h
+    for h in claude codex; do
+        tmp="$(mktemp -d)"
+        mkdir -p "$tmp/bin" "$tmp/payload/runtime/harnesses/$h"
+        cp "$RUNTIME_UNDER_TEST/harnesses/$h/version.sh" "$tmp/payload/runtime/harnesses/$h/"
+        printf '#!/usr/bin/env bash\necho "%s 1.0.0"\n' "$h" > "$tmp/bin/$h"
+        printf '#!/usr/bin/env bash\necho "%s 9.9.9"\n' "$h" > "$tmp/payload/runtime/harnesses/$h/$h"
+        chmod +x "$tmp/bin/$h" "$tmp/payload/runtime/harnesses/$h/$h"
+        local got
+        got="$(PATH="$tmp/bin:$PATH" bash "$tmp/payload/runtime/harnesses/$h/version.sh")"
+        [[ "$got" == "9.9.9" ]] || fail "$h version.sh checked '$got', not the payload-local binary"
+        rm -rf "$tmp"
+    done
+}
+
+# A warning line or a changed layout must not be read as the version.
+test_version_scripts_ignore_noise() {
+    local tmp
+    tmp="$(mktemp -d)"
+    mkdir -p "$tmp/bin"
+    printf '#!/usr/bin/env bash\necho "Warning: something odd"\necho\necho "2.1.251 (Claude Code)"\n' > "$tmp/bin/claude"
+    printf '#!/usr/bin/env bash\nprintf "codex-cli 0.162.1 (abc123)\\r\\n"\n' > "$tmp/bin/codex"
+    chmod +x "$tmp/bin/claude" "$tmp/bin/codex"
+
+    local claude codex
+    claude="$(PATH="$tmp/bin:$PATH" bash "$RUNTIME_UNDER_TEST/harnesses/claude/version.sh")"
+    codex="$(PATH="$tmp/bin:$PATH" bash "$RUNTIME_UNDER_TEST/harnesses/codex/version.sh")"
+    [[ "$claude" == "2.1.251" ]] || fail "claude version.sh printed '$claude' from noisy output"
+    [[ "$codex" == "0.162.1" ]] || fail "codex version.sh printed '$codex' from noisy output"
+    rm -rf "$tmp"
+}
+
 test_matching_pin_starts_the_supervisor
 test_mismatched_pin_refuses_to_start
 test_unreadable_version_refuses_a_pin
 test_latest_is_a_deliberate_opt_out
 test_unpinned_deployment_only_reports
 test_version_scripts_parse_real_output
+test_hung_version_check_times_out
+test_wrapped_command_runs_after_the_check
+test_version_scripts_check_the_payload_binary
+test_version_scripts_ignore_noise
 
 printf 'ok - entrypoint harness version pin\n'
