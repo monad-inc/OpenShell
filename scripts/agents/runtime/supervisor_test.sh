@@ -90,6 +90,7 @@ printf "%s\n" "OPENSHELL_AGENT_RESULT {\"status\":\"complete\",\"reason\":\"done
     OPENSHELL_AGENT_TEST_STATE="$tmp/state" run_supervisor "$tmp/payload" watch "$tmp/output"
     assert_contains "$tmp/output" "transient watch failure 1"
     assert_contains "$tmp/output" "transient watch failure 2"
+    assert_contains "$tmp/output" "upstream transport failure detected"
     assert_contains "$tmp/output" "openshell-agent: complete (done)"
     printf 'ok - watch retries missing sentinel until complete\n'
 }
@@ -256,7 +257,51 @@ fi
     printf 'ok - bounds state history\n'
 }
 
+test_keeps_harness_stdout_and_stderr_apart() {
+    local tmp
+    tmp="$(mktemp -d)"
+    make_payload "$tmp/payload" '
+printf "%s\n" "{\"type\":\"system\"}"
+printf "%s\n" "harness diagnostic" >&2
+printf "%s\n" "OPENSHELL_AGENT_RESULT {\"status\":\"complete\",\"reason\":\"done\"}"
+'
+
+    set +e
+    OPENSHELL_AGENT_HARNESS=test \
+        OPENSHELL_AGENT_RUN_MODE=once \
+        OPENSHELL_AGENT_HEARTBEAT_SECONDS=0 \
+        OPENSHELL_AGENT_STATE_DIR="$tmp/payload/state" \
+        bash "$tmp/payload/runtime/supervisor.sh" > "$tmp/stdout" 2> "$tmp/stderr"
+    local status=$?
+    set -e
+    [[ "$status" -eq 0 ]] || fail "expected once mode to complete, got $status"
+    assert_contains "$tmp/stdout" '{"type":"system"}'
+    assert_contains "$tmp/stderr" "harness diagnostic"
+    if grep -Fq "harness diagnostic" "$tmp/stdout"; then
+        fail "harness stderr leaked into stdout"
+    fi
+    printf 'ok - keeps harness stdout and stderr apart\n'
+}
+
+test_tool_output_is_not_a_transport_failure() {
+    local tmp
+    tmp="$(mktemp -d)"
+    make_payload "$tmp/payload" '
+printf "%s\n" "{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"content\":\"write: Broken pipe\"}]}}"
+exit 1
+'
+
+    run_supervisor "$tmp/payload" once "$tmp/output" || true
+    assert_contains "$tmp/payload/state/status.json" "missing_agent_result"
+    if grep -Fq "upstream transport failure detected" "$tmp/payload/state/status.json"; then
+        fail "a tool result was classified as a transport failure"
+    fi
+    printf 'ok - tool output is not a transport failure\n'
+}
+
 test_once_requires_sentinel
+test_keeps_harness_stdout_and_stderr_apart
+test_tool_output_is_not_a_transport_failure
 test_watch_retries_missing_sentinel_until_complete
 test_watch_retries_invalid_status_until_complete
 test_watch_retries_malformed_terminal_json_until_complete

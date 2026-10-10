@@ -24,7 +24,23 @@ access="$(jq -r '.tokens.access_token' "$HOME/.codex/auth.json")"
 account="$(jq -r '.tokens.account_id' "$HOME/.codex/auth.json")"
 [[ "$access" == "$EXPECTED_ACCESS_PLACEHOLDER" ]]
 [[ "$account" == "$EXPECTED_ACCOUNT_PLACEHOLDER" ]]
-printf '%s\n' 'ok - Codex auth preserves opaque provider placeholders'
+printf '%s\n' 'ok - Codex auth preserves opaque provider placeholders' >&2
+
+json=false
+last_message=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --json) json=true ;;
+        --output-last-message) last_message="$2"; shift ;;
+    esac
+    shift
+done
+[[ "$json" == true ]] || { echo "not ok - exec runs without --json" >&2; exit 1; }
+[[ -n "$last_message" ]] || { echo "not ok - exec runs without --output-last-message" >&2; exit 1; }
+printf '%s\n' '{"type":"thread.started","thread_id":"t-1"}'
+printf '%s\n' '{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"done\nOPENSHELL_AGENT_RESULT {\"status\":\"complete\"}"}}'
+printf 'done\nOPENSHELL_AGENT_RESULT {"status":"complete"}\n' > "$last_message"
+exit 3
 MOCK
 chmod +x "$TMP_DIR/codex"
 printf '%s\n' 'test prompt' > "$TMP_DIR/prompt.md"
@@ -36,4 +52,12 @@ CODEX_AUTH_ACCOUNT_ID="$ACCOUNT_PLACEHOLDER" \
 GITHUB_TOKEN="openshell:resolve:env:v42_GITHUB_TOKEN" \
 EXPECTED_ACCESS_PLACEHOLDER="$ACCESS_PLACEHOLDER" \
 EXPECTED_ACCOUNT_PLACEHOLDER="$ACCOUNT_PLACEHOLDER" \
-    bash "$SCRIPT_DIR/exec.sh" "$TMP_DIR/prompt.md"
+    bash "$SCRIPT_DIR/exec.sh" "$TMP_DIR/prompt.md" > "$TMP_DIR/stdout" 2> "$TMP_DIR/stderr" \
+    && status=0 || status=$?
+
+[[ "$status" -eq 3 ]] || { echo "not ok - adapter exit $status, want the harness's 3" >&2; exit 1; }
+grep -q '^{"type":"thread.started"' "$TMP_DIR/stdout" \
+    || { echo "not ok - JSON event stream missing from stdout" >&2; exit 1; }
+[[ "$(grep -c '^OPENSHELL_AGENT_RESULT ' "$TMP_DIR/stdout")" -eq 1 ]] \
+    || { echo "not ok - sentinel not re-emitted exactly once" >&2; exit 1; }
+printf '%s\n' 'ok - Codex streams JSON events and re-emits the result sentinel'

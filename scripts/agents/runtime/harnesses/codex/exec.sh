@@ -66,6 +66,10 @@ NODE
 chmod 600 "$HOME/.codex/auth.json"
 
 WORK="$(mktemp -d)"
+# The final message lives outside the harness's working dir, so the agent
+# cannot read or rewrite it mid-cycle.
+RESULT_DIR="$(mktemp -d)"
+trap 'rm -rf "$WORK" "$RESULT_DIR"' EXIT
 cd "$WORK"
 
 CODEX_BIN="${CODEX_BIN:-codex}"
@@ -79,11 +83,19 @@ CODEX_REASONING="${CODEX_REASONING:-high}"
 
 echo "openshell-agent: invoking Codex bounded cycle (model=$CODEX_MODEL, reasoning=$CODEX_REASONING)" >&2
 
+LAST_MESSAGE_FILE="$RESULT_DIR/last-message.txt"
+
 CODEX_EXEC_ARGS=(
     exec
     --skip-git-repo-check
     --sandbox danger-full-access
     --ephemeral
+    # One JSON event per line on stdout, written as each happens: every agent
+    # message, command and its output, MCP call and result, and turn usage.
+    # With the sandbox's agent_output_export_enabled setting on, the
+    # supervisor exports the stream unchanged.
+    --json
+    --output-last-message "$LAST_MESSAGE_FILE"
 )
 
 if "$CODEX_BIN" exec --help 2>/dev/null | grep -q -- "--ignore-user-config"; then
@@ -93,8 +105,29 @@ if "$CODEX_BIN" exec --help 2>/dev/null | grep -q -- "--ignore-rules"; then
     CODEX_EXEC_ARGS+=(--ignore-rules)
 fi
 
-exec "$CODEX_BIN" "${CODEX_EXEC_ARGS[@]}" \
+"$CODEX_BIN" "${CODEX_EXEC_ARGS[@]}" \
     -c "model=\"${CODEX_MODEL}\"" \
     -c "model_reasoning_effort=\"${CODEX_REASONING}\"" \
     - \
-    < "$PROMPT_FILE"
+    < "$PROMPT_FILE" &
+harness_pid=$!
+
+# The harness is not exec'd, so pass termination on to it and wait for it to
+# finish: it must never outlive the adapter, or lose its directories to the
+# EXIT trap while still running.
+trap 'kill -TERM "$harness_pid" 2>/dev/null || true' TERM INT HUP
+status=0
+wait "$harness_pid" || status=$?
+# A trapped signal interrupts `wait` while the harness is still shutting down.
+while kill -0 "$harness_pid" 2>/dev/null; do
+    status=0
+    wait "$harness_pid" || status=$?
+done
+
+# The JSON stream carries the final answer inside an event, so hand the
+# supervisor the answer's sentinel lines directly.
+if [[ -f "$LAST_MESSAGE_FILE" ]]; then
+    grep -E '^OPENSHELL_AGENT_RESULT[[:space:]]+' "$LAST_MESSAGE_FILE" || true
+fi
+
+exit "$status"

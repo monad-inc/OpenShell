@@ -7,8 +7,13 @@
 #
 # Contract (shared with runtime/harnesses/codex/exec.sh):
 #   argv[1]  path to the rendered agent prompt
-#   stdout   streamed harness output; the supervisor scans it for the final
-#            `OPENSHELL_AGENT_RESULT {...}` sentinel line
+#   stdout   Claude Code's stream-json event stream (one JSON event per line:
+#            every assistant turn, tool call, tool result, and the final
+#            result with cost and usage), then the final answer's
+#            `OPENSHELL_AGENT_RESULT {...}` sentinel line re-emitted plainly
+#            for the supervisor's line scan. With the sandbox's
+#            agent_output_export_enabled setting on, the supervisor exports
+#            all of it unchanged.
 #   exit     harness exit status
 #
 # Auth: exactly one of the two credential shapes must be present. Both arrive as
@@ -84,6 +89,11 @@ trap 'rm -rf "$CLAUDE_CONFIG_DIR"' EXIT
 
 mkdir -p "$HOME"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/claude-cycle.XXXXXX")"
+# The stream copy is the full transcript. It lives outside the harness's
+# working dir, so the agent's own `grep -r .` or `tar .` never sweeps it up,
+# and it must not accumulate across watch cycles.
+TRANSCRIPT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/claude-transcript.XXXXXX")"
+trap 'rm -rf "$CLAUDE_CONFIG_DIR" "$WORK" "$TRANSCRIPT_DIR"' EXIT
 cd "$WORK"
 
 CLAUDE_BIN="${CLAUDE_BIN:-claude}"
@@ -100,7 +110,10 @@ command -v "$CLAUDE_BIN" >/dev/null 2>&1 || [[ -x "$CLAUDE_BIN" ]] || {
 
 CLAUDE_ARGS=(
     --print
-    --output-format text
+    # One JSON event per line, written as each happens. --verbose is required
+    # for stream-json in print mode.
+    --output-format stream-json
+    --verbose
     --model "$CLAUDE_MODEL"
     # The OpenShell sandbox is the security boundary here: filesystem reach,
     # egress, and binaries are already policy-enforced around this process.
@@ -123,4 +136,57 @@ fi
 
 echo "openshell-agent: invoking Claude Code bounded cycle" >&2
 
-exec "$CLAUDE_BIN" "${CLAUDE_ARGS[@]}" < "$PROMPT_FILE"
+# Print the final answer from the stream's last `result` event. Error results
+# carry no answer and print nothing.
+final_result_text() {
+    local stream="$1"
+
+    if command -v jq >/dev/null 2>&1; then
+        # Only the last result line reaches jq: the stream can be hundreds of
+        # MB, and slurping it would hold all of it in memory.
+        grep -E '^\{"type":"result"' "$stream" | tail -n 1 | jq -r '.result // empty' 2>/dev/null || true
+        return
+    fi
+    python3 -c '
+import json
+import sys
+
+result = None
+with open(sys.argv[1], encoding="utf-8", errors="replace") as stream:
+    for line in stream:
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict) and event.get("type") == "result":
+            result = event
+if result and isinstance(result.get("result"), str):
+    print(result["result"])
+' "$stream"
+}
+
+STREAM_FILE="$TRANSCRIPT_DIR/stream.jsonl"
+mkfifo "$TRANSCRIPT_DIR/stream.fifo"
+tee "$STREAM_FILE" < "$TRANSCRIPT_DIR/stream.fifo" &
+tee_pid=$!
+"$CLAUDE_BIN" "${CLAUDE_ARGS[@]}" < "$PROMPT_FILE" > "$TRANSCRIPT_DIR/stream.fifo" &
+harness_pid=$!
+
+# The harness is not exec'd, so pass termination on to it and wait for it to
+# finish: it must never outlive the adapter, or lose its directories to the
+# EXIT trap while still running.
+trap 'kill -TERM "$harness_pid" 2>/dev/null || true' TERM INT HUP
+status=0
+wait "$harness_pid" || status=$?
+# A trapped signal interrupts `wait` while the harness is still shutting down.
+while kill -0 "$harness_pid" 2>/dev/null; do
+    status=0
+    wait "$harness_pid" || status=$?
+done
+wait "$tee_pid" || true
+
+# Inside the stream the sentinel is a JSON string, not a line of its own, so
+# hand the supervisor the answer's sentinel lines directly.
+final_result_text "$STREAM_FILE" | grep -E '^OPENSHELL_AGENT_RESULT[[:space:]]+' || true
+
+exit "$status"
