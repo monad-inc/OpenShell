@@ -61,7 +61,7 @@ pub enum Focus {
 pub struct LogLine {
     pub timestamp_ms: i64,
     pub level: String,
-    pub source: String, // "gateway" or "sandbox"
+    pub source: String, // "gateway", "sandbox", or "agent"
     pub target: String,
     pub message: String,
     pub fields: HashMap<String, String>,
@@ -73,6 +73,7 @@ pub enum LogSourceFilter {
     All,
     Gateway,
     Sandbox,
+    Agent,
 }
 
 impl LogSourceFilter {
@@ -80,7 +81,8 @@ impl LogSourceFilter {
         match self {
             Self::All => Self::Gateway,
             Self::Gateway => Self::Sandbox,
-            Self::Sandbox => Self::All,
+            Self::Sandbox => Self::Agent,
+            Self::Agent => Self::All,
         }
     }
 
@@ -89,6 +91,7 @@ impl LogSourceFilter {
             Self::All => "all",
             Self::Gateway => "gateway",
             Self::Sandbox => "sandbox",
+            Self::Agent => "agent",
         }
     }
 }
@@ -1198,6 +1201,9 @@ impl App {
                 LogSourceFilter::All => true,
                 LogSourceFilter::Gateway => l.source == "gateway",
                 LogSourceFilter::Sandbox => l.source == "sandbox",
+                LogSourceFilter::Agent => {
+                    l.source == openshell_core::agent_output::AGENT_LOG_SOURCE
+                }
             })
             .collect()
     }

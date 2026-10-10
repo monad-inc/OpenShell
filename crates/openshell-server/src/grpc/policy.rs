@@ -5072,8 +5072,30 @@ pub(super) async fn handle_get_sandbox_logs(
             }
         })
         .collect();
+    let logs = newest_within_bytes(logs, MAX_LOGS_RESPONSE_BYTES);
 
     Ok(Response::new(GetSandboxLogsResponse { logs, buffer_total }))
+}
+
+/// Encoded-size budget for one `GetSandboxLogs` response. A sandbox exporting
+/// its agent's output keeps lines of up to 64 KiB in its tail, and the default
+/// 4 MiB gRPC client decode limit would otherwise reject the whole response.
+const MAX_LOGS_RESPONSE_BYTES: usize = 3 * 1024 * 1024;
+
+/// Keep the newest lines of `logs` whose encoded size fits `budget`, in their
+/// original order. The newest line is always kept.
+fn newest_within_bytes(mut logs: Vec<SandboxLogLine>, budget: usize) -> Vec<SandboxLogLine> {
+    let mut bytes = 0;
+    let mut keep_from = logs.len();
+    for (index, line) in logs.iter().enumerate().rev() {
+        bytes += line.encoded_len() + 4;
+        if bytes > budget && keep_from < logs.len() {
+            break;
+        }
+        keep_from = index;
+    }
+    logs.drain(..keep_from);
+    logs
 }
 
 pub(super) async fn handle_push_sandbox_logs(
@@ -5115,7 +5137,7 @@ pub(super) async fn handle_push_sandbox_logs(
         validate_sandbox_log_timestamps(&logs)?;
 
         for mut log in logs {
-            log.source = "sandbox".to_string();
+            log.source = pushed_log_source(&log.target).to_string();
             log.sandbox_id.clone_from(&batch.sandbox_id);
             sanitize_pushed_log_fields(&mut log);
             record_pushed_telemetry_gap(&log);
@@ -5135,6 +5157,17 @@ pub(super) async fn handle_push_sandbox_logs(
     }
 
     Ok(Response::new(PushSandboxLogsResponse {}))
+}
+
+/// Source the gateway assigns a pushed line. The supervisor marks the agent's
+/// own output with a reserved target; everything else it pushes is its own
+/// record. The sender never chooses the source directly.
+fn pushed_log_source(target: &str) -> &'static str {
+    if openshell_core::agent_output::is_agent_output_target(target) {
+        openshell_core::agent_output::AGENT_LOG_SOURCE
+    } else {
+        "sandbox"
+    }
 }
 
 /// Maximum log lines the gateway ingests from one `PushSandboxLogsRequest`.
@@ -11642,6 +11675,32 @@ mod tests {
             ],
             "both OCSF push formats survive; reserved keys do not"
         );
+    }
+
+    #[test]
+    fn pushed_agent_output_is_sourced_as_agent_and_nothing_else_is() {
+        use openshell_core::agent_output::{AGENT_STDERR_TARGET, AGENT_STDOUT_TARGET};
+        assert_eq!(pushed_log_source(AGENT_STDOUT_TARGET), "agent");
+        assert_eq!(pushed_log_source(AGENT_STDERR_TARGET), "agent");
+        assert_eq!(pushed_log_source(openshell_ocsf::OCSF_TARGET), "sandbox");
+        assert_eq!(pushed_log_source(TELEMETRY_GAP_TARGET), "sandbox");
+        assert_eq!(pushed_log_source("openshell.agent"), "sandbox");
+    }
+
+    #[test]
+    fn logs_response_keeps_the_newest_lines_within_budget() {
+        let line = |message: &str| SandboxLogLine {
+            message: message.to_string(),
+            ..Default::default()
+        };
+        let big = "x".repeat(1000);
+        let logs = vec![line(&big), line(&big), line(&big), line("newest")];
+        let kept = newest_within_bytes(logs, 2100);
+        let messages: Vec<_> = kept.iter().map(|l| l.message.len()).collect();
+        assert_eq!(messages, vec![1000, 1000, 6]);
+
+        let kept = newest_within_bytes(vec![line(&big)], 10);
+        assert_eq!(kept.len(), 1, "the newest line survives any budget");
     }
 
     #[test]

@@ -7973,8 +7973,11 @@ type SandboxLogLine struct {
 	Level     string                 `protobuf:"bytes,3,opt,name=level,proto3" json:"level,omitempty"`
 	Target    string                 `protobuf:"bytes,4,opt,name=target,proto3" json:"target,omitempty"`
 	Message   string                 `protobuf:"bytes,5,opt,name=message,proto3" json:"message,omitempty"`
-	// Log source: "gateway" (server-side) or "sandbox" (supervisor).
-	// Empty is treated as "gateway" for backward compatibility.
+	// Log source: "gateway" (server-side), "sandbox" (supervisor), or "agent"
+	// (a line the sandbox's main process wrote to stdout or stderr, exported
+	// when the sandbox enables agent_output_export_enabled). The gateway assigns
+	// it; a pushed value is ignored. Empty is treated as "gateway" for backward
+	// compatibility.
 	Source string `protobuf:"bytes,6,opt,name=source,proto3" json:"source,omitempty"`
 	// Structured key-value fields from the tracing event (e.g. dst_host, action).
 	Fields        map[string]string `protobuf:"bytes,7,rep,name=fields,proto3" json:"fields,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
@@ -12899,11 +12902,13 @@ type GetSandboxLogsRequest struct {
 	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,6,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
 	// Canonical sandbox name.
 	Sandbox string `protobuf:"bytes,1,opt,name=sandbox,proto3" json:"sandbox,omitempty"`
-	// Maximum number of log lines to return. 0 means use default (2000).
+	// Maximum number of log lines to return. 0 means use default (2000). The
+	// response is also capped at about 3 MiB encoded, keeping the newest lines,
+	// so a tail of large agent output lines returns fewer than requested.
 	Lines uint32 `protobuf:"varint,2,opt,name=lines,proto3" json:"lines,omitempty"`
 	// Only include logs at or after this time. Absence means no filter.
 	SinceTime *timestamppb.Timestamp `protobuf:"bytes,103,opt,name=since_time,json=sinceTime,proto3" json:"since_time,omitempty"`
-	// Filter by log source (e.g. "gateway", "sandbox"). Empty means all sources.
+	// Filter by log source (e.g. "gateway", "sandbox", "agent"). Empty means all sources.
 	Sources []string `protobuf:"bytes,4,rep,name=sources,proto3" json:"sources,omitempty"`
 	// Minimum log level to include (e.g. "INFO", "WARN", "ERROR"). Empty means all levels.
 	MinLevel      string `protobuf:"bytes,5,opt,name=min_level,json=minLevel,proto3" json:"min_level,omitempty"`

@@ -7,6 +7,7 @@
 //! sessions, skills, and log forwarding. Workload spawning and in-sandbox
 //! enforcement live exclusively in `openshell-sandbox`.
 
+pub mod agent_output;
 pub mod debug_rpc;
 pub mod delegated;
 pub mod log_push;

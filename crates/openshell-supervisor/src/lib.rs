@@ -631,6 +631,7 @@ pub async fn run_sandbox(
     health_port: Option<u16>,
     ocsf_enabled: Arc<AtomicBool>,
     ocsf_schema_version: Arc<std::sync::Mutex<String>>,
+    agent_output_push: Option<tokio::sync::mpsc::Sender<openshell_core::proto::SandboxLogLine>>,
     upstream_proxy_args: openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs,
     backend_descriptor: openshell_isolation_interface::contract::BackendDescriptor,
     auth_bundle: openshell_core::jwt::SupervisorAuthBundle,
@@ -1062,6 +1063,10 @@ pub async fn run_sandbox(
         });
     }
 
+    // `agent_output_export_enabled`, published by the policy poll task and read
+    // by the agent output forwarder. `None` until the first poll.
+    let agent_output_export = Arc::new(tokio::sync::watch::Sender::new(None::<bool>));
+
     // Spawn background policy poll task (gRPC mode only).
     if let (Some(id), Some(sandbox), Some(endpoint), Some(engine)) = (
         sandbox_id.as_deref(),
@@ -1096,6 +1101,7 @@ pub async fn run_sandbox(
             interval_secs: poll_interval_secs,
             ocsf_enabled: poll_ocsf_enabled,
             ocsf_schema_version: poll_ocsf_schema_version,
+            agent_output_export: agent_output_export.clone(),
             provider_credentials: poll_provider_credentials,
             provider_readiness: provider_readiness.clone(),
             policy_local_ctx: poll_policy_local,
@@ -1171,6 +1177,19 @@ pub async fn run_sandbox(
         )
         .await?;
         info!(backend = %backend_name, "Control-mode access plane started");
+        // Export the agent's own stdout and stderr when the sandbox opts in.
+        let agent_output_forwarder = boundary_access
+            .main_session()
+            .zip(agent_output_push)
+            .zip(sandbox_id.clone())
+            .map(|((main_session, push), id)| {
+                openshell_supervisor_process::agent_output::spawn_agent_output_forwarder(
+                    main_session,
+                    id,
+                    push,
+                    agent_output_export.subscribe(),
+                )
+            });
         let _provider_reporter =
             sandbox_id
                 .as_ref()
@@ -1293,6 +1312,12 @@ pub async fn run_sandbox(
         if retain_access {
             info!(backend = %backend_name, "Canonical process exited; retaining control-mode access plane");
             retain_remote_access_plane(&mut proxy_exited, &mut shutdown_requested).await?;
+        }
+        // The forwarder ends once it has queued the main process's last
+        // output, which the exit publication above released. Wait for it so
+        // the final flush at exit includes those lines.
+        if let Some(forwarder) = agent_output_forwarder {
+            let _ = timeout(Duration::from_secs(2), forwarder).await;
         }
         drop(control_readiness);
         drop(running);
@@ -3403,6 +3428,8 @@ struct PolicyPollLoopContext {
     interval_secs: u64,
     ocsf_enabled: Arc<AtomicBool>,
     ocsf_schema_version: Arc<std::sync::Mutex<String>>,
+    /// `agent_output_export_enabled`, `None` until the first settings poll.
+    agent_output_export: Arc<tokio::sync::watch::Sender<Option<bool>>>,
     provider_credentials: ProviderCredentialState,
     provider_readiness: ProviderReadinessTracker,
     policy_local_ctx: Option<Arc<openshell_supervisor_network::policy_local::PolicyLocalContext>>,
@@ -3925,6 +3952,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                     current_policy_generation = Some(generation.clone());
                     apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
                     apply_ocsf_schema_version_setting(&ctx.ocsf_schema_version, &result.settings);
+                    apply_agent_output_export_setting(&ctx.agent_output_export, &result.settings);
                     apply_agent_proposals_enabled(
                         &ctx.agent_proposals,
                         agent_proposals_enabled_from_settings(&result.settings),
@@ -3964,6 +3992,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                 (InitialPollDisposition::TrackOnly, _) => {
                     apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
                     apply_ocsf_schema_version_setting(&ctx.ocsf_schema_version, &result.settings);
+                    apply_agent_output_export_setting(&ctx.agent_output_export, &result.settings);
                     apply_agent_proposals_enabled(
                         &ctx.agent_proposals,
                         agent_proposals_enabled_from_settings(&result.settings),
@@ -4015,6 +4044,11 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                 }
             }
         };
+
+        // Applied before anything below can `continue`: the agent output
+        // forwarder waits for this value, and a policy or provider failure
+        // must not hold the export setting back.
+        apply_agent_output_export_setting(&ctx.agent_output_export, &result.settings);
 
         // Reuse installed per-service credentials, rotating only when one is
         // missing or due. Rotation happens on the existing gateway channel and
@@ -4615,6 +4649,46 @@ fn apply_ocsf_json_setting(
     }
 }
 
+/// Publish the `agent_output_export_enabled` setting to the agent output
+/// forwarder. The first call releases the forwarder, which holds off reading
+/// until the setting is known.
+fn apply_agent_output_export_setting(
+    export: &tokio::sync::watch::Sender<Option<bool>>,
+    settings: &std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
+) {
+    let enabled = extract_bool_setting(
+        settings,
+        openshell_core::settings::AGENT_OUTPUT_EXPORT_ENABLED_KEY,
+    )
+    .unwrap_or(false);
+    let previous = export.send_replace(Some(enabled));
+    // Starting off is the default and not news; every other change of whether
+    // the agent's output leaves the sandbox is a config state change.
+    if previous != Some(enabled) && (enabled || previous.is_some()) {
+        let (state, label, message) = if enabled {
+            (
+                StateId::Enabled,
+                "enabled",
+                "Agent output export enabled: the main process's stdout and stderr are exported",
+            )
+        } else {
+            (
+                StateId::Disabled,
+                "disabled",
+                "Agent output export disabled",
+            )
+        };
+        ocsf_emit!(
+            ConfigStateChangeBuilder::new(ocsf_ctx())
+                .severity(SeverityId::Informational)
+                .status(StatusId::Success)
+                .state(state, label)
+                .message(message)
+                .build()
+        );
+    }
+}
+
 /// Extract a bool value from an effective setting, if present.
 fn extract_bool_setting(
     settings: &std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
@@ -5043,6 +5117,21 @@ mod tests {
         apply_ocsf_json_setting(&enabled, &settings);
 
         assert!(enabled.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn apply_agent_output_export_setting_releases_forwarder_with_the_value() {
+        let export = tokio::sync::watch::Sender::new(None);
+        let mut settings = std::collections::HashMap::new();
+        apply_agent_output_export_setting(&export, &settings);
+        assert_eq!(*export.borrow(), Some(false), "unset means known and off");
+
+        settings.insert(
+            openshell_core::settings::AGENT_OUTPUT_EXPORT_ENABLED_KEY.to_string(),
+            effective_bool(true),
+        );
+        apply_agent_output_export_setting(&export, &settings);
+        assert_eq!(*export.borrow(), Some(true));
     }
 
     #[test]
@@ -6499,6 +6588,7 @@ network_policies:
             interval_secs: 0,
             ocsf_enabled: Arc::new(AtomicBool::new(false)),
             ocsf_schema_version: Arc::new(std::sync::Mutex::new(String::new())),
+            agent_output_export: Arc::new(tokio::sync::watch::Sender::new(None)),
             provider_credentials,
             provider_readiness,
             policy_local_ctx: None,

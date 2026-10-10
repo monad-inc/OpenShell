@@ -19,7 +19,8 @@ type LogLine struct {
 	Target string
 	// Message is the log message text.
 	Message string
-	// Source is the log source: "gateway" or "sandbox".
+	// Source is the log source: "gateway", "sandbox", or "agent" (the
+	// sandbox's own stdout and stderr, when agent_output_export_enabled is set).
 	Source string
 	// Fields contains structured key-value fields from the tracing event.
 	Fields map[string]string
@@ -58,7 +59,7 @@ func WithLogSince(t time.Time) LogOption {
 	}
 }
 
-// WithLogSources filters logs by source (e.g., "gateway", "sandbox").
+// WithLogSources filters logs by source (e.g., "gateway", "sandbox", "agent").
 func WithLogSources(sources ...string) LogOption {
 	return func(c *logConfig) {
 		c.sources = sources

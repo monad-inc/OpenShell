@@ -27,6 +27,8 @@ The CLI receives logs from the gateway over gRPC. Each line includes a timestamp
 
 OCSF structured events show `OCSF` as the level. Standard tracing events show `INFO`, `WARN`, or `ERROR`.
 
+Sources are `gateway`, `sandbox` (the supervisor), and `agent`: the sandbox's own stdout and stderr, present when the sandbox enables [agent output export](/observability/logging#export-agent-output). Use `--source agent` to see only that. Agent lines are shown with control and invisible formatting characters escaped, because their text can come from anything the agent read. One request returns at most about 3 MiB, newest lines first, so `-n` returns fewer lines than asked when the tail holds large agent lines.
+
 Gateway-originated policy mutations also appear in this stream. When the gateway merges `openshell policy update` operations or approves or removes draft policy chunks, it emits `gateway` `OCSF` `CONFIG:*` lines for the affected sandbox so you can see the exact logical change that produced a new policy revision.
 
 ## TUI

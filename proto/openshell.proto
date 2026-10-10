@@ -2098,8 +2098,11 @@ message SandboxLogLine {
   string level = 3;
   string target = 4;
   string message = 5;
-  // Log source: "gateway" (server-side) or "sandbox" (supervisor).
-  // Empty is treated as "gateway" for backward compatibility.
+  // Log source: "gateway" (server-side), "sandbox" (supervisor), or "agent"
+  // (a line the sandbox's main process wrote to stdout or stderr, exported
+  // when the sandbox enables agent_output_export_enabled). The gateway assigns
+  // it; a pushed value is ignored. Empty is treated as "gateway" for backward
+  // compatibility.
   string source = 6;
   // Structured key-value fields from the tracing event (e.g. dst_host, action).
   map<string, string> fields = 7;
@@ -2936,11 +2939,13 @@ message GetSandboxLogsRequest {
   reserved "since_ms";
   // Canonical sandbox name.
   string sandbox = 1;
-  // Maximum number of log lines to return. 0 means use default (2000).
+  // Maximum number of log lines to return. 0 means use default (2000). The
+  // response is also capped at about 3 MiB encoded, keeping the newest lines,
+  // so a tail of large agent output lines returns fewer than requested.
   uint32 lines = 2;
   // Only include logs at or after this time. Absence means no filter.
   google.protobuf.Timestamp since_time = 103;
-  // Filter by log source (e.g. "gateway", "sandbox"). Empty means all sources.
+  // Filter by log source (e.g. "gateway", "sandbox", "agent"). Empty means all sources.
   repeated string sources = 4;
   // Minimum log level to include (e.g. "INFO", "WARN", "ERROR"). Empty means all levels.
   string min_level = 5;

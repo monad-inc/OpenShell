@@ -335,24 +335,30 @@ fn main() -> Result<()> {
         let log_push_state = if args.role == SupervisorRole::IsolationBackend
             && let (Some(sandbox_id), Some(endpoint)) = (&args.sandbox_id, &args.openshell_endpoint)
         {
-            let (tx, dropped, handle) = openshell_supervisor_process::log_push::spawn_log_push_task(
-                endpoint.clone(),
-                sandbox_id.clone(),
-            );
+            let (tx, dropped, handle, flush) =
+                openshell_supervisor_process::log_push::spawn_log_push_task(
+                    endpoint.clone(),
+                    sandbox_id.clone(),
+                );
             // Pushed `ocsf.raw` follows the same schema-version setting as the
             // local JSONL file, so both carry the same document.
+            // The agent output forwarder shares the push channel, so its
+            // lines reach the gateway on the same stream as the supervisor's.
+            let agent_output_push = tx.clone();
             let layer = openshell_supervisor_process::log_push::LogPushLayer::new(
                 sandbox_id.clone(),
                 tx,
                 dropped,
             )
             .with_target_version(ocsf_schema_version.clone());
-            Some((layer, handle))
+            Some((layer, handle, agent_output_push, flush))
         } else {
             None
         };
-        let push_layer = log_push_state.as_ref().map(|(layer, _)| layer.clone());
-        let _log_push_handle = log_push_state.map(|(_, handle)| handle);
+        let push_layer = log_push_state.as_ref().map(|(layer, ..)| layer.clone());
+        let agent_output_push = log_push_state.as_ref().map(|(_, _, tx, _)| tx.clone());
+        let log_push_flush = log_push_state.as_ref().map(|(.., flush)| flush.clone());
+        let _log_push_handle = log_push_state.map(|(_, handle, ..)| handle);
 
         let (_file_guard, _jsonl_guard) = if let Some((file_writer, file_guard)) = file_logging {
             let jsonl_logging = tracing_appender::rolling::RollingFileAppender::builder()
@@ -437,7 +443,7 @@ fn main() -> Result<()> {
                 };
                 let admitted_isolation_backend =
                     std::env::var(openshell_core::sandbox_env::ADMITTED_ISOLATION_BACKEND).ok();
-                Box::pin(openshell_supervisor::run_sandbox(
+                let result = Box::pin(openshell_supervisor::run_sandbox(
                     command,
                     workdir,
                     args.timeout,
@@ -453,13 +459,21 @@ fn main() -> Result<()> {
                     args.health_port,
                     ocsf_enabled,
                     ocsf_schema_version,
+                    agent_output_push,
                     upstream_proxy_args,
                     backend_descriptor,
                     auth_bundle,
                     admitted_isolation_backend,
                     args.main_exit_marker,
                 ))
-                .await
+                .await;
+                // `process::exit` follows: push what is still queued first, so
+                // the last lines (often an exporting agent's final result)
+                // reach the gateway.
+                if let Some(flush) = log_push_flush {
+                    flush.finish(std::time::Duration::from_secs(3)).await;
+                }
+                result
             }
             SupervisorRole::NetworkProxy => {
                 let listen = args.listen.unwrap_or_else(|| ([127, 0, 0, 1], 3128).into());

@@ -547,7 +547,9 @@ enum Commands {
         #[arg(long)]
         since: Option<String>,
 
-        /// Filter by log source: "gateway", "sandbox", or "all" (default).
+        /// Filter by log source: "gateway", "sandbox", "agent", or "all" (default).
+        /// "agent" is the sandbox's own stdout and stderr, present when the
+        /// sandbox enables `agent_output_export_enabled`.
         /// Can be specified multiple times: --source gateway --source sandbox
         #[arg(long, default_value = "all")]
         source: Vec<String>,
