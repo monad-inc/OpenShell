@@ -16,6 +16,9 @@ harness:
   supported:
     codex:
       model: gpt-5.6-sol
+      # Installed into the image at build time. An upgrade is a deliberate
+      # edit here; the entrypoint refuses an image carrying another version.
+      version: "0.162.1"
       reasoning: medium
 
 runtime:

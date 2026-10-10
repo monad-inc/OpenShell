@@ -198,6 +198,12 @@ emit "AGENT_DISPLAY_NAME", manifest.fetch("display_name", manifest.fetch("id"))
 emit "HARNESS", harness
 emit "HARNESS_MODEL", harness_config.fetch("model", "")
 emit "HARNESS_REASONING", harness_config.fetch("reasoning", "")
+# The harness is installed into the image at build time, at this version. No
+# default: the version decides the event format the supervisor exports, so an
+# upgrade is a deliberate edit here, and `latest` is accepted only when written.
+harness_version = harness_config.fetch("version", "").to_s
+abort "harness.supported.#{harness}.version is not set: pin the #{harness} version (use \"latest\" only deliberately)" if harness_version.empty?
+emit "HARNESS_VERSION", harness_version
 emit "SANDBOX_NAME_PREFIX", manifest.dig("sandbox", "name_prefix") || manifest.fetch("id")
 emit "SANDBOX_FROM_DEFAULT", manifest.dig("sandbox", "from") || "agent://."
 emit "GATEWAY_DEFAULT", manifest.dig("sandbox", "gateway") || "docker-dev"
@@ -704,8 +710,16 @@ RUBY
     # gateway-selected engine instead of auto-detecting another engine.
     source "$ROOT_DIR/tasks/scripts/container-engine.sh"
     local image_tag="openshell/agent-${AGENT_ID}:$(date +%s)"
-    log "Building sandbox image '$image_tag' with $CONTAINER_ENGINE."
-    ce_build --load --file "$build_dockerfile" --tag "$image_tag" "$build_context"
+    # The image's Dockerfile installs the harness from this build argument.
+    local version_arg
+    case "$HARNESS" in
+        claude) version_arg=CLAUDE_CODE_VERSION ;;
+        codex) version_arg=CODEX_VERSION ;;
+        *) fail "no harness version build argument known for harness '$HARNESS'" ;;
+    esac
+    log "Building sandbox image '$image_tag' with $CONTAINER_ENGINE ($HARNESS $HARNESS_VERSION)."
+    ce_build --load --build-arg "$version_arg=$HARNESS_VERSION" \
+        --file "$build_dockerfile" --tag "$image_tag" "$build_context"
     SANDBOX_FROM="$image_tag"
 }
 
@@ -793,6 +807,7 @@ done
 HARNESS_ENV_ARGS=(
     "OPENSHELL_AGENT_ID=$AGENT_ID"
     "OPENSHELL_AGENT_HARNESS=$HARNESS"
+    "OPENSHELL_AGENT_HARNESS_VERSION=$HARNESS_VERSION"
     "OPENSHELL_AGENT_RUN_MODE=$RUN_MODE"
     "OPENSHELL_AGENT_POLL_INTERVAL_SECONDS=$POLL_INTERVAL_SECONDS"
     "OPENSHELL_AGENT_MAX_TRANSIENT_FAILURES=$MAX_TRANSIENT_FAILURES"

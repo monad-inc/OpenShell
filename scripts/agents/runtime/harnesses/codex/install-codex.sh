@@ -5,7 +5,14 @@
 
 set -euo pipefail
 
-version="${1:-${CODEX_VERSION:-latest}}"
+# No default. The harness version decides the event format the supervisor
+# exports and parses, so it is pinned by whoever builds the image, and `latest`
+# is accepted only when someone passes it on purpose.
+version="${1:-${CODEX_VERSION:-}}"
+if [[ -z "$version" ]]; then
+    echo "no Codex version given: pass one (or set CODEX_VERSION); use latest only deliberately" >&2
+    exit 2
+fi
 
 if [[ "$version" != "latest" && ! "$version" =~ ^[0-9]+(\.[0-9]+){0,2}(-[0-9A-Za-z.-]+)?$ ]]; then
     echo "unsupported Codex version: $version" >&2

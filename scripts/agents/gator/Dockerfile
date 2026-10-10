@@ -65,8 +65,12 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     apt-get update && apt-get install -y --no-install-recommends gh && \
     rm -rf /var/lib/apt/lists/*
 
-ARG CODEX_VERSION=latest
-RUN npm install -g "@openai/codex@${CODEX_VERSION}" && \
+# Set by run.sh from harness.supported.codex.version in agent.yaml. No default,
+# so a build that does not say which Codex it wants fails instead of taking
+# whatever is newest.
+ARG CODEX_VERSION
+RUN test -n "$CODEX_VERSION" || { echo "CODEX_VERSION build argument is required" >&2; exit 1; } && \
+    npm install -g "@openai/codex@${CODEX_VERSION}" && \
     (npm cache clean --force >/dev/null 2>&1 || true) && \
     codex --version
 

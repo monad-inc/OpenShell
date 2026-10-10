@@ -71,4 +71,5 @@ bash scripts/agents/gator/bin/resolve_gator_review_threads_test.sh
 bash scripts/agents/runtime/harnesses/codex/exec_test.sh
 bash scripts/agents/runtime/harnesses/claude/exec_test.sh
 bash scripts/agents/runtime/supervisor_test.sh
+bash scripts/agents/runtime/entrypoint_test.sh
 ```
