@@ -289,6 +289,57 @@ openshell sandbox create \
 | `containers.agent.volume_mounts[].sub_path` | Optional relative path within the PVC. |
 | `containers.agent.volume_mounts[].read_only` | Defaults to `true`. Read-write mounts require a read-write volume. |
 
+### Kubernetes ConfigMap Mounts
+
+Mount an existing ConfigMap read-only into the agent container through driver config. Each volume sets exactly one source, either `persistent_volume_claim` or `config_map`. ConfigMap keys cannot contain `/`, so use `items` to project chosen keys to nested file paths. Without `items`, every key becomes a file at the top of the mount.
+
+```shell
+openshell sandbox create \
+  --from registry.example.com/team/agent-base:1.0 \
+  --driver-config-json '{
+    "kubernetes": {
+      "volumes": [{
+        "name": "agent-payload",
+        "config_map": {
+          "name": "agent-payload-triage",
+          "items": [
+            {"key": "prompt.md", "path": "prompt.md"},
+            {"key": "skills__alert-triage__SKILL.md", "path": "skills/alert-triage/SKILL.md"},
+            {"key": "bin__report.sh", "path": "bin/report.sh", "mode": 493}
+          ]
+        }
+      }],
+      "containers": {
+        "agent": {
+          "volume_mounts": [
+            {"name": "agent-payload", "mount_path": "/etc/agent-payload"}
+          ]
+        }
+      }
+    }
+  }' \
+  -- claude
+```
+
+| Field | Description |
+|---|---|
+| `volumes[].config_map.name` | Existing ConfigMap in the sandbox namespace. |
+| `volumes[].config_map.items[].key` | ConfigMap key to project. |
+| `volumes[].config_map.items[].path` | Relative file path inside the mount. Must not contain `..`. |
+| `volumes[].config_map.items[].mode` | Optional file mode for this item, as a decimal integer. `493` is `0755`. |
+| `volumes[].config_map.default_mode` | Optional mode for projected files, as a decimal integer. Kubernetes defaults to `0644`. |
+| `volumes[].config_map.optional` | Must be `false` or unset, because admission requires the ConfigMap to exist. |
+
+ConfigMap mounts are always read-only, and the driver rejects `read_only: false` on them. Mount targets follow the same rules as PVC mounts, so paths under `/etc/openshell` and other OpenShell control paths are rejected. Kubernetes refreshes mounted files after the ConfigMap changes, except files mounted with `sub_path`.
+
+Label the ConfigMap for the sandbox's workspace before you create the sandbox, as you would a PVC. [External Resource Admission](/how-it-works/gateways/configuration#external-resource-admission) lists the labels:
+
+```shell
+kubectl -n <sandbox-namespace> label configmap agent-payload-triage \
+  openshell.ai/sandbox-attachable=true \
+  openshell.ai/sandbox-attachable-workspace=<workspace>
+```
+
 ## Sandbox User Identity
 
 Set `process.run_as_user` and `process.run_as_group` in the sandbox policy to choose the sandbox user. Any non-root UID or GID is allowed. When a field is unset, the driver supplies it:

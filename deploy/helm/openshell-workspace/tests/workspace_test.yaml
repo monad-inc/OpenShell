@@ -24,7 +24,7 @@ tests:
           path: rules
           content:
             apiGroups: [""]
-            resources: ["persistentvolumeclaims"]
+            resources: ["persistentvolumeclaims", "configmaps"]
             verbs: ["get"]
       - notContains:
           path: rules
@@ -39,7 +39,7 @@ tests:
             resources: ["configmaps"]
             verbs: ["get"]
 
-  - it: grants PVC admission reads only when caller driver config is enabled
+  - it: grants PVC and ConfigMap admission reads only when caller driver config is enabled
     template: templates/role.yaml
     set:
       gateway.allowDriverConfig: true
@@ -48,7 +48,7 @@ tests:
           path: rules
           content:
             apiGroups: [""]
-            resources: ["persistentvolumeclaims"]
+            resources: ["persistentvolumeclaims", "configmaps"]
             verbs: ["get"]
 
   - it: grants generation Secret lifecycle and names no Secrets

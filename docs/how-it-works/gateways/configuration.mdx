@@ -648,8 +648,8 @@ and `openshell.ai/sandbox-workspace`. The default admission key
 sandbox metadata key.
 
 The operator must label the referenced resource before use. Labels on a sandbox
-do not approve its attachments. For example, a PVC used by workspace `team-a`
-needs this metadata:
+do not approve its attachments. For example, a PVC or ConfigMap used by
+workspace `team-a` needs this metadata:
 
 ```yaml
 metadata:
@@ -658,8 +658,9 @@ metadata:
     openshell.ai/sandbox-attachable-workspace: "team-a"
 ```
 
-Kubernetes checks caller-selected PVCs, RuntimeClasses, and PriorityClasses
-through the OpenShell-owned Pod template. Docker and Podman check engine volume
+Kubernetes checks caller-selected PVCs, ConfigMaps, RuntimeClasses, and
+PriorityClasses through the OpenShell-owned Pod template. Caller driver config
+cannot select Secret volumes; credentials reach sandboxes through providers. Docker and Podman check engine volume
 labels. Read-only mounts still require approval. Namespaces do not grant
 approval. Newly provisioned private storage and bootstrap material use driver
 ownership checks instead.
@@ -735,8 +736,8 @@ calls until gateway and driver configuration agree again.
 Helm exposes `server.drivers.kubernetes.allowDriverConfig`,
 `resourceAdmission.enabled`, and `resourceAdmission.requiredLabels`. The label
 map defaults to `null`, which uses code defaults without merging those keys
-into a custom map. The Helm chart grants PVC metadata reads only when
-`allowDriverConfig` is enabled. Split workspace releases must set the matching
+into a custom map. The Helm chart grants PVC and ConfigMap metadata reads only
+when `allowDriverConfig` is enabled. Split workspace releases must set the matching
 `gateway.allowDriverConfig=true` workspace-chart value. Never mark gateway
 database storage as attachable.
 

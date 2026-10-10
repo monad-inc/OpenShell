@@ -18,7 +18,7 @@ rules:
     verbs: ["get"]
   {{- if and (ne $workspaceMode "shared") .Values.server.drivers.kubernetes.allowDriverConfig }}
   - apiGroups: [""]
-    resources: ["persistentvolumeclaims"]
+    resources: ["persistentvolumeclaims", "configmaps"]
     verbs: ["get"]
   {{- end }}
   # Validate projected ServiceAccount tokens during sandbox bootstrap and

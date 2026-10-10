@@ -26,7 +26,7 @@ tests:
             resources: ["networkpolicies"]
             verbs: ["get", "create", "patch", "update"]
 
-  - it: limits namespaced admission reads to PVCs
+  - it: limits namespaced admission reads to PVCs and ConfigMaps
     set:
       server.drivers.kubernetes.workspaceMode: managed
       server.drivers.kubernetes.allowDriverConfig: true
@@ -35,7 +35,7 @@ tests:
           path: rules
           content:
             apiGroups: [""]
-            resources: ["persistentvolumeclaims"]
+            resources: ["persistentvolumeclaims", "configmaps"]
             verbs: ["get"]
       - notContains:
           path: rules
@@ -50,7 +50,7 @@ tests:
             resources: ["configmaps"]
             verbs: ["get"]
 
-  - it: omits PVC admission reads when caller driver config is disabled
+  - it: omits PVC and ConfigMap admission reads when caller driver config is disabled
     set:
       server.drivers.kubernetes.workspaceMode: managed
     asserts:
@@ -58,7 +58,7 @@ tests:
           path: rules
           content:
             apiGroups: [""]
-            resources: ["persistentvolumeclaims"]
+            resources: ["persistentvolumeclaims", "configmaps"]
             verbs: ["get"]
 
   - it: preserves sandbox-runtime fence permissions when gateway isolation is disabled

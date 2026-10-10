@@ -209,6 +209,12 @@ nested schema and currently accepts:
 - `volumes[].name`
 - `volumes[].persistent_volume_claim.claim_name`
 - `volumes[].persistent_volume_claim.read_only`
+- `volumes[].config_map.name`
+- `volumes[].config_map.items[].key`
+- `volumes[].config_map.items[].path`
+- `volumes[].config_map.items[].mode`
+- `volumes[].config_map.default_mode`
+- `volumes[].config_map.optional` (must be `false`)
 
 Nested keys inside the `kubernetes` block use snake_case. The top-level
 `driver_config` envelope is keyed by driver names, so `kubernetes` is not part
@@ -239,6 +245,51 @@ agent container. PVC volumes and mounts default to read-only unless
 rejects duplicate volume names, invalid DNS-1123 volume labels or PVC claim
 subdomain names, mounts that reference unknown volumes, non-normalized or
 protected mount paths, and absolute or parent-traversing `sub_path` values.
+
+Each volume sets exactly one source: `persistent_volume_claim` or
+`config_map`. ConfigMap volumes render as a Kubernetes `configMap` volume
+source and are always read-only, so a mount with `read_only: false` is
+rejected. The driver validates the ConfigMap name as a DNS-1123 subdomain,
+`items[].key` as a ConfigMap key, `items[].path` as a unique relative path
+without `..`, and file modes as integers from 0 to 511 (octal 0777). Because
+`driver_config` arrives as a protobuf `Struct`, modes are decimal JSON
+numbers; non-integral values are rejected. `optional: true` is rejected
+because resource admission requires the ConfigMap to exist. Secret volumes
+are not supported; credentials reach sandboxes through providers.
+
+Resource admission inventories a ConfigMap volume as a workspace-scoped
+reference, exactly like a PVC: the gateway reads the ConfigMap's metadata
+(never its data) and requires the configured approval labels, by default
+`openshell.ai/sandbox-attachable: "true"` and
+`openshell.ai/sandbox-attachable-workspace: <workspace>`. The Helm charts
+grant `get` on `configmaps` alongside `persistentvolumeclaims` when
+`allowDriverConfig` is enabled.
+
+```shell
+openshell sandbox create \
+  --driver-config-json '{
+    "kubernetes": {
+      "volumes": [{
+        "name": "agent-payload",
+        "config_map": {
+          "name": "agent-payload-triage",
+          "items": [
+            {"key": "prompt.md", "path": "prompt.md"},
+            {"key": "skills__alert-triage__SKILL.md", "path": "skills/alert-triage/SKILL.md"}
+          ]
+        }
+      }],
+      "containers": {
+        "agent": {
+          "volume_mounts": [
+            {"name": "agent-payload", "mount_path": "/etc/agent-payload"}
+          ]
+        }
+      }
+    }
+  }' \
+  -- claude
+```
 
 Any explicit driver-config mount under `/sandbox` disables the driver's
 default `/sandbox` workspace PVC injection for that sandbox. Only the explicit
