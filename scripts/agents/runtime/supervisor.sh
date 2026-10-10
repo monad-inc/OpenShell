@@ -182,8 +182,14 @@ print(json.dumps({"status": sys.argv[1], "reason": sys.argv[2], "notes": sys.arg
 }
 
 classify_transient_failure() {
-    local output_file="$1"
-    grep -Eiq 'stream disconnected before completion|failed to connect to websocket|Reconnecting\.\.\.|Broken pipe|Connection to sandbox closed by remote host|peer closed connection without sending TLS close_notify' "$output_file"
+    local cycle_dir="$1"
+    # Harness stderr, plus only the error events of its stdout stream: the
+    # stream also carries every tool result, whose text must not be mistaken
+    # for a transport failure.
+    {
+        cat "$cycle_dir/stderr"
+        grep -E '^\{"type":"(error|turn\.failed)"|^\{"type":"result".*"is_error":true' "$cycle_dir/stdout" || true
+    } | grep -Eiq 'stream disconnected before completion|failed to connect to websocket|Reconnecting\.\.\.|Broken pipe|Connection to sandbox closed by remote host|peer closed connection without sending TLS close_notify'
 }
 
 safe_sleep_seconds() {
@@ -274,18 +280,28 @@ cap_transient_backoff() {
 }
 
 run_cycle() {
-    local output_file="$1"
+    local cycle_dir="$1"
     local heartbeat_pid=""
+    local stderr_tee_pid=""
 
     if [[ "$HEARTBEAT_SECONDS" -gt 0 ]]; then
         active_cycle_heartbeat "$cycle" &
         heartbeat_pid=$!
     fi
 
+    # Keep the harness's stdout and stderr apart all the way to the process's
+    # own stdout and stderr. Stdout is the harness's event stream; merging
+    # stderr into it would interleave diagnostics with (and inside) its lines.
+    # Each stream is also copied into the cycle dir for the result scan below.
+    mkfifo "$cycle_dir/stderr.fifo"
+    tee "$cycle_dir/stderr" < "$cycle_dir/stderr.fifo" >&2 &
+    stderr_tee_pid=$!
+
     set +e
-    bash "$ADAPTER" "$PROMPT_FILE" 2>&1 | tee "$output_file"
+    bash "$ADAPTER" "$PROMPT_FILE" 2> "$cycle_dir/stderr.fifo" | tee "$cycle_dir/stdout"
     local status=${PIPESTATUS[0]}
     set -e
+    wait "$stderr_tee_pid" 2>/dev/null || true
 
     if [[ -n "$heartbeat_pid" ]]; then
         kill "$heartbeat_pid" 2>/dev/null || true
@@ -304,9 +320,10 @@ while true; do
     cycle=$((cycle + 1))
     echo "openshell-agent: starting $RUN_MODE cycle $cycle with harness $OPENSHELL_AGENT_HARNESS" >&2
     persist_state "running"
-    output_file="$(mktemp /tmp/openshell-agent-cycle.XXXXXX)"
+    cycle_dir="$(mktemp -d /tmp/openshell-agent-cycle.XXXXXX)"
+    output_file="$cycle_dir/stdout"
 
-    if run_cycle "$output_file"; then
+    if run_cycle "$cycle_dir"; then
         harness_status=0
     else
         harness_status=$?
@@ -317,19 +334,19 @@ while true; do
 
     if [[ -z "$result_line" ]]; then
         retry_reason="missing OPENSHELL_AGENT_RESULT after harness exit $harness_status"
-        if classify_transient_failure "$output_file"; then
+        if classify_transient_failure "$cycle_dir"; then
             retry_reason="$retry_reason; upstream transport failure detected"
         fi
         diagnostic_json="$(diagnostic_result_json transient_failure missing_agent_result "$retry_reason")"
         persist_state "$([[ "$RUN_MODE" == "once" ]] && printf terminal || printf sleeping)" "$harness_status" "$diagnostic_json"
         if [[ "$RUN_MODE" == "once" ]]; then
-            rm -f "$output_file"
+            rm -rf "$cycle_dir"
             if [[ "$harness_status" -ne 0 ]]; then
                 exit "$harness_status"
             fi
             exit 1
         fi
-        rm -f "$output_file"
+        rm -rf "$cycle_dir"
         retry_watch_cycle "$retry_reason"
         continue
     fi
@@ -337,7 +354,7 @@ while true; do
     if ! valid_result_json "$result_json"; then
         diagnostic_json="$(diagnostic_result_json transient_failure malformed_agent_result "The harness returned malformed result JSON; the supervisor will retry.")"
         persist_state "$([[ "$RUN_MODE" == "once" ]] && printf terminal || printf sleeping)" "$harness_status" "$diagnostic_json"
-        rm -f "$output_file"
+        rm -rf "$cycle_dir"
         if [[ "$RUN_MODE" == "once" ]]; then
             echo "openshell-agent: malformed OPENSHELL_AGENT_RESULT JSON" >&2
             exit 1
@@ -354,7 +371,7 @@ while true; do
     next_poll_seconds="$(safe_sleep_seconds "$next_poll_seconds")"
     [[ -n "$reason" ]] || reason="unspecified"
 
-    rm -f "$output_file"
+    rm -rf "$cycle_dir"
 
     case "$status" in
         complete)

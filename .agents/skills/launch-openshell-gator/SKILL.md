@@ -274,7 +274,7 @@ The launcher streams image-build and provisioning output to the terminal. Import
 - `Built image ...` means the local image build completed.
 - `Created sandbox: <name>` means OpenShell accepted the sandbox.
 - `openshell-agent: starting watch cycle` means the in-sandbox supervisor began a bounded cycle.
-- `OpenAI Codex v...` plus `model: ...` confirms the Codex CLI and model actually used.
+- `openshell-agent: invoking Codex bounded cycle (model=..., reasoning=...)` names the model the adapter requested. The Codex harness runs with `exec --json`, so its own output is one JSON event per line (`thread.started`, `item.*`, `turn.completed`) rather than a human-readable banner; the `OpenAI Codex v...` header no longer appears.
 - `OPENSHELL_AGENT_RESULT {...}` is the bounded-cycle sentinel. In watch mode, the supervisor sleeps and relaunches after this line.
 - `/sandbox/.openshell-agent/status.json` is the atomic current state snapshot. Its `result.notes` field is Gator's plain-language diagnosis and next action for that cycle.
 - `/sandbox/.openshell-agent/history.jsonl` contains the latest 100 supervisor transitions, including active-cycle starts and completed cycle results.
