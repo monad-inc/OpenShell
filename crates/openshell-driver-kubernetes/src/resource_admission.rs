@@ -127,9 +127,18 @@ fn inventory(spec: &Value, private_secret: &str) -> Result<BTreeSet<Reference>, 
                 volume["persistentVolumeClaim"]["claimName"].as_str(),
                 Scope::Workspace,
             ),
+            // ConfigMaps carry caller-selected, workspace-specific content, so
+            // they pass the same workspace approval labels as PVCs.
+            "configMap" => reference(
+                &mut refs,
+                "ConfigMap",
+                volume["configMap"]["name"].as_str(),
+                Scope::Workspace,
+            ),
             "secret" if volume["secret"]["secretName"].as_str() == Some(private_secret) => {}
-            // The typed Kubernetes driver config does not expose Secret or
-            // ConfigMap volumes. The closed-set fallback rejects them instead
+            // The typed Kubernetes driver config does not expose Secret
+            // volumes: credentials reach sandboxes through providers. The
+            // closed-set fallback rejects them and every other source instead
             // of expanding gateway RBAC for attachments callers cannot request.
             _ => return Err(deny()),
         }
@@ -184,6 +193,7 @@ pub async fn admit(
     for reference in inventory(spec, private_secret)? {
         let (group, version, plural, cluster) = match reference.kind {
             "PersistentVolumeClaim" => ("", "v1", "persistentvolumeclaims", false),
+            "ConfigMap" => ("", "v1", "configmaps", false),
             "RuntimeClass" => ("node.k8s.io", "v1", "runtimeclasses", true),
             "PriorityClass" => ("scheduling.k8s.io", "v1", "priorityclasses", true),
             _ => unreachable!("closed resource inventory"),
@@ -469,9 +479,93 @@ mod tests {
                 .any(|r| r.name == "r" && r.scope == Scope::Shared)
         );
     }
+
+    #[test]
+    fn inventories_config_map_volumes_as_workspace_references() {
+        let pod = serde_json::json!({"automountServiceAccountToken":false,
+            "volumes":[{"name":"payload","configMap":{"name":"agent-payload",
+                "items":[{"key":"prompt.md","path":"prompt.md"}]}}]});
+        let refs = inventory(&pod, "private").unwrap();
+        assert_eq!(
+            refs.into_iter().collect::<Vec<_>>(),
+            vec![Reference {
+                kind: "ConfigMap",
+                name: "agent-payload".into(),
+                scope: Scope::Workspace,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn config_map_admission_requires_workspace_labels() {
+        for (labels, allowed) in [
+            (serde_json::json!({}), false),
+            (
+                serde_json::json!({"openshell.ai/sandbox-attachable":"true","openshell.ai/sandbox-attachable-workspace":"other"}),
+                false,
+            ),
+            (
+                serde_json::json!({"openshell.ai/sandbox-attachable":"true","openshell.ai/sandbox-attachable-workspace":"team-a"}),
+                true,
+            ),
+        ] {
+            let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+                assert_eq!(request.method(), http::Method::GET);
+                assert_eq!(
+                    request.uri().path(),
+                    "/api/v1/namespaces/shared/configmaps/agent-payload"
+                );
+                let body = serde_json::json!({"apiVersion":"meta.k8s.io/v1","kind":"PartialObjectMetadata",
+                        "metadata":{"name":"agent-payload","namespace":"shared","uid":"fixture-cm","labels":labels}});
+                async move {
+                    Ok::<_, std::convert::Infallible>(
+                        http::Response::builder()
+                            .header("content-type", "application/json")
+                            .body(kube::client::Body::from(body.to_string().into_bytes()))
+                            .unwrap(),
+                    )
+                }
+            });
+            let client = Client::new(service, "shared");
+            let spec = serde_json::json!({"automountServiceAccountToken":false,
+                "volumes":[{"name":"payload","configMap":{"name":"agent-payload"}}]});
+            let result = admit(
+                &client,
+                &ResourceAdmissionConfig::default(),
+                "team-a",
+                "shared",
+                &spec,
+                "private",
+            )
+            .await;
+            match result {
+                Ok(identities) => {
+                    assert!(allowed, "unlabelled ConfigMap was admitted");
+                    assert_eq!(
+                        identities,
+                        BTreeMap::from([(
+                            "ConfigMap/shared/agent-payload".to_string(),
+                            "fixture-cm".to_string()
+                        )])
+                    );
+                }
+                Err(error) => {
+                    assert!(!allowed, "labelled ConfigMap was denied: {error}");
+                    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+                    assert!(
+                        error
+                            .message()
+                            .starts_with("ConfigMap 'shared/agent-payload'"),
+                        "unexpected error: {error}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn rejects_unsupported_volume_sources_but_allows_gpu() {
-        for kind in ["hostPath", "csi", "projected", "image", "configMap"] {
+        for kind in ["hostPath", "csi", "projected", "image", "nfs"] {
             assert!(inventory(&serde_json::json!({"automountServiceAccountToken":false,"volumes":[{"name":"x",kind:{}}]}), "private").is_err());
         }
         assert!(inventory(&serde_json::json!({"automountServiceAccountToken":false,"volumes":[{"name":"x","secret":{"secretName":"external"}}]}), "private").is_err());

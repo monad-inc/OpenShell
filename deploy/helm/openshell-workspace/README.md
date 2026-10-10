@@ -30,14 +30,14 @@ Keep `sandboxServiceAccount.name` aligned with the gateway chart's
 `openshell-sandbox`. If the gateway enables
 `server.drivers.kubernetes.allowDriverConfig`, also set
 `gateway.allowDriverConfig=true` in every workspace release so caller-selected
-PVCs can be admitted.
+PVCs and ConfigMaps can be admitted.
 
 ## Values
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | fullnameOverride | string | `""` | Override the full generated resource name. |
-| gateway.allowDriverConfig | bool | `false` | Grant PVC metadata reads required when the gateway enables caller driver config. Keep this aligned with server.drivers.kubernetes.allowDriverConfig in the gateway chart. |
+| gateway.allowDriverConfig | bool | `false` | Grant PVC and ConfigMap metadata reads required when the gateway enables caller driver config. Keep this aligned with server.drivers.kubernetes.allowDriverConfig in the gateway chart. |
 | gateway.networkPolicy.podSelector | object | `{"app.kubernetes.io/instance":"openshell","app.kubernetes.io/name":"openshell"}` | Labels selecting gateway pods allowed to reach sandbox SSH. |
 | gateway.serviceAccount.name | string | `"openshell"` | Name of the shared gateway ServiceAccount. |
 | gateway.serviceAccount.namespace | string | `"openshell"` | Namespace containing the shared gateway ServiceAccount. |

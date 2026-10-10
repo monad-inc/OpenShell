@@ -11,9 +11,9 @@ metadata:
     {{- include "openshell-workspace.labels" . | nindent 4 }}
 rules:
   {{- if .Values.gateway.allowDriverConfig }}
-  # Metadata-only admission of caller-selected PVCs requires get permission.
+  # Metadata-only admission of caller-selected PVCs and ConfigMaps requires get permission.
   - apiGroups: [""]
-    resources: ["persistentvolumeclaims"]
+    resources: ["persistentvolumeclaims", "configmaps"]
     verbs: ["get"]
   {{- end }}
   - apiGroups:

@@ -151,8 +151,8 @@ Role is the gateway's only Secret permission grant in that namespace.
 
 If you enable `server.drivers.kubernetes.allowDriverConfig` on the gateway,
 also set `gateway.allowDriverConfig=true` on every workspace release. This
-grants the namespace-scoped PVC metadata read needed to admit caller-selected
-PVC mounts. Leave both values disabled when callers do not need driver config.
+grants the namespace-scoped PVC and ConfigMap metadata reads needed to admit
+caller-selected PVC and ConfigMap mounts. Leave both values disabled when callers do not need driver config.
 
 ### Store provider credentials in Kubernetes Secrets
 
