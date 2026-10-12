@@ -87,7 +87,8 @@ const fn outcome_severity(success: bool) -> SeverityId {
 /// Map the authenticated principal to the OCSF actor user.
 ///
 /// Identity comes from the session, never from request payloads: users carry
-/// their OIDC subject / certificate CN as the stable uid, sandbox principals
+/// their OIDC subject / certificate CN as the stable uid, mTLS operators
+/// appear as admins named `operator:<subject>`, sandbox principals
 /// appear under their sandbox id, gateway peers under their replica id, and
 /// anonymous callers are named as such so a permissive dev gateway still
 /// produces an honest trail. Sandbox and peer principals use `Other`: OCSF
@@ -102,6 +103,15 @@ pub fn actor_user(principal: &Principal) -> User {
                 .clone()
                 .unwrap_or_else(|| subject.clone());
             User::new(name, subject, UserTypeId::User)
+        }
+        Principal::Operator(operator) => {
+            let subject = operator.identity.subject.clone();
+            let name = operator
+                .identity
+                .display_name
+                .clone()
+                .unwrap_or_else(|| subject.clone());
+            User::new(format!("operator:{name}"), subject, UserTypeId::Admin)
         }
         Principal::Sandbox(sandbox) => User::new(
             format!("sandbox:{}", sandbox.sandbox_id),
