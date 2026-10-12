@@ -3,17 +3,16 @@
 
 // Public API surface for @nvidia/openshell-sdk.
 //
-// OidcRefresher (single-flight OIDC refresh) is intentionally not yet exported.
-// It is the one piece of genuinely shared, cross-language behavior; it will be
-// added alongside a conformance suite that pins it byte-identical across the
-// TypeScript, Python, and Go SDKs.
-
 export type {
   ConnectOptions,
+  DeleteOptions,
+  DeletionOutcome,
+  DeletionResult,
   EffectiveSettingView,
   ExecExitEvent,
   ExecInteractiveOptions,
   ExecInteractiveSession,
+  ExecInteractiveSessionControl,
   ExecOptions,
   ExecResult,
   ExecStreamChunk,
@@ -23,22 +22,48 @@ export type {
   Health,
   HealthStatus,
   ListOptions,
+  Page,
   PolicySourceName,
   ProviderChange,
   ProviderChangeOptions,
   ProviderRef,
   SandboxConfig,
+  SandboxFromTemplateSpec,
   SandboxPhaseName,
   SandboxPolicy,
   SandboxRef,
+  SandboxResources,
+  SandboxRestartPolicyName,
+  SandboxServiceLevel,
   SandboxSpec,
+  SandboxStartup,
+  SandboxTemplateListOptions,
+  SandboxTemplateWorkspaceOptions,
+  SandboxWorkloadConfig,
+  SandboxWorkloadTemplate,
+  SandboxWorkloadTemplateProvenance,
+  SandboxWorkloadTemplateSpec,
+  ServiceExposure,
   SetPolicyOptions,
   SettingScopeName,
   SettingValue,
   SshSession,
   UpdateConfigResult,
+  WaitDeletedOptions,
   WaitOptions,
+  WorkspaceListScope,
 } from './client.js';
-export { errorCode, OpenShellClient, SandboxClient } from './client.js';
-export type { SdkErrorCode } from './errors.js';
-export { SdkError } from './errors.js';
+export {
+  errorCode,
+  OpenShellClient,
+  Pager,
+  SandboxClient,
+  SandboxTemplateClient,
+  ServiceAuthorizationMode,
+} from './client.js';
+export type { ErrorInfo, FieldViolation, SdkErrorCode } from './errors.js';
+export { fromConnect, SdkError } from './errors.js';
+export type { ClientCredentialsOptions, OidcTokenProvider } from './oidc.js';
+export { clientCredentials } from './oidc.js';
+export type { ProviderCredentialsOptions, ProviderCredentialValue } from './providers.js';
+export { ProviderClient } from './providers.js';

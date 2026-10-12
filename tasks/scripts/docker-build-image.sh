@@ -43,8 +43,11 @@ required_prebuilt_binaries() {
 		gateway)
 			echo "openshell-gateway"
 			;;
-		supervisor|supervisor-sideload|supervisor-output)
+		sandbox)
 			echo "openshell-sandbox"
+			;;
+		supervisor|supervisor-sideload|supervisor-output)
+			echo "openshell-supervisor"
 			;;
 	esac
 }
@@ -92,7 +95,7 @@ ensure_prebuilt_binaries() {
 	fi
 }
 
-TARGET=${1:?"Usage: docker-build-image.sh <gateway|supervisor|supervisor-output> [extra-args...]"}
+TARGET=${1:?"Usage: docker-build-image.sh <gateway|sandbox|supervisor|supervisor-output> [extra-args...]"}
 shift
 
 IS_FINAL_IMAGE=0
@@ -105,6 +108,12 @@ case "${TARGET}" in
     IMAGE_NAME="openshell/gateway"
     DOCKER_TARGET="gateway"
     DOCKERFILE="deploy/docker/Dockerfile.gateway"
+    ;;
+  sandbox)
+    IS_FINAL_IMAGE=1
+    IMAGE_NAME="openshell/sandbox"
+    DOCKER_TARGET="sandbox"
+    DOCKERFILE="deploy/docker/Dockerfile.sandbox"
     ;;
   supervisor)
     IS_FINAL_IMAGE=1
@@ -168,14 +177,19 @@ if [[ "${IS_FINAL_IMAGE}" == "1" ]]; then
 	TAG_ARGS=(-t "${IMAGE_NAME}:${IMAGE_TAG}")
 fi
 
+ATTESTATION_ARGS=(--provenance=false)
 OUTPUT_ARGS=()
 if [[ -n "${DOCKER_OUTPUT:-}" ]]; then
 	OUTPUT_ARGS=(--output "${DOCKER_OUTPUT}")
 elif [[ "${IS_FINAL_IMAGE}" == "1" ]]; then
-	if [[ "${DOCKER_PUSH:-}" == "1" ]]; then
-		OUTPUT_ARGS=(--push)
-	elif [[ "${DOCKER_PLATFORM:-}" == *","* ]]; then
-		OUTPUT_ARGS=(--push)
+	if [[ "${DOCKER_PUSH:-}" == "1" || "${DOCKER_PLATFORM:-}" == *","* ]]; then
+		if ce_is_docker; then
+			# Attestations require a registry-backed image index.
+			ATTESTATION_ARGS=(--provenance=mode=min --attest type=sbom)
+			OUTPUT_ARGS=(--output "type=image,push=true,oci-mediatypes=true,oci-artifact=true")
+		else
+			OUTPUT_ARGS=(--push)
+		fi
 	else
 		OUTPUT_ARGS=(--load)
 	fi
@@ -191,7 +205,7 @@ ce_build \
 	-f "${DOCKERFILE}" \
 	--target "${DOCKER_TARGET}" \
 	${TAG_ARGS[@]+"${TAG_ARGS[@]}"} \
-	--provenance=false \
+	${ATTESTATION_ARGS[@]+"${ATTESTATION_ARGS[@]}"} \
 	"$@" \
 	${OUTPUT_ARGS[@]+"${OUTPUT_ARGS[@]}"} \
 	.

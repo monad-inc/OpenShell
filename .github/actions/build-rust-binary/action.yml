@@ -1,0 +1,89 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Build Rust Binary
+description: Build, verify, package, and upload an auditable Rust binary
+
+inputs:
+  package:
+    description: Cargo package that owns the binary
+    required: true
+  binary:
+    description: Cargo binary name
+    required: true
+  triple:
+    description: Rust target triple
+    required: true
+  cargo-version:
+    description: Cargo package version embedded in the binary
+    required: true
+  supervisor-image-tag:
+    description: Default supervisor image tag embedded in the binary
+    required: false
+    default: ""
+  artifact-name:
+    description: GitHub artifact name
+    required: false
+    default: ""
+  extra-cargo-flags:
+    description: Additional flags passed to cargo build
+    required: false
+    default: ""
+  entitlements-file:
+    description: Path to an entitlements plist for macOS ad-hoc codesigning (skipped when empty or not on macOS)
+    required: false
+    default: ""
+runs:
+  using: composite
+  steps:
+    - uses: ./.github/actions/setup-rust
+      with:
+        cache-key: binaries-v2-${{ inputs.binary }}-${{ inputs.triple }}
+        save-cache: "true"
+
+    - name: Set version
+      shell: nix develop -c bash -euo pipefail {0}
+      env:
+        INPUTS_CARGO_VERSION: ${{ inputs.cargo-version }}
+      run: sed -i "s/^version = \"0\\.0\\.0\"$/version = \"${INPUTS_CARGO_VERSION}\"/" Cargo.toml
+
+    - name: Build ${{ inputs.binary }}
+      shell: nix develop -c bash -euo pipefail {0}
+      env:
+        GIT_DIR: /nonexistent
+        OPENSHELL_IMAGE_TAG: ${{ inputs.supervisor-image-tag }}
+        INPUTS_PACKAGE: ${{ inputs.package }}
+        INPUTS_BINARY: ${{ inputs.binary }}
+        INPUTS_TRIPLE: ${{ inputs.triple }}
+        INPUTS_EXTRA_CARGO_FLAGS: ${{ inputs.extra-cargo-flags }}
+      run: cargo auditable build --release --target "${INPUTS_TRIPLE}" --package "${INPUTS_PACKAGE}" --bin "${INPUTS_BINARY}" ${INPUTS_EXTRA_CARGO_FLAGS}
+
+    - name: Verify ${{ inputs.binary }}
+      shell: nix develop -c bash -euo pipefail {0}
+      env:
+        INPUTS_BINARY: ${{ inputs.binary }}
+        INPUTS_TRIPLE: ${{ inputs.triple }}
+      run: |
+        binary="target/${INPUTS_TRIPLE}/release/${INPUTS_BINARY}"
+        # Confirm the binary runs and reports the expected name.
+        "$binary" --version | grep -q "^${INPUTS_BINARY} "
+        # Confirm Syft can decode the embedded cargo-auditable metadata.
+        SYFT_CHECK_FOR_APP_UPDATE=false syft "file:${binary}" -o cyclonedx-json | grep 'pkg:cargo/' > /dev/null
+
+    - name: Codesign with entitlements
+      if: inputs.entitlements-file != '' && runner.os == 'macOS'
+      shell: bash
+      env:
+        INPUTS_ENTITLEMENTS: ${{ inputs.entitlements-file }}
+        INPUTS_TRIPLE: ${{ inputs.triple }}
+        INPUTS_BINARY: ${{ inputs.binary }}
+      run: /usr/bin/codesign --entitlements "${INPUTS_ENTITLEMENTS}" --force -s - "target/${INPUTS_TRIPLE}/release/${INPUTS_BINARY}"
+
+    - name: Upload ${{ inputs.binary }}
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      with:
+        name: ${{ inputs.artifact-name || format('{0}-{1}', inputs.binary, inputs.triple) }}
+        path: target/${{ inputs.triple }}/release/${{ inputs.binary }}
+        compression-level: 0
+        retention-days: 5
+        if-no-files-found: error

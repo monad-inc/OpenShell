@@ -24,10 +24,20 @@
 //! upstream proxy or disable proxying with `NO_PROXY=*`.
 //!
 //! Scope and invariants:
-//! - Only `http://` proxy URLs are supported. Configuration is fail-closed:
-//!   any present-but-invalid driver-supplied setting — an empty argument
-//!   value, an unsupported (`https://`, SOCKS) or malformed proxy URL, an
-//!   unreadable auth file, a malformed credential, or an auth file without the explicit
+//! - `http://` and `https://` proxy URLs are supported; SOCKS proxies are
+//!   rejected. For an `https://` proxy the supervisor opens a TLS connection
+//!   to the proxy first and runs the CONNECT handshake inside it, verifying
+//!   the proxy certificate against the built-in Mozilla roots, the system CA
+//!   bundle, and an optional operator corporate CA bundle
+//!   (`--upstream-proxy-ca-bundle`). That same corporate CA is also folded
+//!   into the sandbox trust bundle and the L7 upstream verification store at
+//!   startup (see `run.rs`): a TLS-intercepting corporate proxy re-signs
+//!   tunneled server certificates with its CA, so trusting it only for the
+//!   proxy-listener handshake would make every intercepted upstream handshake
+//!   fail. Configuration is fail-closed: any present-but-invalid
+//!   driver-supplied setting — an empty argument value, an unsupported
+//!   (SOCKS) or malformed proxy URL, an unreadable auth file or CA bundle, a
+//!   malformed credential, or an auth file without the explicit
 //!   cleartext-credential acknowledgement — is a fatal startup error rather
 //!   than being silently ignored, so a typo can never quietly downgrade the
 //!   operator's egress boundary to direct dialing or unauthenticated proxy
@@ -48,13 +58,17 @@
 use std::io::{Error as IoError, ErrorKind};
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use base64::Engine as _;
 use openshell_core::net::set_tcp_nodelay_best_effort;
+use rustls::ClientConfig;
+use rustls::pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
+use tokio_rustls::TlsConnector;
 use tracing::debug;
 
 /// Upper bound on the corporate proxy's CONNECT response header block.
@@ -69,9 +83,17 @@ const CONNECT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct ProxyEndpoint {
     host: String,
     port: u16,
+    /// Optional driver-pinned address used only for the TCP dial. The
+    /// configured host remains authoritative for TLS identity and logging.
+    dial_ip: Option<IpAddr>,
     /// Pre-computed `Basic <base64>` header value from the proxy auth file.
     /// Never logged.
     proxy_authorization: Option<String>,
+    /// TLS client config for an `https://` proxy; `None` for a plain `http://`
+    /// proxy. When set, the connection to the proxy is wrapped in TLS (the
+    /// proxy certificate verified against these roots) before the CONNECT
+    /// handshake.
+    tls: Option<Arc<ClientConfig>>,
 }
 
 impl ProxyEndpoint {
@@ -87,7 +109,9 @@ impl std::fmt::Debug for ProxyEndpoint {
         f.debug_struct("ProxyEndpoint")
             .field("host", &self.host)
             .field("port", &self.port)
+            .field("dial_ip", &self.dial_ip)
             .field("proxy_authorization", &self.proxy_authorization.is_some())
+            .field("tls", &self.tls.is_some())
             .finish()
     }
 }
@@ -311,8 +335,12 @@ pub struct UpstreamProxyConfig {
 /// / `false` genuinely means "not configured by the operator".
 #[derive(Debug, Clone, Default)]
 pub struct UpstreamProxyArgs {
-    /// `http://host:port` corporate proxy URL, or `None` for direct egress.
+    /// `http://host:port` or `https://host:port` corporate proxy URL, or
+    /// `None` for direct egress.
     pub https_proxy: Option<String>,
+    /// Optional compute-driver-selected IP for reaching the proxy from the
+    /// supervisor's network namespace without changing its TLS identity.
+    pub proxy_dial_ip: Option<IpAddr>,
     /// Comma-separated `NO_PROXY` list.
     pub no_proxy: Option<String>,
     /// Path to the root-only credential mount (`user:pass`).
@@ -322,15 +350,23 @@ pub struct UpstreamProxyArgs {
     pub proxy_auth_allow_insecure: bool,
     /// Send the destination hostname in CONNECT instead of a validated IP.
     pub proxy_connect_by_hostname: bool,
+    /// Path to a PEM bundle of extra CAs trusted for the corporate proxy: the
+    /// TLS handshake with an `https://` proxy and, because TLS-intercepting
+    /// proxies re-sign tunneled server certificates with the same CA, the
+    /// sandbox trust bundle and upstream verification too (folded in by
+    /// `run.rs`).
+    pub proxy_ca_bundle: Option<String>,
 }
 
 // Supervisor CLI flag names for the corporate-proxy settings, used as the
 // dispatch keys in `from_lookup` and in operator-facing error messages.
 const ARG_HTTPS_PROXY: &str = "--upstream-proxy";
+const ARG_PROXY_DIAL_IP: &str = "--upstream-proxy-dial-ip";
 const ARG_NO_PROXY: &str = "--upstream-no-proxy";
 const ARG_PROXY_AUTH_FILE: &str = "--upstream-proxy-auth-file";
 const ARG_PROXY_AUTH_ALLOW_INSECURE: &str = "--upstream-proxy-auth-allow-insecure";
 const ARG_PROXY_CONNECT_BY_HOSTNAME: &str = "--upstream-proxy-connect-by-hostname";
+pub(crate) const ARG_PROXY_CA_BUNDLE: &str = "--upstream-proxy-ca-bundle";
 
 impl UpstreamProxyConfig {
     /// Build the corporate proxy configuration from the driver-supplied
@@ -363,6 +399,8 @@ impl UpstreamProxyConfig {
         Self::from_lookup(|name| {
             if name == ARG_HTTPS_PROXY {
                 args.https_proxy.clone()
+            } else if name == ARG_PROXY_DIAL_IP {
+                args.proxy_dial_ip.map(|ip| ip.to_string())
             } else if name == ARG_NO_PROXY {
                 args.no_proxy.clone()
             } else if name == ARG_PROXY_AUTH_FILE {
@@ -371,6 +409,8 @@ impl UpstreamProxyConfig {
                 args.proxy_auth_allow_insecure.then(|| "true".to_string())
             } else if name == ARG_PROXY_CONNECT_BY_HOSTNAME {
                 args.proxy_connect_by_hostname.then(|| "true".to_string())
+            } else if name == ARG_PROXY_CA_BUNDLE {
+                args.proxy_ca_bundle.clone()
             } else {
                 None
             }
@@ -394,19 +434,28 @@ impl UpstreamProxyConfig {
         let https = var(ARG_HTTPS_PROXY)?
             .map(|url| parse_proxy_url(&url, ARG_HTTPS_PROXY))
             .transpose()?;
+        let proxy_dial_ip = var(ARG_PROXY_DIAL_IP)?
+            .map(|raw| {
+                raw.parse::<IpAddr>()
+                    .map_err(|error| format!("{ARG_PROXY_DIAL_IP} is invalid: {error}"))
+            })
+            .transpose()?;
         let auth_file = var(ARG_PROXY_AUTH_FILE)?;
         let auth_allow_insecure = var(ARG_PROXY_AUTH_ALLOW_INSECURE)?;
         let connect_by_hostname_raw = var(ARG_PROXY_CONNECT_BY_HOSTNAME)?;
         let no_proxy_list = var(ARG_NO_PROXY)?;
-        let Some(mut https) = https else {
+        let ca_bundle = var(ARG_PROXY_CA_BUNDLE)?;
+        let Some((mut https, secure)) = https else {
             // Auxiliary proxy settings without a proxy mean the operator
             // believed a proxy boundary was in effect; refuse rather than
             // silently running with direct egress.
             for (name, value) in [
                 (ARG_PROXY_AUTH_FILE, &auth_file),
+                (ARG_PROXY_DIAL_IP, &proxy_dial_ip.map(|ip| ip.to_string())),
                 (ARG_PROXY_AUTH_ALLOW_INSECURE, &auth_allow_insecure),
                 (ARG_PROXY_CONNECT_BY_HOSTNAME, &connect_by_hostname_raw),
                 (ARG_NO_PROXY, &no_proxy_list),
+                (ARG_PROXY_CA_BUNDLE, &ca_bundle),
             ] {
                 if value.is_some() {
                     return Err(format!("{name} is set but no upstream proxy is configured"));
@@ -414,6 +463,7 @@ impl UpstreamProxyConfig {
             }
             return Ok(None);
         };
+        https.dial_ip = proxy_dial_ip;
 
         // CONNECT-target mode. The default binds the tunnel to a validated
         // address; hostname CONNECT re-opens proxy-side DNS resolution and
@@ -429,11 +479,10 @@ impl UpstreamProxyConfig {
         };
 
         // Cleartext-credential acknowledgement. `Proxy-Authorization: Basic`
-        // travels over plain TCP to the http:// proxy, so credentials are
-        // only sent when the operator explicitly opted in. The compute driver
-        // enforces the same pairing at sandbox-create time; enforcing it here
-        // as well keeps the supervisor fail-closed against a bypassed or
-        // foreign driver.
+        // travels over plain TCP to an http:// proxy, so credentials are
+        // only sent when the operator explicitly opted in. For an https://
+        // proxy the credential is inside the verified TLS session, so the
+        // acknowledgement is unnecessary (but tolerated).
         let allow_insecure = match auth_allow_insecure.as_deref().map(str::trim) {
             None => false,
             Some("true") => true,
@@ -448,7 +497,7 @@ impl UpstreamProxyConfig {
                 "{ARG_PROXY_AUTH_ALLOW_INSECURE} is set but no {ARG_PROXY_AUTH_FILE} is configured"
             ));
         }
-        if auth_file.is_some() && !allow_insecure {
+        if auth_file.is_some() && !allow_insecure && !secure {
             return Err(format!(
                 "{ARG_PROXY_AUTH_FILE} sends the credential as cleartext Basic auth \
                  over the plain-TCP proxy connection; refusing without \
@@ -466,6 +515,25 @@ impl UpstreamProxyConfig {
                 format!("invalid credential in upstream proxy auth file '{path}': {err}")
             })?;
             https.proxy_authorization = Some(header);
+        }
+
+        // Wrap the proxy connection in TLS for an `https://` proxy. The
+        // corporate CA bundle (also folded into the sandbox trust bundle by
+        // `run.rs`) is trusted alongside the built-in and system roots; a bare
+        // `https://` proxy with no bundle verifies against those roots only.
+        if secure {
+            let corporate_pem = ca_bundle
+                .as_deref()
+                .map(|path| read_proxy_ca_bundle(path, ARG_PROXY_CA_BUNDLE))
+                .transpose()?;
+            https.tls = Some(build_proxy_tls_config(corporate_pem.as_deref()));
+        } else if let Some(path) = ca_bundle.as_deref() {
+            // An `http://` proxy is dialed in plaintext, so the CA bundle is
+            // not used for the proxy connection itself. It is still validated
+            // fail-closed here (and folded into the sandbox trust bundle by
+            // `run.rs`) for the TLS-intercepting-proxy case, where a proxy
+            // reached over plain HTTP re-signs tunneled upstream certificates.
+            read_proxy_ca_bundle(path, ARG_PROXY_CA_BUNDLE)?;
         }
 
         Ok(Some(Self {
@@ -518,9 +586,13 @@ impl UpstreamProxyConfig {
     }
 }
 
-/// Parse an `http://host:port` proxy URL with the same validation rules the
-/// compute driver applies at sandbox-create time
+/// Parse an `http://host:port` or `https://host:port` proxy URL with the same
+/// validation rules the compute driver applies at sandbox-create time
 /// ([`parse_upstream_proxy_url`](openshell_core::driver_utils::parse_upstream_proxy_url)).
+///
+/// Returns the endpoint (with `tls` still unset — the caller attaches the
+/// shared TLS config afterward) and whether the URL used the `https://`
+/// scheme, so the caller knows to wrap the proxy connection in TLS.
 ///
 /// Credentials are never taken from the URL: they are delivered out of band
 /// through the root-only auth-file mount (`--upstream-proxy-auth-file`) so
@@ -528,17 +600,62 @@ impl UpstreamProxyConfig {
 ///
 /// # Errors
 ///
-/// Rejects unsupported schemes (TLS or SOCKS proxies), inline `user:pass@`
+/// Rejects unsupported schemes (SOCKS proxies), inline `user:pass@`
 /// credentials, and malformed addresses. The error names `var_name` so the
 /// operator can locate the offending setting.
-fn parse_proxy_url(raw: &str, var_name: &str) -> Result<ProxyEndpoint, String> {
+fn parse_proxy_url(raw: &str, var_name: &str) -> Result<(ProxyEndpoint, bool), String> {
     let addr = openshell_core::driver_utils::parse_upstream_proxy_url(raw)
         .map_err(|err| format!("{var_name} is invalid: {err}"))?;
-    Ok(ProxyEndpoint {
-        host: addr.host,
-        port: addr.port,
-        proxy_authorization: None,
-    })
+    Ok((
+        ProxyEndpoint {
+            host: addr.host,
+            port: addr.port,
+            dial_ip: None,
+            proxy_authorization: None,
+            tls: None,
+        },
+        addr.secure,
+    ))
+}
+
+/// Read and validate the operator corporate proxy CA bundle PEM at `path`.
+///
+/// A TLS-intercepting corporate proxy signs both its own listener certificate
+/// and the re-signed certificates of tunneled destinations with this CA, so
+/// the bundle is trusted for proxy-listener TLS (`https://` proxy URLs), for
+/// upstream re-encryption verification, and by sandbox workload processes.
+///
+/// Fail-closed to match the rest of the operator-owned proxy configuration:
+/// the operator explicitly pointed at this file, so an unreadable file or one
+/// with no usable certificate is a fatal startup error rather than a silent
+/// fall-back to the built-in roots that would quietly weaken the trust
+/// boundary. The error names `var_name` so the operator can locate the setting.
+pub(crate) fn read_proxy_ca_bundle(path: &str, var_name: &str) -> Result<String, String> {
+    // Shared with the compute driver, which validates the same file on the
+    // gateway host before staging it, so host acceptance and guest acceptance
+    // cannot diverge. It also bounds the read: the file arrives from the
+    // driver, but a bundle the size of the sandbox disk should fail rather
+    // than be loaded whole.
+    openshell_core::driver_utils::read_upstream_proxy_ca_bundle_file(path, var_name)
+}
+
+/// Build the TLS client config used to connect to an `https://` corporate
+/// proxy and to verify re-signed upstream certificates: built-in Mozilla
+/// roots + the system CA bundle + the optional corporate CA bundle PEM.
+///
+/// Reuses [`build_upstream_client_config`](crate::l7::tls::build_upstream_client_config),
+/// which already folds the built-in and passed-in roots, so the proxy-listener
+/// trust store matches the L7 upstream store exactly.
+fn build_proxy_tls_config(corporate_ca_pem: Option<&str>) -> Arc<ClientConfig> {
+    let mut bundle = crate::l7::tls::read_system_ca_bundle();
+    if let Some(pem) = corporate_ca_pem {
+        if !bundle.is_empty() && !bundle.ends_with('\n') {
+            bundle.push('\n');
+        }
+        bundle.push_str(pem);
+    }
+    crate::l7::tls::build_upstream_client_config(&bundle)
+        .expect("corporate proxy TLS config must be valid")
 }
 
 /// Build a `Proxy-Authorization: Basic <base64>` header value from a raw
@@ -565,7 +682,78 @@ fn basic_auth_header(credential: &str) -> Result<String, String> {
     ))
 }
 
-/// A `TcpStream` that first replays bytes already read from the socket.
+/// The connection to the corporate proxy (or a direct dial): either plain
+/// TCP or, for an `https://` proxy, a TLS session wrapping the TCP socket.
+///
+/// Direct dials and `http://` proxy tunnels are `Plain`; only the transport
+/// to the proxy differs, so both variants behave as transparent byte pipes
+/// once the CONNECT handshake completes.
+#[derive(Debug)]
+enum UpstreamStream {
+    Plain(TcpStream),
+    Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
+}
+
+impl AsyncRead for UpstreamStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_read(cx, buf),
+            Self::Tls(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for UpstreamStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_write(cx, buf),
+            Self::Tls(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_write_vectored(cx, bufs),
+            Self::Tls(s) => Pin::new(s.as_mut()).poll_write_vectored(cx, bufs),
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        match self {
+            Self::Plain(s) => s.is_write_vectored(),
+            Self::Tls(s) => s.is_write_vectored(),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_flush(cx),
+            Self::Tls(s) => Pin::new(s.as_mut()).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_shutdown(cx),
+            Self::Tls(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
+        }
+    }
+}
+
+/// An upstream connection that first replays bytes already read from the
+/// socket.
 ///
 /// The CONNECT handshake reads from the proxy socket in chunks, so the read
 /// that completes the response header block may also contain the first
@@ -576,7 +764,7 @@ fn basic_auth_header(credential: &str) -> Result<String, String> {
 /// straight through.
 #[derive(Debug)]
 pub struct PrefixedStream {
-    inner: TcpStream,
+    inner: UpstreamStream,
     /// Bytes read past the CONNECT header terminator, replayed first.
     prefix: Vec<u8>,
     /// Read offset into `prefix`.
@@ -587,21 +775,28 @@ pub struct PrefixedStream {
 }
 
 impl PrefixedStream {
-    /// Wrap `inner`, replaying `prefix` before socket reads.
+    /// Wrap a directly dialed or `http://`-tunneled `TcpStream`, replaying
+    /// `prefix` before socket reads.
     #[must_use]
     pub fn new(inner: TcpStream, prefix: Vec<u8>) -> Self {
-        Self {
-            inner,
-            prefix,
-            pos: 0,
-            connect_target: None,
-        }
+        Self::over(UpstreamStream::Plain(inner), prefix)
     }
 
     /// Wrap a directly dialed stream with nothing to replay.
     #[must_use]
     pub fn without_prefix(inner: TcpStream) -> Self {
         Self::new(inner, Vec::new())
+    }
+
+    /// Wrap an already-established upstream connection (plain or TLS-wrapped
+    /// proxy), replaying `prefix` before further reads.
+    fn over(inner: UpstreamStream, prefix: Vec<u8>) -> Self {
+        Self {
+            inner,
+            prefix,
+            pos: 0,
+            connect_target: None,
+        }
     }
 
     fn with_connect_target(mut self, target: ConnectTarget) -> Self {
@@ -612,7 +807,10 @@ impl PrefixedStream {
     /// Return the connected socket peer. For a proxied tunnel this is the
     /// corporate proxy, not the ultimate destination.
     pub fn peer_addr(&self) -> std::io::Result<SocketAddr> {
-        self.inner.peer_addr()
+        match &self.inner {
+            UpstreamStream::Plain(s) => s.peer_addr(),
+            UpstreamStream::Tls(s) => s.get_ref().0.peer_addr(),
+        }
     }
 
     /// Return the HTTP CONNECT target for a proxied tunnel. An IP target is
@@ -821,8 +1019,38 @@ async fn connect_via_inner(
     port: u16,
     target: ConnectTarget,
 ) -> std::io::Result<PrefixedStream> {
-    let mut stream = TcpStream::connect((endpoint.host.as_str(), endpoint.port)).await?;
-    set_tcp_nodelay_best_effort(&stream);
+    let tcp = match endpoint.dial_ip {
+        Some(ip) => TcpStream::connect(SocketAddr::new(ip, endpoint.port)).await?,
+        None => TcpStream::connect((endpoint.host.as_str(), endpoint.port)).await?,
+    };
+    set_tcp_nodelay_best_effort(&tcp);
+    // For an `https://` proxy, wrap the connection in TLS (verifying the proxy
+    // certificate against the configured roots) before the CONNECT handshake.
+    let mut stream = match &endpoint.tls {
+        Some(config) => {
+            let server_name = ServerName::try_from(endpoint.host.clone()).map_err(|err| {
+                IoError::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "upstream proxy host '{}' is not a valid TLS server name: {err}",
+                        endpoint.host
+                    ),
+                )
+            })?;
+            let connector = TlsConnector::from(Arc::clone(config));
+            let tls = connector.connect(server_name, tcp).await.map_err(|err| {
+                IoError::new(
+                    err.kind(),
+                    format!(
+                        "TLS handshake with upstream proxy {} failed: {err}",
+                        endpoint.display_addr()
+                    ),
+                )
+            })?;
+            UpstreamStream::Tls(Box::new(tls))
+        }
+        None => UpstreamStream::Plain(tcp),
+    };
 
     let connect_target = target;
     let target = match connect_target {
@@ -883,7 +1111,7 @@ async fn connect_via_inner(
             );
             buf.truncate(used);
             let overflow = buf.split_off(header_end);
-            Ok(PrefixedStream::new(stream, overflow).with_connect_target(connect_target))
+            Ok(PrefixedStream::over(stream, overflow).with_connect_target(connect_target))
         }
         Some(code) => Err(IoError::other(format!(
             "upstream proxy {} refused CONNECT to {target}: HTTP {code}",
@@ -905,8 +1133,9 @@ mod tests {
     use super::{
         ARG_HTTPS_PROXY as HTTPS_PROXY, ARG_NO_PROXY as NO_PROXY,
         ARG_PROXY_AUTH_ALLOW_INSECURE as PROXY_AUTH_ALLOW_INSECURE,
-        ARG_PROXY_AUTH_FILE as PROXY_AUTH_FILE,
+        ARG_PROXY_AUTH_FILE as PROXY_AUTH_FILE, ARG_PROXY_CA_BUNDLE as PROXY_CA_BUNDLE,
         ARG_PROXY_CONNECT_BY_HOSTNAME as PROXY_CONNECT_BY_HOSTNAME,
+        ARG_PROXY_DIAL_IP as PROXY_DIAL_IP,
     };
 
     fn config_from(pairs: &[(&str, &str)]) -> Result<Option<UpstreamProxyConfig>, String> {
@@ -1045,12 +1274,110 @@ mod tests {
     // to direct dialing or unauthenticated proxy access.
 
     #[test]
-    fn tls_and_socks_proxies_are_fatal() {
-        for url in ["https://proxy:443", "socks5://proxy:1080"] {
+    fn socks_proxies_are_fatal() {
+        // http:// and https:// are supported; other schemes are fatal rather
+        // than silently ignored.
+        for url in ["socks5://proxy:1080", "ftp://proxy:21"] {
             let err = config_from(&[(HTTPS_PROXY, url)]).unwrap_err();
             assert!(err.contains(HTTPS_PROXY), "{err}");
             assert!(err.contains("scheme"), "{err}");
         }
+    }
+
+    #[test]
+    fn https_proxy_scheme_enables_tls_and_requires_explicit_port() {
+        // An explicit port is required (no scheme-default fallback), matching
+        // the http:// grammar.
+        let err = config_from(&[(HTTPS_PROXY, "https://proxy.corp.com")]).unwrap_err();
+        assert!(err.contains("explicit"), "{err}");
+
+        let cfg = config_ok(&[(HTTPS_PROXY, "https://proxy.corp.com:3130")]);
+        assert!(
+            cfg.https.tls.is_some(),
+            "https:// proxy dials the proxy over TLS"
+        );
+        assert_eq!(cfg.https.display_addr(), "proxy.corp.com:3130");
+    }
+
+    #[test]
+    fn http_proxy_scheme_stays_plaintext() {
+        let cfg = config_ok(&[(HTTPS_PROXY, "http://proxy.corp.com:8080")]);
+        assert!(
+            cfg.https.tls.is_none(),
+            "http:// proxy is dialed without TLS"
+        );
+    }
+
+    #[test]
+    fn ca_bundle_without_a_proxy_is_fatal() {
+        let err = config_from(&[(PROXY_CA_BUNDLE, "/etc/openshell/tls/proxy/ca-bundle.pem")])
+            .unwrap_err();
+        assert!(err.contains(PROXY_CA_BUNDLE), "{err}");
+        assert!(err.contains("no upstream proxy"), "{err}");
+    }
+
+    #[test]
+    fn empty_ca_bundle_value_is_fatal() {
+        let err = config_from(&[
+            (HTTPS_PROXY, "https://proxy.corp.com:3130"),
+            (PROXY_CA_BUNDLE, "  "),
+        ])
+        .unwrap_err();
+        assert!(err.contains(PROXY_CA_BUNDLE), "{err}");
+        assert!(err.contains("empty"), "{err}");
+    }
+
+    #[test]
+    fn unreadable_ca_bundle_is_fatal_for_https_proxy() {
+        let err = config_from(&[
+            (HTTPS_PROXY, "https://proxy.corp.com:3130"),
+            (PROXY_CA_BUNDLE, "/nonexistent/proxy-ca.pem"),
+        ])
+        .unwrap_err();
+        assert!(err.contains(PROXY_CA_BUNDLE), "{err}");
+        assert!(err.contains("could not be read"), "{err}");
+    }
+
+    #[test]
+    fn unreadable_ca_bundle_is_fatal_for_http_proxy_too() {
+        // A CA bundle with an http:// proxy still describes the intercepting
+        // proxy's re-sign CA and must be validated fail-closed.
+        let err = config_from(&[
+            (HTTPS_PROXY, "http://proxy.corp.com:8080"),
+            (PROXY_CA_BUNDLE, "/nonexistent/proxy-ca.pem"),
+        ])
+        .unwrap_err();
+        assert!(err.contains(PROXY_CA_BUNDLE), "{err}");
+    }
+
+    #[test]
+    fn ca_bundle_with_no_certificates_is_fatal() {
+        let bundle = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(bundle.path(), "not a certificate\n").unwrap();
+        let path = bundle.path().to_string_lossy().into_owned();
+        let err = config_from(&[
+            (HTTPS_PROXY, "https://proxy.corp.com:3130"),
+            (PROXY_CA_BUNDLE, path.as_str()),
+        ])
+        .unwrap_err();
+        assert!(err.contains("no PEM certificate blocks"), "{err}");
+    }
+
+    #[test]
+    fn ca_bundle_with_invalid_der_certificates_is_fatal() {
+        let bundle = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            bundle.path(),
+            "-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        let path = bundle.path().to_string_lossy().into_owned();
+        let err = config_from(&[
+            (HTTPS_PROXY, "https://proxy.corp.com:3130"),
+            (PROXY_CA_BUNDLE, path.as_str()),
+        ])
+        .unwrap_err();
+        assert!(err.contains("no usable trust anchors"), "{err}");
     }
 
     #[test]
@@ -1110,7 +1437,7 @@ mod tests {
     }
 
     #[test]
-    fn auth_file_without_insecure_acknowledgement_is_fatal() {
+    fn auth_file_without_insecure_acknowledgement_is_fatal_for_http_proxy() {
         // Basic auth over the plain-TCP proxy connection is readable on the
         // network path; sending it requires the explicit opt-in.
         let err = config_from(&[
@@ -1120,6 +1447,22 @@ mod tests {
         .unwrap_err();
         assert!(err.contains(PROXY_AUTH_ALLOW_INSECURE), "{err}");
         assert!(err.contains("cleartext"), "{err}");
+    }
+
+    #[test]
+    fn auth_file_without_insecure_acknowledgement_is_allowed_for_https_proxy() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), "user:secret\n").unwrap();
+        let path = file.path().to_str().unwrap().to_string();
+        let cfg = config_ok(&[
+            (HTTPS_PROXY, "https://proxy.corp.com:3130"),
+            (PROXY_AUTH_FILE, &path),
+        ]);
+        let ep = proxy_endpoint(&cfg, "example.com").unwrap();
+        assert!(
+            ep.proxy_authorization.is_some(),
+            "https:// proxy must accept auth without the insecure acknowledgement"
+        );
     }
 
     #[test]
@@ -1502,7 +1845,9 @@ mod tests {
         ProxyEndpoint {
             host: addr.ip().to_string(),
             port: addr.port(),
+            dial_ip: None,
             proxy_authorization: auth.map(str::to_string),
+            tls: None,
         }
     }
 
@@ -1679,8 +2024,6 @@ mod tests {
         use tokio::io::copy_bidirectional;
 
         const SERVER_HOSTNAME: &str = "upstream.example.test";
-
-        let _ = rustls::crypto::ring::default_provider().install_default();
 
         // Trusted CA; the client config trusts it, and the fake upstream
         // server presents a leaf for SERVER_HOSTNAME signed by it.
@@ -1904,5 +2247,102 @@ mod tests {
         let err = config_from(&[(PROXY_CONNECT_BY_HOSTNAME, "true")]).unwrap_err();
         assert!(err.contains(PROXY_CONNECT_BY_HOSTNAME), "{err}");
         assert!(err.contains("no upstream proxy"), "{err}");
+    }
+
+    // -- TLS (https://) proxies --
+
+    /// A fake `https://` proxy: a TLS server with a self-signed cert for the
+    /// requested identity that answers CONNECT with 200. Returns the listen address,
+    /// the server task (yielding the received CONNECT request), and the
+    /// server certificate PEM to use as the corporate CA bundle.
+    async fn fake_tls_proxy(
+        tls_identity: &str,
+    ) -> (SocketAddr, tokio::task::JoinHandle<String>, String) {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec![tls_identity.to_string()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let cert_pem = cert.pem();
+
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.der().clone()],
+                rustls::pki_types::PrivateKeyDer::try_from(key.serialize_der()).unwrap(),
+            )
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut tls = acceptor.accept(socket).await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let mut used = 0;
+            loop {
+                let n = tls.read(&mut buf[used..]).await.unwrap();
+                used += n;
+                if n == 0 || buf[..used].windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            tls.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .await
+                .unwrap();
+            tls.flush().await.unwrap();
+            String::from_utf8_lossy(&buf[..used]).into_owned()
+        });
+        (addr, handle, cert_pem)
+    }
+
+    #[tokio::test]
+    async fn connect_via_https_proxy_with_corporate_ca_bundle() {
+        const PROXY_IDENTITY: &str = "proxy.corp.test";
+        let (addr, handle, cert_pem) = fake_tls_proxy(PROXY_IDENTITY).await;
+        let ca_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(ca_file.path(), cert_pem).unwrap();
+
+        let proxy_url = format!("https://{PROXY_IDENTITY}:{}", addr.port());
+        let ca_path = ca_file.path().to_string_lossy().into_owned();
+        let dial_ip = addr.ip().to_string();
+        let cfg = config_ok(&[
+            (HTTPS_PROXY, proxy_url.as_str()),
+            (PROXY_DIAL_IP, dial_ip.as_str()),
+            (PROXY_CA_BUNDLE, ca_path.as_str()),
+        ]);
+        let endpoint = &cfg.https;
+        assert!(endpoint.tls.is_some());
+        assert_eq!(endpoint.host, PROXY_IDENTITY);
+        assert_eq!(endpoint.dial_ip, Some(addr.ip()));
+
+        let stream = connect_via(endpoint, "api.example.com", 443, ConnectTarget::Hostname)
+            .await
+            .unwrap();
+        assert!(matches!(stream.inner, UpstreamStream::Tls(_)));
+        drop(stream);
+        let request = handle.await.unwrap();
+        assert!(request.starts_with("CONNECT api.example.com:443 HTTP/1.1\r\n"));
+    }
+
+    #[tokio::test]
+    async fn connect_via_https_proxy_rejects_untrusted_cert() {
+        // No corporate CA bundle: the self-signed proxy cert must not verify
+        // against the built-in / system roots, so the handshake fails closed.
+        let (addr, _handle, _cert_pem) = fake_tls_proxy("127.0.0.1").await;
+        let proxy_url = format!("https://{addr}");
+        let cfg = config_ok(&[(HTTPS_PROXY, proxy_url.as_str())]);
+        let endpoint = &cfg.https;
+
+        let err = connect_via(endpoint, "api.example.com", 443, ConnectTarget::Hostname)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("TLS handshake with upstream proxy"),
+            "{err}"
+        );
     }
 }

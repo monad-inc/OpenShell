@@ -13,7 +13,7 @@ PRs can compare like-for-like.
 
 Usage:
     uv run python scripts/baseline_workflow_metrics.py
-    uv run python scripts/baseline_workflow_metrics.py --days 30 --out architecture/plans/OS-49-baseline.json
+    uv run python scripts/baseline_workflow_metrics.py --days 30 --out plans/OS-49-baseline.json
 
 Auth:
     Relies on `gh auth login` — the script shells out to `gh api` so no token
@@ -41,9 +41,15 @@ REPO = "NVIDIA/OpenShell"
 WORKFLOWS: list[str] = [
     "branch-checks.yml",
     "branch-e2e.yml",
+    "build-cli-binaries.yml",
+    "build-gateway-binaries.yml",
+    "build-runtime-binaries.yml",
     "ci-image.yml",
     "docker-build.yml",
-    "e2e-test.yml",
+    "e2e-docker-test.yml",
+    "e2e-podman-test.yml",
+    "e2e-vm-test.yml",
+    "package-release-binaries.yml",
     "release-canary.yml",
     "release-dev.yml",
     "release-tag.yml",
@@ -55,8 +61,14 @@ WORKFLOWS: list[str] = [
 # workflow_run. For these, we scan all repo runs in the window and attribute
 # via `referenced_workflows`.
 REUSABLE_WORKFLOWS: set[str] = {
+    "build-cli-binaries.yml",
+    "build-gateway-binaries.yml",
+    "build-runtime-binaries.yml",
     "docker-build.yml",
-    "e2e-test.yml",
+    "e2e-docker-test.yml",
+    "e2e-podman-test.yml",
+    "e2e-vm-test.yml",
+    "package-release-binaries.yml",
 }
 
 # Conclusions that represent a real execution on a runner. Percentile math
@@ -348,14 +360,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--out",
         type=pathlib.Path,
-        default=pathlib.Path("architecture/plans/OS-49-baseline.json"),
-        help="Where to write the JSON report (default: architecture/plans/OS-49-baseline.json)",
+        default=pathlib.Path("plans/OS-49-baseline.json"),
+        help="Where to write the JSON report (default: plans/OS-49-baseline.json)",
     )
     parser.add_argument(
         "--md",
         type=pathlib.Path,
-        default=pathlib.Path("architecture/plans/OS-49-baseline.md"),
-        help="Where to write the Markdown report (default: architecture/plans/OS-49-baseline.md)",
+        default=pathlib.Path("plans/OS-49-baseline.md"),
+        help="Where to write the Markdown report (default: plans/OS-49-baseline.md)",
     )
     return parser.parse_args()
 

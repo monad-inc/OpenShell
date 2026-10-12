@@ -7,6 +7,7 @@ use std::path::Path;
 ///
 /// If the path already has a scheme (`unix:` or `tcp:`), use it as-is.
 /// Otherwise, assume it is a Unix socket path and prepend `unix:`.
+#[allow(dead_code)]
 pub fn workload_api_endpoint(path: &Path) -> String {
     let path = path.to_string_lossy();
     if path.starts_with("unix:") || path.starts_with("tcp:") {

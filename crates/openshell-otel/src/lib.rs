@@ -3,11 +3,25 @@
 
 //! Shared OpenTelemetry trace export support for `OpenShell` services.
 
+mod driver;
 mod grpc;
 mod propagation;
 
-pub use grpc::{RecordGrpcFailure, RecordGrpcStatus};
-pub use propagation::{HeaderMapExtractor, MetadataMapInjector, TraceContextInterceptor};
+pub use driver::{
+    BoxGrpcStream, ComputeDriverTracing, DriverTracingConfig, DriverTracingHandle,
+    IN_PROCESS_COMPUTE_DRIVER_TARGET, InProcessRpcTracer, install_driver_tracing,
+};
+
+pub use grpc::{
+    COMPUTE_DRIVER_RPC_SERVICE, ComputeDriverRpc, ComputeDriverRpcSpan, RecordGrpcFailure,
+    RecordGrpcStatus, TracedGrpcStream, compute_driver_rpc_layer, compute_driver_rpc_operation,
+    grpc_status_code_name, record_grpc_status, rpc,
+};
+pub use propagation::{
+    HeaderMapExtractor, MetadataMapInjector, TRACEPARENT_ENV, TRACESTATE_ENV,
+    TraceContextInterceptor, current_trace_context_carrier, current_trace_context_environment,
+    set_parent_from_environment, trace_context_environment,
+};
 
 use opentelemetry::KeyValue;
 use opentelemetry::trace::TracerProvider as _;
@@ -22,6 +36,27 @@ use tracing_subscriber::layer::{Context, Filter};
 use tracing_subscriber::registry::LookupSpan;
 
 const SDK_UNKNOWN_SERVICE_PREFIX: &str = "unknown_service";
+
+/// Build the resource attributes shared by gateway and compute-driver providers.
+pub fn gateway_resource_attributes(
+    gateway_name: Option<&str>,
+    compute_driver: Option<&str>,
+) -> Vec<KeyValue> {
+    let mut attributes = Vec::new();
+    if let Some(name) = gateway_name.map(str::trim).filter(|name| !name.is_empty()) {
+        attributes.push(KeyValue::new("openshell.gateway.name", name.to_string()));
+    }
+    if let Some(driver) = compute_driver
+        .map(str::trim)
+        .filter(|driver| !driver.is_empty())
+    {
+        attributes.push(KeyValue::new(
+            "openshell.gateway.compute_driver",
+            driver.to_string(),
+        ));
+    }
+    attributes
+}
 
 /// Mark `span` as failed.
 ///
@@ -197,17 +232,21 @@ pub type OtlpLayer<S> = tracing_subscriber::filter::Filtered<
 pub type TargetOtlpLayer<S> =
     tracing_subscriber::filter::Filtered<OpenTelemetryLayer<S, SdkTracer>, TargetPrefixFilter, S>;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct TargetPrefixFilter {
-    prefix: &'static str,
+    prefixes: Vec<&'static str>,
     include: bool,
 }
 
 impl<S> Filter<S> for TargetPrefixFilter {
     fn enabled(&self, metadata: &tracing::Metadata<'_>, _ctx: &Context<'_, S>) -> bool {
+        let matches_prefix = self
+            .prefixes
+            .iter()
+            .any(|prefix| metadata.target().starts_with(prefix));
         metadata.is_span()
             && !metadata.target().starts_with("opentelemetry")
-            && (metadata.target().starts_with(self.prefix) == self.include)
+            && (matches_prefix == self.include)
     }
 }
 
@@ -232,19 +271,14 @@ pub fn layer_for_target_prefix<S>(
 where
     S: Subscriber + for<'span> LookupSpan<'span>,
 {
-    tracing_opentelemetry::layer()
-        .with_tracer(provider.tracer(instrumentation_scope))
-        .with_filter(TargetPrefixFilter {
-            prefix: target_prefix,
-            include: true,
-        })
+    layer_for_target_prefixes(provider, instrumentation_scope, [target_prefix])
 }
 
-/// Build a tracing layer that excludes spans from `target_prefix`.
-pub fn layer_excluding_target_prefix<S>(
+/// Build a tracing layer that exports only spans from `target_prefixes`.
+pub fn layer_for_target_prefixes<S>(
     provider: &SdkTracerProvider,
     instrumentation_scope: &'static str,
-    target_prefix: &'static str,
+    target_prefixes: impl IntoIterator<Item = &'static str>,
 ) -> TargetOtlpLayer<S>
 where
     S: Subscriber + for<'span> LookupSpan<'span>,
@@ -252,7 +286,40 @@ where
     tracing_opentelemetry::layer()
         .with_tracer(provider.tracer(instrumentation_scope))
         .with_filter(TargetPrefixFilter {
-            prefix: target_prefix,
+            prefixes: target_prefixes.into_iter().collect(),
+            include: true,
+        })
+}
+
+/// Build a tracing layer that excludes spans from `target_prefix`.
+///
+/// `None` excludes no application spans.
+pub fn layer_excluding_target_prefix<S>(
+    provider: &SdkTracerProvider,
+    instrumentation_scope: &'static str,
+    target_prefix: Option<&'static str>,
+) -> TargetOtlpLayer<S>
+where
+    S: Subscriber + for<'span> LookupSpan<'span>,
+{
+    layer_excluding_target_prefixes(provider, instrumentation_scope, target_prefix)
+}
+
+/// Build a tracing layer that excludes spans from `target_prefixes`.
+///
+/// An empty iterator excludes no application spans.
+pub fn layer_excluding_target_prefixes<S>(
+    provider: &SdkTracerProvider,
+    instrumentation_scope: &'static str,
+    target_prefixes: impl IntoIterator<Item = &'static str>,
+) -> TargetOtlpLayer<S>
+where
+    S: Subscriber + for<'span> LookupSpan<'span>,
+{
+    tracing_opentelemetry::layer()
+        .with_tracer(provider.tracer(instrumentation_scope))
+        .with_filter(TargetPrefixFilter {
+            prefixes: target_prefixes.into_iter().collect(),
             include: false,
         })
 }
@@ -332,7 +399,7 @@ mod tests {
             .with(layer_excluding_target_prefix(
                 &gateway_provider,
                 "gateway",
-                "driver_target",
+                Some("driver_target"),
             ))
             .with(layer_for_target_prefix(
                 &driver_provider,
@@ -372,6 +439,30 @@ mod tests {
             driver_spans[0].parent_span_id,
             gateway_spans[0].span_context.span_id()
         );
+    }
+
+    #[test]
+    fn excluding_no_target_prefix_exports_all_application_spans() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let _tracing_lock = test_lock();
+        let exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry()
+            .with(layer_excluding_target_prefix(&provider, "gateway", None));
+
+        tracing::subscriber::with_default(subscriber, || {
+            drop(tracing::info_span!(target: "\0driver_target", "nul-prefixed.span"));
+            drop(tracing::info_span!(target: "gateway_target", "gateway.span"));
+        });
+
+        provider.force_flush().unwrap();
+        let spans = exporter.get_finished_spans().unwrap();
+        assert_eq!(spans.len(), 2);
+        assert!(spans.iter().any(|span| span.name == "nul-prefixed.span"));
+        assert!(spans.iter().any(|span| span.name == "gateway.span"));
     }
 
     #[test]

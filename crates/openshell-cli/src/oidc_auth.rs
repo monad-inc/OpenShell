@@ -29,7 +29,7 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tracing::debug;
 
-const AUTH_TIMEOUT: Duration = Duration::from_secs(120);
+const AUTH_TIMEOUT: Duration = Duration::from_mins(2);
 
 /// OIDC discovery document (subset of fields we need).
 #[derive(Debug, Deserialize)]
@@ -93,6 +93,7 @@ async fn discover(issuer: &str, insecure: bool) -> Result<OidcDiscovery> {
 }
 
 fn http_client(insecure: bool) -> reqwest::Client {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let mut builder = reqwest::ClientBuilder::new().redirect(reqwest::redirect::Policy::none());
     if insecure {
         builder = builder.danger_accept_invalid_certs(true);
@@ -512,10 +513,11 @@ fn bundle_from_refresh_output(
     }
 }
 
-/// Ensure we have a valid OIDC token for the given gateway, refreshing if needed.
-///
-/// Returns the access token string.
-pub async fn ensure_valid_oidc_token(gateway_name: &str, insecure: bool) -> Result<String> {
+/// Ensure we have a valid OIDC token bundle for the given gateway, refreshing if needed.
+pub async fn ensure_valid_oidc_token_bundle(
+    gateway_name: &str,
+    insecure: bool,
+) -> Result<OidcTokenBundle> {
     let bundle =
         openshell_bootstrap::oidc_token::load_oidc_token(gateway_name).ok_or_else(|| {
             miette::miette!(
@@ -525,7 +527,7 @@ pub async fn ensure_valid_oidc_token(gateway_name: &str, insecure: bool) -> Resu
         })?;
 
     if !openshell_bootstrap::oidc_token::is_token_expired(&bundle) {
-        return Ok(bundle.access_token);
+        return Ok(bundle);
     }
 
     debug!(
@@ -537,7 +539,16 @@ pub async fn ensure_valid_oidc_token(gateway_name: &str, insecure: bool) -> Resu
         .and_then(|metadata| metadata.oidc_scopes);
     let refreshed = oidc_refresh_token(&bundle, scopes.as_deref(), insecure).await?;
     openshell_bootstrap::oidc_token::store_oidc_token(gateway_name, &refreshed)?;
-    Ok(refreshed.access_token)
+    Ok(refreshed)
+}
+
+/// Ensure we have a valid OIDC token for the given gateway, refreshing if needed.
+///
+/// Returns the access token string.
+pub async fn ensure_valid_oidc_token(gateway_name: &str, insecure: bool) -> Result<String> {
+    Ok(ensure_valid_oidc_token_bundle(gateway_name, insecure)
+        .await?
+        .access_token)
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────

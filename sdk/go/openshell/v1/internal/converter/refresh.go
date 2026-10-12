@@ -30,6 +30,24 @@ func RefreshStrategyFromProto(s pb.ProviderCredentialRefreshStrategy) types.Refr
 	}
 }
 
+// --- RefreshRecoveryAction enum mapping ---
+
+// RefreshRecoveryActionFromProto converts a proto recovery action to the curated SDK type.
+func RefreshRecoveryActionFromProto(a pb.ProviderCredentialRefreshRecoveryAction) types.RefreshRecoveryAction {
+	switch a {
+	case pb.ProviderCredentialRefreshRecoveryAction_PROVIDER_CREDENTIAL_REFRESH_RECOVERY_ACTION_RETRY:
+		return types.RefreshRecoveryActionRetry
+	case pb.ProviderCredentialRefreshRecoveryAction_PROVIDER_CREDENTIAL_REFRESH_RECOVERY_ACTION_REAUTHORIZE:
+		return types.RefreshRecoveryActionReauthorize
+	case pb.ProviderCredentialRefreshRecoveryAction_PROVIDER_CREDENTIAL_REFRESH_RECOVERY_ACTION_FIX_CONFIGURATION:
+		return types.RefreshRecoveryActionFixConfiguration
+	case pb.ProviderCredentialRefreshRecoveryAction_PROVIDER_CREDENTIAL_REFRESH_RECOVERY_ACTION_INVESTIGATE:
+		return types.RefreshRecoveryActionInvestigate
+	default:
+		return types.RefreshRecoveryActionUnspecified
+	}
+}
+
 // RefreshStrategyToProto converts an SDK RefreshStrategy to a proto ProviderCredentialRefreshStrategy.
 func RefreshStrategyToProto(s types.RefreshStrategy) pb.ProviderCredentialRefreshStrategy {
 	switch s {
@@ -58,15 +76,19 @@ func RefreshStatusFromProto(s *pb.ProviderCredentialRefreshStatus) *types.Refres
 		return nil
 	}
 	return &types.RefreshStatus{
-		ProviderName:  s.GetProviderName(),
-		ProviderID:    s.GetProviderId(),
-		CredentialKey: s.GetCredentialKey(),
-		Strategy:      RefreshStrategyFromProto(s.GetStrategy()),
-		Status:        s.GetStatus(),
-		ExpiresAt:     TimeFromMillis(s.GetExpiresAtMs()),
-		NextRefreshAt: TimeFromMillis(s.GetNextRefreshAtMs()),
-		LastRefreshAt: TimeFromMillis(s.GetLastRefreshAtMs()),
-		LastError:     s.GetLastError(),
+		Provider:             s.GetProvider(),
+		ProviderID:           s.GetProviderId(),
+		CredentialKey:        s.GetCredentialKey(),
+		Strategy:             RefreshStrategyFromProto(s.GetStrategy()),
+		Status:               s.GetStatus(),
+		ExpiresAt:            TimeFromProto(s.GetExpirationTime()),
+		NextRefreshAt:        TimeFromProto(s.GetNextRefreshTime()),
+		LastRefreshAt:        TimeFromProto(s.GetLastRefreshTime()),
+		LastError:            s.GetLastError(),
+		RecoveryAction:       RefreshRecoveryActionFromProto(s.GetRecoveryAction()),
+		FailureCode:          s.GetFailureCode(),
+		ProviderErrorSubtype: s.GetProviderErrorSubtype(),
+		LastErrorAt:          TimeFromProto(s.GetLastErrorTime()),
 	}
 }
 
@@ -88,8 +110,7 @@ func RefreshConfigToProto(c *types.RefreshConfig) *pb.ConfigureProviderRefreshRe
 	}
 
 	if c.ExpiresAt != nil {
-		ms := MillisFromTime(*c.ExpiresAt)
-		result.ExpiresAtMs = &ms
+		result.ExpirationTime = TimestampFromTime(*c.ExpiresAt)
 	}
 
 	return result

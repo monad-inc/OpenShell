@@ -6,15 +6,17 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use miette::{IntoDiagnostic, Result};
+use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
-use openshell_core::{Config, VERSION};
-use openshell_driver_docker::{DockerComputeConfig, DockerComputeDriver};
+use openshell_driver_docker::{ComputeDriverService, DockerComputeConfig, DockerComputeDriver};
 use tracing::info;
-use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
 #[command(name = "openshell-driver-docker", version = VERSION)]
 struct Args {
+    /// Override the operator admission policy in the driver TOML file.
+    #[arg(long, env = "OPENSHELL_DRIVER_ADMISSION_CONFIG_JSON")]
+    admission_config_json: Option<openshell_core::resource_admission::DriverAdmissionConfig>,
     /// Public compute-driver Unix socket used by the gateway.
     #[arg(long, env = "OPENSHELL_COMPUTE_DRIVER_SOCKET")]
     bind_socket: PathBuf,
@@ -23,7 +25,15 @@ struct Args {
     #[arg(long, env = "OPENSHELL_DOCKER_DRIVER_CONFIG")]
     config: PathBuf,
 
-    /// Gateway listener address used to derive sandbox callback routing.
+    /// OCI image containing the `openshell-sandbox` runtime binary.
+    #[arg(long, env = openshell_core::config::SANDBOX_RUNTIME_IMAGE_ENV)]
+    sandbox_runtime_image: Option<String>,
+
+    /// OCI image containing the `openshell-supervisor` control binary.
+    #[arg(long, env = openshell_core::config::SUPERVISOR_IMAGE_ENV)]
+    supervisor_image: Option<String>,
+
+    /// Gateway listener address used to derive the supervisor endpoint.
     #[arg(
         long,
         env = "OPENSHELL_GATEWAY_BIND",
@@ -33,21 +43,42 @@ struct Args {
 
     #[arg(long, env = "OPENSHELL_LOG_LEVEL", default_value = "info")]
     log_level: String,
+
+    #[arg(long, env = "OPENSHELL_OTLP_ENDPOINT")]
+    otlp_endpoint: Option<String>,
+
+    #[arg(long, env = "OPENSHELL_GATEWAY_NAME")]
+    gateway_name: Option<String>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level)),
-        )
-        .init();
+    let _tracing = openshell_otel::install_driver_tracing(
+        openshell_driver_docker::otel_tracing::TRACING,
+        openshell_otel::DriverTracingConfig {
+            endpoint: args.otlp_endpoint.as_deref(),
+            gateway_name: args.gateway_name.as_deref(),
+            service_version: VERSION,
+            log_level: &args.log_level,
+        },
+    );
 
     let config_source = std::fs::read_to_string(&args.config).into_diagnostic()?;
-    let docker_config: DockerComputeConfig = toml::from_str(&config_source).into_diagnostic()?;
-    let gateway_config = Config::new(None).with_bind_address(args.gateway_bind);
-    let driver = DockerComputeDriver::new(&gateway_config, &docker_config)
+    let mut docker_config: DockerComputeConfig =
+        toml::from_str(&config_source).into_diagnostic()?;
+    if let Some(policy) = args.admission_config_json {
+        docker_config.allow_driver_config = policy.allow_driver_config;
+        docker_config.resource_admission = policy.resource_admission;
+    }
+    if let Some(image) = args.sandbox_runtime_image {
+        docker_config.sandbox_runtime_image = Some(image);
+    }
+    if let Some(image) = args.supervisor_image {
+        docker_config.supervisor_image = Some(image);
+    }
+    docker_config.supervisor_otlp_endpoint = args.otlp_endpoint.clone();
+    let driver = DockerComputeDriver::new(args.gateway_bind, &args.log_level, &docker_config)
         .await
         .into_diagnostic()?;
 
@@ -57,7 +88,8 @@ async fn main() -> Result<()> {
         openshell_core::external_driver_socket::SocketCleanup::new(args.bind_socket.clone());
     info!(socket = %args.bind_socket.display(), "Starting Docker compute driver");
     tonic::transport::Server::builder()
-        .add_service(ComputeDriverServer::new(driver))
+        .layer(openshell_otel::compute_driver_rpc_layer())
+        .add_service(ComputeDriverServer::new(ComputeDriverService::new(driver)))
         .serve_with_incoming_shutdown(
             openshell_core::external_driver_socket::SameUidUnixIncoming::new(listener),
             shutdown_signal(),

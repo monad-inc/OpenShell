@@ -4,10 +4,11 @@ Launch a headless sandbox agent that runs the `gator-gate` skill against OpenShe
 
 ## Prerequisites
 
-- `gh` is authenticated on the host and has access to `NVIDIA/OpenShell` and `NVIDIA/OpenShell-Community`.
+- `gh` is authenticated on the host and has access to `NVIDIA/OpenShell`.
 - For `--harness codex`, `codex login` has created `$HOME/.codex/auth.json`.
 - For `--harness codex`, local Codex auth must include an access token, refresh token, and account ID.
-- A local gateway is available when using the default local Dockerfile source.
+- A local gateway and either Docker or Podman are available to build the
+  default sandbox image.
 
 ## Usage
 
@@ -19,7 +20,11 @@ Launch a headless sandbox agent that runs the `gator-gate` skill against OpenShe
   "Run gator on PR 1536 and keep watching until it closes or merges."
 ```
 
-By default the launcher uses `scripts/agents/gator/Dockerfile` as the sandbox source. Local gateways build `scripts/agents/gator/` as the image context, so gator-specific image files such as `policy.yaml` and `bin/gh` stay with the gator agent. The launcher bakes rendered prompts, skills, subagents, and shared runtime files into `/etc/openshell/agent-payload`, so `--from` must point to a local Dockerfile or directory containing a Dockerfile.
+By default the launcher uses `scripts/agents/gator/Dockerfile` as the sandbox image source. It builds `scripts/agents/gator/` as the image context, so gator-specific image files such as `policy.yaml` and `bin/gh` stay with the gator agent. The launcher bakes rendered prompts, skills, subagents, and shared runtime files into `/etc/openshell/agent-payload`, then passes the resulting image reference to `openshell sandbox create`.
+
+The launcher queries the selected gateway and builds with its Docker or Podman
+compute driver. If `CONTAINER_ENGINE` is set, it must match that driver. Other
+gateway drivers cannot run this local-image launcher.
 
 Use `--harness codex` to select Codex explicitly. Other harness names are rejected until their support is added to `agent.yaml` and `scripts/agents/runtime/harnesses/<name>/`. Agent directories do not carry their own harness implementations; they provide prompt templates and optional skills or subagents for the shared runtime to inject.
 
@@ -29,23 +34,33 @@ The manifest-driven launcher at `scripts/agents/run.sh` reads `agent.yaml`, whic
 
 The launcher:
 
-- Scans `profile_paths` in manifest order and imports `providers/github-gator.yaml`.
+- Scans `profile_paths` in manifest order and imports or updates `providers/github-gator.yaml`.
 - Creates or updates the `github-gator` provider from `gh auth token`.
 - Selects the requested harness and bakes the common runtime into the immutable sandbox payload.
+- Builds with the latest Codex CLI by default. Docker can reuse the cached install layer; rebuild with that layer's cache disabled to fetch a newer release.
 - For `--harness codex`, imports `providers/codex-gator.yaml`, creates or updates the `codex-gator` provider from `$HOME/.codex/auth.json`, and stores the refresh token as gateway-only refresh material.
 - For `--harness codex`, configures gateway-managed refresh for `CODEX_AUTH_ACCESS_TOKEN` and rotates it before launching the sandbox.
-- Enables `providers_v2_enabled`, `agent_policy_proposals_enabled`, and `proposal_approval_mode=auto` at gateway scope.
+- Passes the non-secret Codex account ID from host auth as `CODEX_ACCOUNT_ID`. The harness writes it literally into `auth.json` for local workspace discovery; access tokens remain opaque provider placeholders and refresh tokens remain gateway-only.
+- Enables `agent_policy_proposals_enabled` and `proposal_approval_mode=auto` at gateway scope.
 - Uses the gator image policy copied to `/etc/openshell/policy.yaml`.
 - Installs the gator-specific `gh` wrapper from `gator/bin/gh` as `/usr/local/bin/gh` to fail closed when same-head-SHA history cannot be checked, prevent duplicate dispositions, and require versioned review payloads.
 - Installs `gator/bin/review-feedback-ledger` as `/usr/local/bin/review-feedback-ledger` so reviews receive tree- and patch-aware scope, prior summaries and findings, resolution state, convergence telemetry, and the three-round Warning budget.
+  Patch identity uses fetched merge-base/head trees in a temporary bare Git
+  repository, avoiding GitHub's full-diff size limit without checking out PR
+  code. If those trees cannot be fetched, the ledger retains feedback and
+  exact-SHA history but disables rebase-equivalence shortcuts.
+- Installs `gator/bin/resolve-gator-review-threads` so a follow-up commit that
+  demonstrably fixes a Gator inline finding can resolve the corresponding
+  Gator-owned GitHub review thread without touching human review threads.
 - Installs `gator/bin/validate-review-findings` to downgrade blockers that lack the required reachability, ownership, base-vs-head, impact, and reproducer evidence.
+- Keeps that normalized evidence as Gator's internal review contract, then renders validated blockers for people as a read-aloud `Summary`, an actionable `Fix`, and a deterministic `Verify`. Exact paths and only the additional provenance an implementation agent needs appear in collapsed `Agent context`; raw evidence headings such as `Base` and `Head` are not posted publicly. Review-process provenance, docs and E2E disposition, SHAs, and state codes appear at the end of the summary in collapsed `Gator metadata`, while required human actions remain visible.
 - Bakes `scripts/agents/gator/skills/gator-gate/SKILL.md` into `/etc/openshell/agent-payload`.
 - Bakes `.claude/agents/principal-engineer-reviewer.md` so the selected harness can run a deterministic independent reviewer execution through `/etc/openshell/agent-payload/runtime/subagent.sh principal-engineer-reviewer < task.md`.
 - For `--harness codex`, optionally bakes a host Codex executable as `/etc/openshell/agent-payload/runtime/harnesses/codex/codex`.
 - Starts the selected harness without a TTY.
 - Runs gator in `watch` mode by default. The sandbox stays alive while the supervisor sleeps between bounded Codex cycles, so Codex is not connected during passive PR waits. The supervisor prints periodic heartbeat lines during active cycles and passive sleeps.
 - Makes each watch cycle compare its immutable payload version with the version published on the default branch. A stale watcher stops without GitHub writes and must be relaunched.
-The GitHub provider profile allows read-only GraphQL queries on `api.github.com/graphql` so `gh` read paths can use GraphQL when needed. Write operations remain REST-only and scoped to the two allowed repositories.
+The GitHub provider profile allows read-only GraphQL queries on `api.github.com/graphql` so `gh` read paths can use GraphQL when needed. Its only GraphQL mutation is the named `ResolveGatorReviewThread` operation, restricted to the `resolveReviewThread` root field. All other writes remain REST-only and scoped to the two allowed repositories.
 
 Set `GATOR_CODEX_ACCESS_CREDENTIAL_KEY` or pass `--codex-access-key` if the gator Codex profile uses a credential key other than `CODEX_AUTH_ACCESS_TOKEN` for the short-lived access token.
 
@@ -58,4 +73,6 @@ The launcher preserves existing gateway-owned Codex refresh material by default 
 ```shell
 bash scripts/agents/gator/bin/gh_guard_test.sh
 bash scripts/agents/gator/bin/review_feedback_ledger_test.sh
+bash scripts/agents/gator/bin/resolve_gator_review_threads_test.sh
+bash scripts/agents/runtime/harnesses/codex/exec_test.sh
 ```

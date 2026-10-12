@@ -10,7 +10,8 @@
 //! sandbox from its mutable tag, and verifies both the child identity and the
 //! image ID recorded on the real sandbox container. This exercises the Podman
 //! API inspect → protected metadata → create path rather than only its unit
-//! serialization boundaries.
+//! serialization boundaries. Workspace behavior shared with Docker is covered
+//! by the `oci-image` feature suite in `tests/suites/features`.
 
 use std::process::Stdio;
 
@@ -18,11 +19,11 @@ use openshell_e2e::harness::container::{ContainerEngine, is_e2e_driver};
 use openshell_e2e::harness::output::strip_ansi;
 use openshell_e2e::harness::sandbox::SandboxGuard;
 
-const BASE_IMAGE: &str = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest";
+const BASE_IMAGE: &str = "nvcr.io/nvidia/base/ubuntu:24.04";
 const READY_MARKER: &str = "podman-oci-identity-ready";
 const OCI_UID: &str = "2345";
 const OCI_GID: &str = "2346";
-const OCI_FALLBACK_POLICY: &str = r#"version: 1
+const OCI_FALLBACK_POLICY: &str = r"version: 1
 
 filesystem_policy:
   include_workdir: true
@@ -32,7 +33,7 @@ landlock:
   compatibility: best_effort
 
 network_policies: {}
-"#;
+";
 
 struct ImageGuard {
     engine: ContainerEngine,
@@ -54,7 +55,16 @@ impl ImageGuard {
         let containerfile = context.path().join("Containerfile");
         std::fs::write(
             &containerfile,
-            format!("FROM {BASE_IMAGE}\nUSER {OCI_UID}:{OCI_GID}\n"),
+            format!(
+                r"FROM {BASE_IMAGE}
+USER 0:0
+RUN mkdir -p /home/app/project && \
+    chown {OCI_UID}:{OCI_GID} /home/app /home/app/project && \
+    chmod 0700 /home/app /home/app/project
+WORKDIR /home/app/project
+USER {OCI_UID}:{OCI_GID}
+"
+            ),
         )
         .map_err(|err| format!("write Containerfile: {err}"))?;
 
@@ -128,7 +138,16 @@ fn run_engine(engine: &ContainerEngine, args: &[&str]) -> Result<String, String>
 }
 
 fn sandbox_container_id(engine: &ContainerEngine, sandbox_name: &str) -> Result<String, String> {
+    container_id_for_role(engine, sandbox_name, "sandbox")
+}
+
+fn container_id_for_role(
+    engine: &ContainerEngine,
+    sandbox_name: &str,
+    role: &str,
+) -> Result<String, String> {
     let name_filter = format!("label=openshell.ai/sandbox-name={sandbox_name}");
+    let role_filter = format!("label=openshell.ai/isolation-role={role}");
     let stdout = run_engine(
         engine,
         &[
@@ -138,6 +157,8 @@ fn sandbox_container_id(engine: &ContainerEngine, sandbox_name: &str) -> Result<
             "label=openshell.managed=true",
             "--filter",
             &name_filter,
+            "--filter",
+            &role_filter,
         ],
     )?;
     let ids = stdout
@@ -171,7 +192,7 @@ async fn podman_uses_oci_identity_and_inspected_image_id() {
     }
 
     let image = ImageGuard::build().expect("build Podman OCI identity image");
-    // The community base image contains a baked default policy with an
+    // The fixture image contains a policy with an
     // explicit `sandbox` process identity. Supply a complete policy that
     // intentionally omits `process` so this test exercises OCI fallback.
     let policy = tempfile::NamedTempFile::new().expect("create OCI fallback policy");
@@ -233,5 +254,81 @@ async fn podman_uses_oci_identity_and_inspected_image_id() {
         "Podman sandbox must launch the immutable image ID inspected before creation"
     );
 
+    let workspace_output = sandbox
+        .exec(&[
+            "sh",
+            "-c",
+            "set -eu; test \"$(pwd -P)\" = /home/app/project; test ! -e /sandbox; stat -c 'workspace-owner=%u:%g' .; touch probe; rm probe; echo podman-workspace-write-ok",
+        ])
+        .await
+        .expect("OCI workload should be able to write to its image workspace");
+    assert!(
+        workspace_output.contains(&format!("workspace-owner={OCI_UID}:{OCI_GID}")),
+        "expected workspace owner {OCI_UID}:{OCI_GID}:\n{workspace_output}"
+    );
+    assert!(
+        workspace_output.contains("podman-workspace-write-ok"),
+        "expected workspace write marker:\n{workspace_output}"
+    );
+
+    assert_isolated_pair(&image, &sandbox, &container_id).await;
     sandbox.cleanup().await;
+}
+
+async fn assert_isolated_pair(image: &ImageGuard, sandbox: &SandboxGuard, container_id: &str) {
+    let supervisor_id = container_id_for_role(&image.engine, &sandbox.name, "supervisor")
+        .expect("find separate supervisor companion");
+    assert_ne!(supervisor_id, container_id);
+    let workload_user = run_engine(
+        &image.engine,
+        &["inspect", "--format", "{{.Config.User}}", container_id],
+    )
+    .unwrap();
+    assert_eq!(
+        workload_user,
+        format!("{OCI_UID}:{OCI_GID}"),
+        "a custom OCI workspace must start directly as the final identity"
+    );
+    let supervisor_user = run_engine(
+        &image.engine,
+        &["inspect", "--format", "{{.Config.User}}", &supervisor_id],
+    )
+    .unwrap();
+    assert_eq!(supervisor_user, format!("{OCI_UID}:{OCI_GID}"));
+    let supervisor_caps = run_engine(
+        &image.engine,
+        &["inspect", "--format", "{{.EffectiveCaps}}", &supervisor_id],
+    )
+    .unwrap();
+    assert_eq!(
+        supervisor_caps, "[]",
+        "the supervisor companion may not have effective capabilities"
+    );
+    let network = run_engine(
+        &image.engine,
+        &[
+            "inspect",
+            "--format",
+            "{{.HostConfig.NetworkMode}}",
+            container_id,
+        ],
+    )
+    .unwrap();
+    assert_eq!(network, "none");
+    let mounts = run_engine(
+        &image.engine,
+        &[
+            "inspect",
+            "--format",
+            "{{range .Mounts}}{{println .Destination}}{{end}}",
+            container_id,
+        ],
+    )
+    .unwrap();
+    assert!(!mounts.contains("/etc/openshell/tls"));
+    assert!(!mounts.contains("/.openshell/supervisor"));
+    assert!(!mounts.lines().any(|path| path == "/home/app/project"));
+    assert!(!mounts.lines().any(|path| path == "/sandbox"));
+    let posture = sandbox.exec(&["sh", "-c", "set -eu; awk '/^CapEff:|^CapBnd:|^NoNewPrivs:/ {print}' /proc/self/status; test ! -r /.openshell/channel/sandbox/server.key; test ! -r /.openshell/supervisor/runtime-descriptor.json"]).await.expect("workload cannot read either control credential set");
+    assert!(posture.contains("0000000000000000"));
 }

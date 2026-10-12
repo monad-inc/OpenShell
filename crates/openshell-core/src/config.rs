@@ -3,16 +3,13 @@
 
 //! Configuration management for `OpenShell` components.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt;
-#[cfg(unix)]
-use std::io::{Read, Write};
 use std::net::SocketAddr;
-#[cfg(unix)]
-use std::os::unix::fs::FileTypeExt;
-use std::path::{Path, PathBuf};
+use std::num::{NonZeroI64, NonZeroU64};
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -28,8 +25,20 @@ pub const DEFAULT_SSH_PORT: u16 = 2222;
 /// Default gateway server port.
 pub const DEFAULT_SERVER_PORT: u16 = 17670;
 
+/// Default operator-facing name for a gateway installation.
+pub const DEFAULT_GATEWAY_NAME: &str = "openshell";
+
 /// Default container stop timeout in seconds (SIGTERM → SIGKILL).
 pub const DEFAULT_STOP_TIMEOUT_SECS: u32 = 10;
+
+/// Default cgroup PID limit for local container sandboxes.
+pub const DEFAULT_SANDBOX_PIDS_LIMIT: i64 = 2048;
+
+/// Typed default cgroup PID limit for local container sandboxes.
+#[must_use]
+pub fn default_sandbox_pids_limit() -> Option<NonZeroI64> {
+    NonZeroI64::new(DEFAULT_SANDBOX_PIDS_LIMIT)
+}
 
 /// Default Docker bridge network name for local sandboxes.
 pub const DEFAULT_DOCKER_NETWORK_NAME: &str = "openshell-docker";
@@ -77,12 +86,48 @@ impl FromStr for PolicyValidationFailureMode {
 /// Default OCI repository for the supervisor image (no tag).
 pub const DEFAULT_SUPERVISOR_IMAGE_REPO: &str = "ghcr.io/nvidia/openshell/supervisor";
 
-/// Return the default supervisor image reference with a version-pinned tag.
-#[must_use]
-pub fn default_supervisor_image() -> String {
+/// Default OCI repository for the sandbox runtime image (no tag).
+pub const DEFAULT_SANDBOX_RUNTIME_IMAGE_REPO: &str = "ghcr.io/nvidia/openshell/sandbox";
+
+/// Process-level default for the trusted sandbox runtime image.
+pub const SANDBOX_RUNTIME_IMAGE_ENV: &str = "OPENSHELL_SANDBOX_RUNTIME_IMAGE";
+
+/// Process-level default for the trusted supervisor image.
+pub const SUPERVISOR_IMAGE_ENV: &str = "OPENSHELL_SUPERVISOR_IMAGE";
+
+fn compiled_sandbox_runtime_image() -> String {
+    format!(
+        "{DEFAULT_SANDBOX_RUNTIME_IMAGE_REPO}:{}",
+        default_supervisor_image_tag()
+    )
+}
+
+fn compiled_supervisor_image() -> String {
     format!(
         "{DEFAULT_SUPERVISOR_IMAGE_REPO}:{}",
         default_supervisor_image_tag()
+    )
+}
+
+fn runtime_image_default(environment_value: Option<String>, compiled_default: String) -> String {
+    environment_value.unwrap_or(compiled_default)
+}
+
+/// Return the process-configured sandbox runtime image, or the compiled default.
+#[must_use]
+pub fn default_sandbox_runtime_image() -> String {
+    runtime_image_default(
+        std::env::var(SANDBOX_RUNTIME_IMAGE_ENV).ok(),
+        compiled_sandbox_runtime_image(),
+    )
+}
+
+/// Return the process-configured supervisor image, or the compiled default.
+#[must_use]
+pub fn default_supervisor_image() -> String {
+    runtime_image_default(
+        std::env::var(SUPERVISOR_IMAGE_ENV).ok(),
+        compiled_supervisor_image(),
     )
 }
 
@@ -112,33 +157,6 @@ pub fn resolve_supervisor_image_tag(candidates: &[&str]) -> String {
 /// CDI device identifier for requesting all NVIDIA GPUs.
 pub const CDI_GPU_DEVICE_ALL: &str = "nvidia.com/gpu=all";
 
-/// Default maximum number of processes (PIDs) allowed inside a sandbox container.
-///
-/// Shared by the Docker and Podman drivers; override via driver config.
-pub const DEFAULT_SANDBOX_PIDS_LIMIT: i64 = 2048;
-
-/// Compute backends the gateway can orchestrate sandboxes through.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ComputeDriverKind {
-    Kubernetes,
-    Vm,
-    Docker,
-    Podman,
-}
-
-impl ComputeDriverKind {
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Kubernetes => "kubernetes",
-            Self::Vm => "vm",
-            Self::Docker => "docker",
-            Self::Podman => "podman",
-        }
-    }
-}
-
 /// Normalize a configured compute driver name.
 ///
 /// Built-in driver names and custom remote driver names share the same
@@ -160,253 +178,6 @@ pub fn normalize_compute_driver_name(value: &str) -> Result<String, String> {
     Ok(value.to_ascii_lowercase())
 }
 
-impl fmt::Display for ComputeDriverKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl FromStr for ComputeDriverKind {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "kubernetes" => Ok(Self::Kubernetes),
-            "vm" => Ok(Self::Vm),
-            "docker" => Ok(Self::Docker),
-            "podman" => Ok(Self::Podman),
-            other => Err(format!(
-                "unsupported compute driver '{other}'. expected one of: kubernetes, vm, docker, podman"
-            )),
-        }
-    }
-}
-
-/// Auto-detect the appropriate compute driver based on the runtime environment.
-///
-/// Priority order: Kubernetes → Podman → Docker.
-/// VM is never auto-detected (requires explicit `--drivers vm`).
-///
-/// Returns the first driver where the environment check passes.
-/// Returns `None` if no compatible driver is found.
-pub fn detect_driver() -> Option<ComputeDriverKind> {
-    // Kubernetes: check for KUBERNETES_SERVICE_HOST env var (set inside pods)
-    if std::env::var_os("KUBERNETES_SERVICE_HOST").is_some() {
-        return Some(ComputeDriverKind::Kubernetes);
-    }
-
-    // Podman: check for a reachable local API socket.
-    if is_podman_available() {
-        return Some(ComputeDriverKind::Podman);
-    }
-
-    // Docker: check for a reachable local API socket.
-    if is_docker_available() {
-        return Some(ComputeDriverKind::Docker);
-    }
-
-    None
-}
-
-/// Return whether a responsive local Podman API socket is available.
-#[must_use]
-pub fn is_podman_available() -> bool {
-    detect_podman_socket().is_some()
-}
-
-/// Return the first responsive Podman API socket, or `None` if none respond.
-pub fn detect_podman_socket() -> Option<PathBuf> {
-    detect_podman_socket_from_candidates(&podman_socket_candidates())
-}
-
-fn detect_podman_socket_from_candidates(candidates: &[PathBuf]) -> Option<PathBuf> {
-    candidates
-        .iter()
-        .find(|path| podman_socket_responds(path))
-        .cloned()
-}
-
-fn podman_socket_candidates() -> Vec<PathBuf> {
-    let socket = std::env::var("OPENSHELL_PODMAN_SOCKET")
-        .ok()
-        .filter(|path| !path.trim().is_empty())
-        .map(PathBuf::from);
-    podman_socket_candidates_from_env(
-        socket,
-        std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from),
-        std::env::var_os("HOME").map(PathBuf::from),
-    )
-}
-
-fn podman_socket_candidates_from_env(
-    socket: Option<PathBuf>,
-    runtime_dir: Option<PathBuf>,
-    home: Option<PathBuf>,
-) -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-
-    if let Some(path) = socket {
-        candidates.push(path);
-    }
-
-    if let Some(runtime_dir) = runtime_dir {
-        candidates.push(runtime_dir.join("podman/podman.sock"));
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        candidates.push(PathBuf::from(format!(
-            "/run/user/{}/podman/podman.sock",
-            current_uid()
-        )));
-    }
-
-    if let Some(home) = home {
-        candidates.push(home.join(".local/share/containers/podman/machine/podman.sock"));
-    }
-
-    candidates
-}
-
-/// Return whether a responsive local Docker API socket is available.
-#[must_use]
-pub fn is_docker_available() -> bool {
-    detect_docker_socket().is_some()
-}
-
-pub fn detect_docker_socket() -> Option<PathBuf> {
-    detect_docker_socket_from_candidates(&docker_socket_candidates())
-}
-
-fn detect_docker_socket_from_candidates(candidates: &[PathBuf]) -> Option<PathBuf> {
-    candidates
-        .iter()
-        .find(|path| docker_socket_responds(path))
-        .cloned()
-}
-
-fn docker_socket_candidates() -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-
-    if let Ok(host) = std::env::var("DOCKER_HOST")
-        && let Some(path) = docker_host_unix_socket_path(&host)
-    {
-        candidates.push(path);
-    }
-
-    candidates.push(PathBuf::from("/var/run/docker.sock"));
-
-    if let Some(home) = std::env::var_os("HOME") {
-        candidates.push(PathBuf::from(home).join(".docker/run/docker.sock"));
-    }
-
-    if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
-        candidates.push(PathBuf::from(runtime_dir).join("docker.sock"));
-    }
-
-    candidates
-}
-
-fn docker_host_unix_socket_path(host: &str) -> Option<PathBuf> {
-    let path = host.trim().strip_prefix("unix://")?;
-    (!path.is_empty()).then(|| PathBuf::from(path))
-}
-
-#[cfg(unix)]
-fn is_unix_socket(path: &Path) -> bool {
-    path.metadata()
-        .is_ok_and(|metadata| metadata.file_type().is_socket())
-}
-
-#[cfg(unix)]
-fn podman_socket_responds(path: &Path) -> bool {
-    unix_socket_http_ping(path, |response| {
-        http_response_is_success(response) && contains_ascii(response, b"Libpod-Api-Version:")
-    })
-}
-
-#[cfg(unix)]
-fn docker_socket_responds(path: &Path) -> bool {
-    unix_socket_http_ping(path, |response| {
-        http_response_is_success(response)
-            && contains_ascii(response, b"Api-Version:")
-            && !contains_ascii(response, b"Libpod-Api-Version:")
-    })
-}
-
-#[cfg(unix)]
-fn unix_socket_http_ping(path: &Path, accepts_response: impl FnOnce(&[u8]) -> bool) -> bool {
-    const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
-    const PING_REQUEST: &[u8] =
-        b"GET /_ping HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
-
-    if !is_unix_socket(path) {
-        return false;
-    }
-
-    let Ok(mut stream) = std::os::unix::net::UnixStream::connect(path) else {
-        return false;
-    };
-    if stream.set_read_timeout(Some(PROBE_TIMEOUT)).is_err()
-        || stream.set_write_timeout(Some(PROBE_TIMEOUT)).is_err()
-        || stream.write_all(PING_REQUEST).is_err()
-    {
-        return false;
-    }
-
-    let mut response = [0_u8; 512];
-    let mut total = 0;
-    while total < response.len() {
-        let Ok(n) = stream.read(&mut response[total..]) else {
-            return false;
-        };
-        if n == 0 {
-            break;
-        }
-        total += n;
-        if contains_ascii(&response[..total], b"\r\n\r\n") {
-            break;
-        }
-    }
-    total > 0 && accepts_response(&response[..total])
-}
-
-#[cfg(unix)]
-fn http_response_is_success(response: &[u8]) -> bool {
-    response.starts_with(b"HTTP/1.1 200") || response.starts_with(b"HTTP/1.0 200")
-}
-
-#[cfg(unix)]
-fn contains_ascii(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack
-        .windows(needle.len())
-        .any(|window| window.eq_ignore_ascii_case(needle))
-}
-
-#[cfg(all(unix, test))]
-fn is_reachable_unix_socket(path: &Path) -> bool {
-    is_unix_socket(path) && std::os::unix::net::UnixStream::connect(path).is_ok()
-}
-
-#[cfg(all(unix, target_os = "linux"))]
-fn current_uid() -> u32 {
-    use std::os::unix::fs::MetadataExt;
-
-    std::fs::metadata("/proc/self").map_or(0, |metadata| metadata.uid())
-}
-
-#[cfg(not(unix))]
-fn podman_socket_responds(path: &Path) -> bool {
-    let _ = path;
-    false
-}
-
-#[cfg(not(unix))]
-fn docker_socket_responds(path: &Path) -> bool {
-    let _ = path;
-    false
-}
-
 /// Server configuration.
 ///
 /// Built programmatically in [`crate::Config::new`] and the gateway CLI from
@@ -416,6 +187,9 @@ fn docker_socket_responds(path: &Path) -> bool {
 /// `Deserialize` impls for that purpose).
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// Operator-assigned name for this gateway installation.
+    pub name: String,
+
     /// Address to bind the server to.
     pub bind_address: SocketAddr,
 
@@ -444,6 +218,10 @@ pub struct Config {
     /// Gateway user authentication behavior.
     pub auth: GatewayAuthConfig,
 
+    /// Allow the WebSocket tunnel used by authenticated edge proxies.
+    /// Disabled for local gateways by default.
+    pub enable_websocket_tunnel: bool,
+
     /// Disabled-by-default gateway interceptor service configs.
     pub gateway_interceptors: Vec<GatewayInterceptorConfig>,
 
@@ -465,12 +243,9 @@ pub struct Config {
     /// Database URL for persistence.
     pub database_url: String,
 
-    /// Compute drivers configured for the gateway.
-    ///
-    /// The config shape allows multiple drivers so the gateway can evolve
-    /// toward multi-backend routing. Current releases require exactly one
-    /// configured driver.
-    pub compute_drivers: Vec<String>,
+    /// Explicit compute driver configured for the gateway.
+    /// `None` enables runtime auto-detection.
+    pub compute_driver: Option<String>,
 
     /// Operator-provided endpoints for named remote compute drivers.
     ///
@@ -488,6 +263,10 @@ pub struct Config {
 
     /// TTL for SSH session tokens, in seconds. 0 disables expiry.
     pub ssh_session_ttl_secs: u64,
+
+    /// Absolute image preparation and initial supervisor startup budget for new
+    /// sandbox attempts, in seconds. Must be between 1 and 86400, inclusive.
+    pub image_preparation_timeout_seconds: u32,
 
     /// Maximum gRPC requests allowed per rate-limit window.
     ///
@@ -584,8 +363,20 @@ pub struct TlsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OidcConfig {
-    /// OIDC issuer URL (e.g., `http://localhost:8180/realms/openshell`).
+    /// OIDC issuer URL (e.g., `https://idp.example.com/realms/openshell`).
     pub issuer: String,
+
+    /// Permit cleartext OIDC metadata and JWKS requests to numeric loopback
+    /// addresses. This is a development-only escape hatch and never permits
+    /// cleartext requests to hostnames or non-loopback addresses.
+    #[serde(default)]
+    pub dangerously_allow_insecure_http: bool,
+
+    /// Additional origins from which JWKS may be loaded. Entries must be
+    /// origins such as `https://www.googleapis.com`, without a path, query,
+    /// credentials, or fragment. The issuer origin is always allowed.
+    #[serde(default)]
+    pub jwks_allowed_origins: Vec<String>,
 
     /// Expected audience (`aud`) claim. Typically the OIDC client ID.
     pub audience: String,
@@ -615,13 +406,17 @@ pub struct OidcConfig {
     pub scopes_claim: String,
 }
 
-/// mTLS user authentication for local, single-user gateways.
+/// mTLS user authentication for gateway users.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MtlsAuthConfig {
+    /// Enable gateway-wide operators authenticated by verified certificates with OU=operator.
+    /// Independent of ordinary mTLS user authentication; defaults off.
+    #[serde(default)]
+    pub operator_enabled: bool,
     /// When true, the gateway maps a verified TLS client certificate into a
-    /// user principal. Keep disabled for Kubernetes deployments because
-    /// Kubernetes sandbox pods and external users must not share user auth.
+    /// user principal. Sandbox and supervisor clients use bearer identity, so
+    /// this setting is independent of the selected compute driver.
     #[serde(default)]
     pub enabled: bool,
 }
@@ -714,15 +509,44 @@ pub enum GatewayInterceptorBindingPolicy {
 }
 
 /// One configured source in the gateway's effective provider-profile catalog.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// Deserialization is hand-written so that the removed `builtin` source is
+/// recognized and rejected with the migration step, rather than reported as an
+/// unknown variant.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum GatewayProviderProfileSourceConfig {
-    /// Profiles bundled with the `OpenShell` build.
-    Builtin,
     /// Profiles managed through the provider profile mutation APIs.
     User,
     /// Profiles vended by a configured gateway interceptor instance.
     Interceptor { name: String },
+}
+
+pub(crate) const BUILTIN_PROFILE_SOURCE_REMOVED: &str = "provider profile source type \"builtin\" was removed: provider profiles are import-only. \
+     Remove the entry and import the profiles this gateway needs with \
+     'openshell provider profile import --from providers --global'";
+
+impl<'de> Deserialize<'de> for GatewayProviderProfileSourceConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        /// Mirrors the public shape, plus the retired `builtin` tag so it can be
+        /// named in the error instead of surfacing as an unknown variant.
+        #[derive(Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+        enum Shadow {
+            Builtin,
+            User,
+            Interceptor { name: String },
+        }
+
+        match Shadow::deserialize(deserializer)? {
+            Shadow::Builtin => Err(de::Error::custom(BUILTIN_PROFILE_SOURCE_REMOVED)),
+            Shadow::User => Ok(Self::User),
+            Shadow::Interceptor { name } => Ok(Self::Interceptor { name }),
+        }
+    }
 }
 
 /// Failure behavior when an interceptor evaluation cannot produce a valid
@@ -774,6 +598,225 @@ const fn default_jwks_ttl_secs() -> u64 {
     3600
 }
 
+/// Canonical policy controlling when a driver pulls a sandbox image.
+///
+/// Backends translate this shared vocabulary to their runtime API. `newer` is
+/// supported only by Podman; other backends reject it during configuration.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImagePullPolicy {
+    /// Always pull, even if a local image is available.
+    Always,
+    /// Pull only when a local image is unavailable.
+    #[default]
+    IfNotPresent,
+    /// Never pull; fail when a local image is unavailable.
+    Never,
+    /// Pull only when the registry image is newer than the local copy.
+    Newer,
+}
+
+impl ImagePullPolicy {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Always => "always",
+            Self::IfNotPresent => "if_not_present",
+            Self::Never => "never",
+            Self::Newer => "newer",
+        }
+    }
+}
+
+impl fmt::Display for ImagePullPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ImagePullPolicy {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "always" => Ok(Self::Always),
+            "if_not_present" => Ok(Self::IfNotPresent),
+            "never" => Ok(Self::Never),
+            "newer" => Ok(Self::Newer),
+            other => Err(format!(
+                "invalid image pull policy '{other}'; expected one of: always, if_not_present, never, newer"
+            )),
+        }
+    }
+}
+
+/// Canonical `AppArmor` confinement requested for a sandbox container.
+///
+/// Drivers translate this model to their runtime API. An omitted value leaves
+/// the runtime default unchanged; `Unconfined` is explicit because the
+/// supervisor needs mount operations that the default Docker/Podman profile
+/// commonly denies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppArmorProfile {
+    RuntimeDefault,
+    Unconfined,
+    Localhost(String),
+}
+
+impl AppArmorProfile {
+    #[must_use]
+    pub const fn kubernetes_type(&self) -> &'static str {
+        match self {
+            Self::RuntimeDefault => "RuntimeDefault",
+            Self::Unconfined => "Unconfined",
+            Self::Localhost(_) => "Localhost",
+        }
+    }
+
+    #[must_use]
+    pub fn localhost_profile(&self) -> Option<&str> {
+        match self {
+            Self::Localhost(profile) => Some(profile),
+            Self::RuntimeDefault | Self::Unconfined => None,
+        }
+    }
+
+    /// Translate to the OCI `apparmor=<profile>` security option.
+    ///
+    /// `RuntimeDefault` deliberately returns `None`: omitting an OCI option
+    /// asks Docker/Podman to apply their runtime default profile.
+    #[must_use]
+    pub fn oci_security_opt(&self) -> Option<String> {
+        match self {
+            Self::RuntimeDefault => None,
+            Self::Unconfined => Some("apparmor=unconfined".to_string()),
+            Self::Localhost(profile) => Some(format!("apparmor={profile}")),
+        }
+    }
+}
+
+impl fmt::Display for AppArmorProfile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RuntimeDefault => f.write_str("RuntimeDefault"),
+            Self::Unconfined => f.write_str("Unconfined"),
+            Self::Localhost(profile) => write!(f, "Localhost/{profile}"),
+        }
+    }
+}
+
+impl FromStr for AppArmorProfile {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "RuntimeDefault" => Ok(Self::RuntimeDefault),
+            "Unconfined" => Ok(Self::Unconfined),
+            other => match other.strip_prefix("Localhost/") {
+                Some("") => Err(
+                    "invalid AppArmor profile 'Localhost/'; expected non-empty profile name"
+                        .to_string(),
+                ),
+                Some(profile) if !profile.contains(char::is_whitespace) => {
+                    Ok(Self::Localhost(profile.to_string()))
+                }
+                Some(_) => {
+                    Err("invalid AppArmor localhost profile; whitespace is not allowed".to_string())
+                }
+                None => Err(format!(
+                    "unknown AppArmor profile '{other}'; expected 'RuntimeDefault', 'Unconfined', or 'Localhost/<profile-name>'"
+                )),
+            },
+        }
+    }
+}
+
+impl Serialize for AppArmorProfile {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for AppArmorProfile {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::from_str(&value).map_err(de::Error::custom)
+    }
+}
+
+/// Common local-driver corporate forward-proxy settings.
+///
+/// This type is `flatten`ed by local compute-driver tables, preserving the
+/// established TOML field names while keeping their safety contract shared.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct UpstreamProxyConfig {
+    pub https_proxy: Option<String>,
+    pub no_proxy: Option<String>,
+    pub proxy_auth_file: Option<PathBuf>,
+    pub proxy_auth_allow_insecure: Option<bool>,
+    pub proxy_connect_by_hostname: Option<bool>,
+}
+
+impl UpstreamProxyConfig {
+    /// Validate relationships that are independent of the container backend.
+    /// Credential contents are intentionally not read here and are never put
+    /// in an error message; drivers validate and stage them per sandbox.
+    pub fn validate(&self) -> Result<(), String> {
+        use crate::driver_utils::{UpstreamProxyUrlError, parse_upstream_proxy_url};
+
+        let proxy_secure = if let Some(url) = self.https_proxy.as_deref() {
+            parse_upstream_proxy_url(url)
+                .map_err(|err| match err {
+                    UpstreamProxyUrlError::Empty => "https_proxy must not be empty when set".to_string(),
+                    UpstreamProxyUrlError::InlineCredentials => "https_proxy must not embed credentials; supply them with proxy_auth_file so they are not stored in configuration or runtime metadata".to_string(),
+                    err => format!("https_proxy {err}"),
+                })?
+                .secure
+        } else {
+            false
+        };
+
+        if self
+            .no_proxy
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err("no_proxy must not be empty when set; omit it instead".to_string());
+        }
+        if self.no_proxy.is_some() && self.https_proxy.is_none() {
+            return Err("no_proxy is set but no https_proxy is configured".to_string());
+        }
+        if let Some(path) = self.proxy_auth_file.as_ref() {
+            if path.as_os_str().is_empty() {
+                return Err("proxy_auth_file must not be empty when set".to_string());
+            }
+            if self.https_proxy.is_none() {
+                return Err("proxy_auth_file is set but no https_proxy is configured".to_string());
+            }
+            if !proxy_secure && self.proxy_auth_allow_insecure != Some(true) {
+                return Err("proxy_auth_file sends a cleartext Basic credential to an http:// proxy; set proxy_auth_allow_insecure = true to acknowledge that exposure".to_string());
+            }
+        } else if self.proxy_auth_allow_insecure.is_some() {
+            return Err(
+                "proxy_auth_allow_insecure is set but no proxy_auth_file is configured".to_string(),
+            );
+        }
+        if self.proxy_connect_by_hostname.is_some() && self.https_proxy.is_none() {
+            return Err(
+                "proxy_connect_by_hostname is set but no https_proxy is configured".to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
 /// Gateway-minted sandbox JWT configuration.
 ///
 /// Points the gateway at the Ed25519 signing key (produced by `certgen`)
@@ -789,22 +832,33 @@ pub struct GatewayJwtConfig {
     pub public_key_path: PathBuf,
     /// Path to the `kid` value (plain text, one line).
     pub kid_path: PathBuf,
-    /// Stable gateway identity embedded in `iss`/`aud`. Defaults to the
-    /// hostname-or-`openshell` placeholder if unset.
+    /// Stable gateway identity embedded in `iss`/`aud`. Defaults to
+    /// `openshell`.
     #[serde(default = "default_gateway_id")]
     pub gateway_id: String,
-    /// Token lifetime in seconds. A value of 0 disables expiration and is
-    /// intended only for local single-player deployments.
-    #[serde(default = "default_sandbox_token_ttl_secs")]
-    pub ttl_secs: u64,
+    /// Token lifetime in seconds. Omission selects non-expiring sandbox
+    /// session credentials and the default lifetime for extension tokens.
+    /// Explicit zero is invalid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_secs: Option<NonZeroU64>,
+}
+
+impl GatewayJwtConfig {
+    /// Effective typed extension-token lifetime.
+    pub fn token_ttl(&self) -> Duration {
+        self.ttl_secs.map_or(Duration::from_mins(15), |ttl| {
+            Duration::from_secs(ttl.get())
+        })
+    }
+
+    /// Effective sandbox session-token lifetime. `None` is non-expiring.
+    pub fn sandbox_token_ttl(&self) -> Option<Duration> {
+        self.ttl_secs.map(|ttl| Duration::from_secs(ttl.get()))
+    }
 }
 
 fn default_gateway_id() -> String {
     "openshell".to_string()
-}
-
-const fn default_sandbox_token_ttl_secs() -> u64 {
-    0
 }
 
 fn default_roles_claim() -> String {
@@ -823,6 +877,7 @@ impl Config {
     /// Create a new config with optional TLS.
     pub fn new(tls: Option<TlsConfig>) -> Self {
         Self {
+            name: DEFAULT_GATEWAY_NAME.to_string(),
             bind_address: default_bind_address(),
             health_bind_address: None,
             metrics_bind_address: None,
@@ -831,23 +886,29 @@ impl Config {
             tls,
             oidc: None,
             auth: GatewayAuthConfig::default(),
+            enable_websocket_tunnel: false,
             gateway_interceptors: Vec::new(),
-            provider_profile_sources: vec![
-                GatewayProviderProfileSourceConfig::Builtin,
-                GatewayProviderProfileSourceConfig::User,
-            ],
+            provider_profile_sources: vec![GatewayProviderProfileSourceConfig::User],
             mtls_auth: MtlsAuthConfig::default(),
             gateway_jwt: None,
             database_url: String::new(),
-            compute_drivers: vec![],
+            compute_driver: None,
             compute_driver_endpoints: BTreeMap::new(),
             credential_drivers: Vec::new(),
             default_credential_driver: None,
             ssh_session_ttl_secs: default_ssh_session_ttl_secs(),
+            image_preparation_timeout_seconds: 1800,
             grpc_rate_limit_requests: None,
             grpc_rate_limit_window_secs: None,
             service_routing: ServiceRoutingConfig::default(),
         }
+    }
+
+    /// Create a new configuration with the gateway installation name.
+    #[must_use]
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = name.into();
+        self
     }
 
     /// Create a new configuration with the given bind address.
@@ -883,17 +944,10 @@ impl Config {
         self
     }
 
-    /// Create a new configuration with the configured compute drivers.
+    /// Create a new configuration with an explicit compute driver.
     #[must_use]
-    pub fn with_compute_drivers<I, D>(mut self, drivers: I) -> Self
-    where
-        I: IntoIterator<Item = D>,
-        D: ToString,
-    {
-        self.compute_drivers = drivers
-            .into_iter()
-            .map(|driver| driver.to_string())
-            .collect();
+    pub fn with_compute_driver(mut self, driver: impl ToString) -> Self {
+        self.compute_driver = Some(driver.to_string());
         self
     }
 
@@ -1006,6 +1060,13 @@ impl Config {
         self.service_routing.enable_loopback_service_http = enabled;
         self
     }
+
+    /// Enable the WebSocket tunnel for an authenticated edge proxy.
+    #[must_use]
+    pub const fn with_websocket_tunnel(mut self, enabled: bool) -> Self {
+        self.enable_websocket_tunnel = enabled;
+        self
+    }
 }
 
 impl Default for ServiceRoutingConfig {
@@ -1088,48 +1149,13 @@ const fn default_ssh_session_ttl_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        ComputeDriverKind, Config, DEFAULT_SERVICE_ROUTING_DOMAIN, GatewayInterceptorBindingPolicy,
+        AppArmorProfile, Config, DEFAULT_SERVICE_ROUTING_DOMAIN, GatewayInterceptorBindingPolicy,
         GatewayInterceptorConfig, GatewayInterceptorFailurePolicy, GatewayJwtConfig,
-        GatewayProviderProfileSourceConfig, PolicyValidationFailureMode,
-        detect_docker_socket_from_candidates, detect_driver, detect_podman_socket_from_candidates,
-        docker_host_unix_socket_path, docker_socket_responds, normalize_compute_driver_name,
-        podman_socket_candidates_from_env, podman_socket_responds,
+        GatewayProviderProfileSourceConfig, ImagePullPolicy, PolicyValidationFailureMode,
+        UpstreamProxyConfig, default_sandbox_pids_limit, normalize_compute_driver_name,
     };
-    #[cfg(unix)]
-    use super::{is_reachable_unix_socket, is_unix_socket};
-    #[cfg(unix)]
-    use std::io::{Read as _, Write as _};
     use std::net::SocketAddr;
-    #[cfg(unix)]
-    use std::os::unix::net::UnixListener;
-    use std::path::PathBuf;
     use std::time::Duration;
-
-    #[test]
-    fn compute_driver_kind_parses_supported_values() {
-        assert_eq!(
-            "kubernetes".parse::<ComputeDriverKind>().unwrap(),
-            ComputeDriverKind::Kubernetes
-        );
-        assert_eq!(
-            "vm".parse::<ComputeDriverKind>().unwrap(),
-            ComputeDriverKind::Vm
-        );
-        assert_eq!(
-            "podman".parse::<ComputeDriverKind>().unwrap(),
-            ComputeDriverKind::Podman
-        );
-        assert_eq!(
-            "docker".parse::<ComputeDriverKind>().unwrap(),
-            ComputeDriverKind::Docker
-        );
-    }
-
-    #[test]
-    fn compute_driver_kind_rejects_unknown_values() {
-        let err = "firecracker".parse::<ComputeDriverKind>().unwrap_err();
-        assert!(err.contains("unsupported compute driver 'firecracker'"));
-    }
 
     #[test]
     fn policy_validation_failure_mode_is_secure_by_default() {
@@ -1177,14 +1203,42 @@ mod tests {
     }
 
     #[test]
-    fn config_defaults_to_builtin_and_user_provider_profile_sources() {
+    fn config_defaults_to_the_user_provider_profile_source() {
         let cfg = Config::new(None);
         assert_eq!(
             cfg.provider_profile_sources,
-            vec![
-                GatewayProviderProfileSourceConfig::Builtin,
-                GatewayProviderProfileSourceConfig::User,
-            ]
+            vec![GatewayProviderProfileSourceConfig::User]
+        );
+    }
+
+    #[test]
+    fn builtin_provider_profile_source_is_rejected_with_the_import_step() {
+        let error =
+            serde_json::from_str::<GatewayProviderProfileSourceConfig>(r#"{"type":"builtin"}"#)
+                .expect_err("the builtin source was removed");
+        let message = error.to_string();
+        assert!(message.contains("import-only"), "{message}");
+        assert!(
+            message.contains("openshell provider profile import"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn user_and_interceptor_provider_profile_sources_still_parse() {
+        assert_eq!(
+            serde_json::from_str::<GatewayProviderProfileSourceConfig>(r#"{"type":"user"}"#)
+                .unwrap(),
+            GatewayProviderProfileSourceConfig::User
+        );
+        assert_eq!(
+            serde_json::from_str::<GatewayProviderProfileSourceConfig>(
+                r#"{"type":"interceptor","name":"governance"}"#
+            )
+            .unwrap(),
+            GatewayProviderProfileSourceConfig::Interceptor {
+                name: "governance".to_string()
+            }
         );
     }
 
@@ -1212,7 +1266,7 @@ mod tests {
     }
 
     #[test]
-    fn gateway_jwt_ttl_defaults_to_non_expiring() {
+    fn gateway_jwt_omitted_ttl_defaults_extension_and_nonexpiring_session_tokens() {
         let cfg: GatewayJwtConfig = serde_json::from_value(serde_json::json!({
             "signing_key_path": "/tmp/signing.pem",
             "public_key_path": "/tmp/public.pem",
@@ -1220,7 +1274,253 @@ mod tests {
         }))
         .expect("gateway JWT config should deserialize with default ttl");
 
-        assert_eq!(cfg.ttl_secs, 0);
+        assert_eq!(cfg.ttl_secs, None);
+        assert_eq!(cfg.token_ttl(), Duration::from_mins(15));
+        assert_eq!(cfg.sandbox_token_ttl(), None);
+
+        let serialized = serde_json::to_value(&cfg).expect("gateway JWT config serializes");
+        assert!(serialized.get("ttl_secs").is_none());
+    }
+
+    #[test]
+    fn gateway_jwt_positive_ttl_serializes_and_has_effective_duration() {
+        let cfg: GatewayJwtConfig = serde_json::from_value(serde_json::json!({
+            "signing_key_path": "/tmp/signing.pem",
+            "public_key_path": "/tmp/public.pem",
+            "kid_path": "/tmp/kid",
+            "ttl_secs": 3600
+        }))
+        .expect("gateway JWT config should deserialize with positive ttl");
+
+        assert_eq!(cfg.token_ttl(), Duration::from_hours(1));
+        assert_eq!(cfg.sandbox_token_ttl(), Some(Duration::from_hours(1)));
+        let serialized = serde_json::to_value(&cfg).expect("gateway JWT config serializes");
+        assert_eq!(serialized["ttl_secs"], 3600);
+    }
+
+    #[test]
+    fn gateway_jwt_ttl_rejects_zero() {
+        let error = serde_json::from_value::<GatewayJwtConfig>(serde_json::json!({
+            "signing_key_path": "/tmp/signing.pem",
+            "public_key_path": "/tmp/public.pem",
+            "kid_path": "/tmp/kid",
+            "ttl_secs": 0
+        }))
+        .expect_err("zero TTL must be rejected");
+        assert!(error.to_string().contains("invalid value: integer `0`"));
+    }
+
+    #[test]
+    fn image_pull_policy_uses_canonical_vocabulary() {
+        for (value, expected) in [
+            ("always", ImagePullPolicy::Always),
+            ("if_not_present", ImagePullPolicy::IfNotPresent),
+            ("never", ImagePullPolicy::Never),
+            ("newer", ImagePullPolicy::Newer),
+        ] {
+            assert_eq!(value.parse::<ImagePullPolicy>(), Ok(expected));
+            assert_eq!(expected.to_string(), value);
+            assert_eq!(serde_json::to_value(expected).unwrap(), value);
+        }
+        assert!("missing".parse::<ImagePullPolicy>().is_err());
+        assert!("IfNotPresent".parse::<ImagePullPolicy>().is_err());
+    }
+
+    #[test]
+    fn app_armor_profiles_round_trip_and_translate_for_each_backend() {
+        for (value, expected, kubernetes_type, localhost_profile, oci_security_opt) in [
+            (
+                "RuntimeDefault",
+                AppArmorProfile::RuntimeDefault,
+                "RuntimeDefault",
+                None,
+                None,
+            ),
+            (
+                "Unconfined",
+                AppArmorProfile::Unconfined,
+                "Unconfined",
+                None,
+                Some("apparmor=unconfined"),
+            ),
+            (
+                "Localhost/openshell-supervisor",
+                AppArmorProfile::Localhost("openshell-supervisor".to_string()),
+                "Localhost",
+                Some("openshell-supervisor"),
+                Some("apparmor=openshell-supervisor"),
+            ),
+        ] {
+            let parsed = value.parse::<AppArmorProfile>().expect("valid profile");
+            assert_eq!(parsed, expected);
+            assert_eq!(parsed.to_string(), value);
+            assert_eq!(parsed.kubernetes_type(), kubernetes_type);
+            assert_eq!(parsed.localhost_profile(), localhost_profile);
+            assert_eq!(parsed.oci_security_opt().as_deref(), oci_security_opt);
+
+            let json = serde_json::to_value(&parsed).expect("profile serializes");
+            assert_eq!(json, value);
+            assert_eq!(
+                serde_json::from_value::<AppArmorProfile>(json).expect("profile deserializes"),
+                parsed
+            );
+        }
+
+        for invalid in [
+            "Localhost/",
+            "Localhost/openshell profile",
+            "runtimeDefault",
+            "unconfined",
+            "Unknown",
+        ] {
+            assert!(
+                invalid.parse::<AppArmorProfile>().is_err(),
+                "{invalid} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn upstream_proxy_validation_enforces_cross_field_contract() {
+        let auth_file = Some("/run/secrets/proxy-auth".into());
+        let cases = [
+            ("default", UpstreamProxyConfig::default(), None),
+            (
+                "https auth",
+                UpstreamProxyConfig {
+                    https_proxy: Some("https://proxy.example:8443".to_string()),
+                    proxy_auth_file: auth_file.clone(),
+                    ..Default::default()
+                },
+                None,
+            ),
+            (
+                "acknowledged http auth",
+                UpstreamProxyConfig {
+                    https_proxy: Some("http://proxy.example:8080".to_string()),
+                    proxy_auth_file: auth_file.clone(),
+                    proxy_auth_allow_insecure: Some(true),
+                    ..Default::default()
+                },
+                None,
+            ),
+            (
+                "unacknowledged http auth",
+                UpstreamProxyConfig {
+                    https_proxy: Some("http://proxy.example:8080".to_string()),
+                    proxy_auth_file: auth_file.clone(),
+                    ..Default::default()
+                },
+                Some("proxy_auth_allow_insecure"),
+            ),
+            (
+                "no_proxy without proxy",
+                UpstreamProxyConfig {
+                    no_proxy: Some("localhost".to_string()),
+                    ..Default::default()
+                },
+                Some("no_proxy"),
+            ),
+            (
+                "blank no_proxy",
+                UpstreamProxyConfig {
+                    https_proxy: Some("https://proxy.example:8443".to_string()),
+                    no_proxy: Some("  ".to_string()),
+                    ..Default::default()
+                },
+                Some("no_proxy"),
+            ),
+            (
+                "auth file without proxy",
+                UpstreamProxyConfig {
+                    proxy_auth_file: auth_file,
+                    ..Default::default()
+                },
+                Some("proxy_auth_file"),
+            ),
+            (
+                "ack without auth file",
+                UpstreamProxyConfig {
+                    https_proxy: Some("http://proxy.example:8080".to_string()),
+                    proxy_auth_allow_insecure: Some(true),
+                    ..Default::default()
+                },
+                Some("proxy_auth_allow_insecure"),
+            ),
+            (
+                "hostname mode without proxy",
+                UpstreamProxyConfig {
+                    proxy_connect_by_hostname: Some(true),
+                    ..Default::default()
+                },
+                Some("proxy_connect_by_hostname"),
+            ),
+            (
+                "empty proxy",
+                UpstreamProxyConfig {
+                    https_proxy: Some(String::new()),
+                    ..Default::default()
+                },
+                Some("https_proxy"),
+            ),
+            (
+                "inline credentials",
+                UpstreamProxyConfig {
+                    https_proxy: Some(
+                        "https://secret-user:secret-password@proxy.example:8443".to_string(),
+                    ),
+                    ..Default::default()
+                },
+                Some("must not embed credentials"),
+            ),
+        ];
+
+        for (name, config, expected_error) in cases {
+            match expected_error {
+                None => config
+                    .validate()
+                    .unwrap_or_else(|error| panic!("{name}: {error}")),
+                Some(expected) => {
+                    let error = match config.validate() {
+                        Ok(()) => panic!("{name} should fail validation"),
+                        Err(error) => error,
+                    };
+                    assert!(error.contains(expected), "{name}: {error}");
+                    assert!(!error.contains("secret-user"), "{name}: {error}");
+                    assert!(!error.contains("secret-password"), "{name}: {error}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn config_defaults_and_builder_use_singular_compute_driver() {
+        let config = Config::new(None);
+        assert_eq!(config.compute_driver, None);
+        assert_eq!(
+            Config::new(None)
+                .with_compute_driver("podman")
+                .compute_driver
+                .as_deref(),
+            Some("podman")
+        );
+    }
+
+    #[test]
+    fn typed_sandbox_pids_default_matches_positive_constant() {
+        assert_eq!(
+            default_sandbox_pids_limit().map(std::num::NonZeroI64::get),
+            Some(super::DEFAULT_SANDBOX_PIDS_LIMIT)
+        );
+    }
+
+    #[test]
+    fn name_defaults_and_can_be_overridden() {
+        assert_eq!(Config::new(None).name, "openshell");
+        assert_eq!(
+            Config::new(None).with_name("production-us-west").name,
+            "production-us-west"
+        );
     }
 
     #[test]
@@ -1284,7 +1584,7 @@ mod tests {
             Config::new(None)
                 .with_grpc_rate_limit(Some(10), Some(60))
                 .grpc_rate_limit(),
-            Some((10, Duration::from_secs(60)))
+            Some((10, Duration::from_mins(1)))
         );
     }
 
@@ -1342,244 +1642,6 @@ mod tests {
     }
 
     #[test]
-    fn detect_driver_returns_none_without_k8s_env_or_local_runtime() {
-        // When KUBERNETES_SERVICE_HOST is not set, no Docker binary/socket is
-        // available, and no Podman API socket is available, detect_driver
-        // should return None.
-        // This test may pass or fail depending on the test environment,
-        // but it documents the expected behavior.
-        let _ = detect_driver(); // Returns Some or None based on environment
-    }
-
-    #[test]
-    fn docker_host_unix_socket_path_parses_unix_hosts() {
-        assert_eq!(
-            docker_host_unix_socket_path("unix:///var/run/docker.sock"),
-            Some(PathBuf::from("/var/run/docker.sock"))
-        );
-        assert_eq!(docker_host_unix_socket_path("tcp://127.0.0.1:2375"), None);
-        assert_eq!(docker_host_unix_socket_path("unix://"), None);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn is_unix_socket_detects_socket_files() {
-        let temp_dir = tempfile::tempdir().expect("create temp dir");
-        let socket_path = temp_dir.path().join("docker.sock");
-        let _listener = UnixListener::bind(&socket_path).expect("bind unix socket");
-
-        assert!(is_unix_socket(&socket_path));
-        assert!(is_reachable_unix_socket(&socket_path));
-
-        let regular_file = temp_dir.path().join("not-a-socket");
-        std::fs::write(&regular_file, b"not a socket").expect("write regular file");
-        assert!(!is_unix_socket(&regular_file));
-        assert!(!is_reachable_unix_socket(&regular_file));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[ignore = "flaky under concurrent test execution"]
-    fn podman_socket_probe_accepts_successful_ping_response() {
-        let temp_dir = tempfile::tempdir().expect("create temp dir");
-        let socket_path = temp_dir.path().join("podman.sock");
-        let listener = UnixListener::bind(&socket_path).expect("bind podman socket");
-
-        let handle = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept podman probe");
-            let mut request = [0_u8; 128];
-            let n = stream.read(&mut request).expect("read podman probe");
-            assert!(request[..n].starts_with(b"GET /_ping HTTP/1.1\r\n"));
-            stream
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nLibpod-Api-Version: 5.8.2\r\nContent-Length: 2\r\n\r\nOK",
-                )
-                .expect("write podman ping response");
-        });
-
-        assert!(podman_socket_responds(&socket_path));
-        handle.join().expect("probe server exits");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[ignore = "flaky under concurrent test execution"]
-    fn podman_socket_probe_rejects_docker_ping_response() {
-        let temp_dir = tempfile::tempdir().expect("create temp dir");
-        let socket_path = temp_dir.path().join("podman.sock");
-        let listener = UnixListener::bind(&socket_path).expect("bind podman socket");
-
-        let handle = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept podman probe");
-            let mut request = [0_u8; 128];
-            let n = stream.read(&mut request).expect("read podman probe");
-            assert!(request[..n].starts_with(b"GET /_ping HTTP/1.1\r\n"));
-            stream
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nServer: Docker/29.2.1\r\nContent-Length: 2\r\n\r\nOK",
-                )
-                .expect("write docker ping response");
-        });
-
-        assert!(!podman_socket_responds(&socket_path));
-        handle.join().expect("probe server exits");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[ignore = "flaky under concurrent test execution"]
-    fn docker_socket_probe_accepts_successful_ping_response() {
-        let temp_dir = tempfile::tempdir().expect("create temp dir");
-        let socket_path = temp_dir.path().join("docker.sock");
-        let listener = UnixListener::bind(&socket_path).expect("bind docker socket");
-
-        let handle = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept docker probe");
-            let mut request = [0_u8; 128];
-            let n = stream.read(&mut request).expect("read docker probe");
-            assert!(request[..n].starts_with(b"GET /_ping HTTP/1.1\r\n"));
-            stream
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nApi-Version: 1.51\r\nDocker-Experimental: false\r\nContent-Length: 2\r\n\r\nOK",
-                )
-                .expect("write docker ping response");
-        });
-
-        assert!(docker_socket_responds(&socket_path));
-        handle.join().expect("probe server exits");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[ignore = "flaky under concurrent test execution"]
-    fn docker_socket_probe_rejects_podman_ping_response() {
-        let temp_dir = tempfile::tempdir().expect("create temp dir");
-        let socket_path = temp_dir.path().join("podman.sock");
-        let listener = UnixListener::bind(&socket_path).expect("bind podman socket");
-
-        let handle = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept docker probe");
-            let mut request = [0_u8; 128];
-            let n = stream.read(&mut request).expect("read docker probe");
-            assert!(request[..n].starts_with(b"GET /_ping HTTP/1.1\r\n"));
-            stream
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nLibpod-Api-Version: 5.8.2\r\nContent-Length: 2\r\n\r\nOK",
-                )
-                .expect("write podman ping response");
-        });
-
-        assert!(!docker_socket_responds(&socket_path));
-        handle.join().expect("probe server exits");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn docker_socket_probe_rejects_inactive_socket() {
-        let temp_dir = tempfile::tempdir().expect("create temp dir");
-        let socket_path = temp_dir.path().join("docker.sock");
-        let listener = UnixListener::bind(&socket_path).expect("bind docker socket");
-        drop(listener);
-
-        assert!(is_unix_socket(&socket_path));
-        assert!(!docker_socket_responds(&socket_path));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[ignore = "flaky under concurrent test execution"]
-    fn docker_socket_detection_returns_the_responsive_candidate() {
-        let temp_dir = tempfile::tempdir().expect("create temp dir");
-        let inactive_path = temp_dir.path().join("inactive.sock");
-        let inactive_listener = UnixListener::bind(&inactive_path).expect("bind inactive socket");
-        drop(inactive_listener);
-
-        let responsive_path = temp_dir.path().join("responsive.sock");
-        let listener = UnixListener::bind(&responsive_path).expect("bind responsive socket");
-        let handle = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept docker probe");
-            let mut request = [0_u8; 128];
-            let _ = stream.read(&mut request).expect("read docker probe");
-            stream
-                .write_all(b"HTTP/1.1 200 OK\r\nApi-Version: 1.51\r\nContent-Length: 2\r\n\r\nOK")
-                .expect("write docker ping response");
-        });
-
-        assert_eq!(
-            detect_docker_socket_from_candidates(&[inactive_path, responsive_path.clone(),]),
-            Some(responsive_path)
-        );
-        handle.join().expect("probe server exits");
-    }
-
-    #[test]
-    fn podman_socket_candidates_include_env_runtime_and_home_paths() {
-        let candidates = podman_socket_candidates_from_env(
-            Some(PathBuf::from("/tmp/custom-podman.sock")),
-            Some(PathBuf::from("/tmp/runtime")),
-            Some(PathBuf::from("/tmp/home")),
-        );
-
-        assert!(candidates.contains(&PathBuf::from("/tmp/custom-podman.sock")));
-        assert!(candidates.contains(&PathBuf::from("/tmp/runtime/podman/podman.sock")));
-        assert!(candidates.contains(&PathBuf::from(
-            "/tmp/home/.local/share/containers/podman/machine/podman.sock"
-        )));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[ignore = "flaky under concurrent test execution"]
-    fn podman_socket_detection_returns_the_responsive_candidate() {
-        let temp_dir = tempfile::tempdir().expect("create temp dir");
-        let inactive_path = temp_dir.path().join("inactive.sock");
-        let inactive_listener = UnixListener::bind(&inactive_path).expect("bind inactive socket");
-        drop(inactive_listener);
-
-        let responsive_path = temp_dir.path().join("responsive.sock");
-        let listener = UnixListener::bind(&responsive_path).expect("bind responsive socket");
-        let handle = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept podman probe");
-            let mut request = [0_u8; 128];
-            let _ = stream.read(&mut request).expect("read podman probe");
-            stream
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nLibpod-Api-Version: 5.8.2\r\nContent-Length: 2\r\n\r\nOK",
-                )
-                .expect("write podman ping response");
-        });
-
-        assert_eq!(
-            detect_podman_socket_from_candidates(&[inactive_path, responsive_path.clone(),]),
-            Some(responsive_path)
-        );
-        handle.join().expect("probe server exits");
-    }
-
-    #[test]
-    #[allow(unsafe_code)] // std::env::set_var/remove_var require unsafe in Rust 2024
-    fn detect_driver_prefers_kubernetes_when_k8s_env_is_set() {
-        // Save the original env var
-        let original = std::env::var("KUBERNETES_SERVICE_HOST").ok();
-
-        // Set the env var
-        unsafe {
-            std::env::set_var("KUBERNETES_SERVICE_HOST", "127.0.0.1");
-        }
-
-        let result = detect_driver();
-        assert_eq!(result, Some(ComputeDriverKind::Kubernetes));
-
-        // Restore the original env var
-        unsafe {
-            match original {
-                Some(val) => std::env::set_var("KUBERNETES_SERVICE_HOST", val),
-                None => std::env::remove_var("KUBERNETES_SERVICE_HOST"),
-            }
-        }
-    }
-
-    #[test]
     fn supervisor_image_tag_prefers_explicit_build_tags() {
         use super::resolve_supervisor_image_tag;
         assert_eq!(
@@ -1610,10 +1672,30 @@ mod tests {
 
     #[test]
     fn default_supervisor_image_is_version_pinned() {
-        use super::default_supervisor_image;
-        let image = default_supervisor_image();
+        use super::{compiled_sandbox_runtime_image, compiled_supervisor_image};
+        let image = compiled_supervisor_image();
         assert!(image.starts_with("ghcr.io/nvidia/openshell/supervisor:"));
         let tag = image.rsplit_once(':').unwrap().1;
         assert!(!tag.is_empty());
+
+        let sandbox_image = compiled_sandbox_runtime_image();
+        assert!(sandbox_image.starts_with("ghcr.io/nvidia/openshell/sandbox:"));
+        let sandbox_tag = sandbox_image.rsplit_once(':').unwrap().1;
+        assert!(!sandbox_tag.is_empty());
+    }
+
+    #[test]
+    fn runtime_image_environment_value_replaces_compiled_default() {
+        use super::runtime_image_default;
+
+        let digest = format!("registry.example.com/sandbox@sha256:{}", "a".repeat(64));
+        assert_eq!(
+            runtime_image_default(Some(digest.clone()), "compiled:default".to_string()),
+            digest
+        );
+        assert_eq!(
+            runtime_image_default(None, "compiled:default".to_string()),
+            "compiled:default"
+        );
     }
 }

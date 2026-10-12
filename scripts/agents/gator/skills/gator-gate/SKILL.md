@@ -30,17 +30,24 @@ gh api --method POST repos/NVIDIA/OpenShell/issues/<number>/labels -f labels[]="
 gh api --method DELETE repos/NVIDIA/OpenShell/issues/<number>/labels/gator%3Ablocked --silent || true
 ```
 
-If a required GitHub REST read or write fails with `EOF`, `Empty reply from server`, or a sandbox `NET:FAIL` after the current policy shows the endpoint was allowed, treat it as a transient transport or provider failure. Do not convert the PR or issue to `gator:blocked`, do not report it as a rate-limit/auth failure, and do not keep probing optional endpoints such as `/rate_limit`. In supervised watch mode, finish with `OPENSHELL_AGENT_RESULT {"status":"transient_failure","next_poll_seconds":120,"reason":"github_transport_eof"}` so the supervisor retries soon.
+If a required GitHub REST read or write fails with `EOF`, `Empty reply from server`, or a sandbox `NET:FAIL` after the current policy shows the endpoint was allowed, treat it as a transient transport or provider failure. Do not convert the PR or issue to `gator:blocked`, do not report it as a rate-limit/auth failure, and do not keep probing optional endpoints such as `/rate_limit`. In supervised watch mode, finish with `OPENSHELL_AGENT_RESULT {"status":"transient_failure","next_poll_seconds":120,"reason":"github_transport_eof","notes":"GitHub transport failed after policy allowed the request. The supervisor should retry without changing the PR state."}` so the supervisor retries soon.
 
-If the `principal-engineer-reviewer` sub-agent fails before producing usable review output, treat that as transient gator infrastructure failure, not as a PR blocker. This includes Codex auth or token-refresh failures, model transport failures, sub-agent command failures, empty reviewer output, malformed reviewer output, and sandbox policy denials that only affect the sub-agent harness. Do not post a marked gator comment or PR review, do not apply `gator:blocked`, and do not consume the one-disposition-per-head-SHA slot. In supervised watch mode, finish with `OPENSHELL_AGENT_RESULT {"status":"transient_failure","next_poll_seconds":120,"reason":"reviewer_subagent_failed"}` so the supervisor retries after the operator or provider issue clears.
+If the `principal-engineer-reviewer` sub-agent fails before producing usable review output, treat that as transient gator infrastructure failure, not as a PR blocker. This includes Codex auth or token-refresh failures, model transport failures, sub-agent command failures, empty reviewer output, malformed reviewer output, and sandbox policy denials that only affect the sub-agent harness. Do not post a marked gator comment or PR review, do not apply `gator:blocked`, and do not consume the one-disposition-per-head-SHA slot. In supervised watch mode, finish with `OPENSHELL_AGENT_RESULT {"status":"transient_failure","next_poll_seconds":120,"reason":"reviewer_subagent_failed","notes":"The reviewer did not produce usable feedback, so no PR state was changed. The supervisor should retry the review."}` so the supervisor retries after the operator or provider issue clears.
 
 ## Authority Rules
 
 - Do not push commits to a contributor's PR branch by default.
 - You may push changes only when explicitly instructed by a GitHub comment from a maintainer or by a direct operator prompt.
-- Do not post `/ok to test <sha>` unless the current GitHub user has maintainer authority.
+- Do not post `/ok to test <full-head-sha>` unless the current GitHub user has maintainer authority.
 - Code review is code-only. Do not run pre-commit, unit tests, or E2E locally as part of the initial PR review unless explicitly instructed.
-- Security vulnerabilities must not be triaged through public GitHub issues. Follow `SECURITY.md`.
+- Surface security-related findings introduced or newly exposed by an unmerged
+  PR in that PR's normal review, using the same evidence, severity, and blocker
+  rules as other findings. A security classification alone does not require
+  private triage or suspend operator-authorized test dispatch.
+- For pre-existing vulnerabilities independent of the PR, follow `SECURITY.md`:
+  retain detailed evidence privately and notify the operator without publishing
+  exploit details. Do not initiate external disclosure, contact PSIRT, or submit
+  a security report without explicit operator authorization.
 
 Maintainer authority means one of:
 
@@ -132,12 +139,24 @@ Treat the ledger as required reviewer input, not optional background:
 - Use `current_patch_id`, `previous_reviewed_patch_id`, base SHA, and merge-base
   SHA to preserve review identity across rebases and merge-main commits. If
   `rebase_equivalent` is true, do not review the same effective patch again.
+- A null `current_patch_id` disables patch-equivalence shortcuts; it does not
+  invalidate the feedback ledger. Preserve exact-SHA history and review the
+  author-only delta conservatively when the head changed.
+- For large PRs, fetch the exact commits and inspect local `git diff` output
+  file-by-file. Do not depend on `gh pr diff` or GitHub's full-diff endpoint:
+  those reject oversized diffs. Review schema/generated changes separately
+  from handwritten behavior, without silently excluding them from scope.
 - For a non-equivalent rebase, compare author patch IDs or use `git range-diff`
   to isolate the author-only delta. Upstream changes are context, not new PR
   findings.
 - Carry every still-open finding forward as an existing obligation. Do not post
   a new thread or semantically equivalent general finding for it.
 - A Gator thread resolved by a verified maintainer is addressed. If the resolver is only the PR author, inspect the trusted reply and latest diff to decide whether the finding was fixed; resolution alone does not grant a non-maintainer author waiver authority.
+- When a later commit demonstrably fixes an open inline Gator finding, resolve
+  that Gator-owned GitHub review thread as part of the same reconciliation
+  cycle. Also resolve it after a verified maintainer explicitly waives the
+  finding. Do not resolve a thread merely because it is outdated, the author
+  says it is fixed, or a new review omits it.
 - Preserve a verified maintainer's reply as the rationale. An explicit rejection such as "invalid", "intentional", "fine as implemented", or "won't fix" is a waiver, not an unanswered request.
 - An unresolved thread with an explicit verified-maintainer waiver is also waived. A non-maintainer author's disagreement remains context for review but does not override a maintainer-required change.
 - Preserve each `GATOR-<origin-sha-prefix>-<ordinal>` finding ID across later
@@ -151,6 +170,33 @@ Treat the ledger as required reviewer input, not optional background:
 - Record the ledger's `review_telemetry` in the internal cycle summary. Treat a
   nonzero duplicate finding-ID count, a waived finding reappearing, or an
   unchanged-code proposal as a reviewer-quality signal, not an author defect.
+
+### Resolve addressed Gator threads
+
+After checking the new diff and trusted replies, partition every open ledger
+finding into still-open, fixed by the current head, or explicitly waived by a
+verified maintainer. Before posting the current-head disposition or advancing
+out of review, resolve each fixed or waived inline Gator thread by stable
+finding ID:
+
+```bash
+resolve-gator-review-threads \
+  /tmp/gator-review-feedback-ledger.json \
+  GATOR-<origin-sha-prefix>-<ordinal> [...]
+```
+
+The resolver accepts only exact threads from the feedback ledger whose first
+comment carries the Gator marker. Never resolve a human-owned review thread, a
+still-open finding, or a thread whose disposition is ambiguous. General
+findings and issue comments have no review thread to resolve; retain their
+durable disposition in the ledger.
+
+Thread resolution is required housekeeping for an addressed inline finding,
+not a new review disposition, and does not consume the one-disposition-per-head
+SHA slot. If GitHub does not confirm every requested resolution, do not advance
+the Gator state or post the follow-up disposition. Return
+`OPENSHELL_AGENT_RESULT {"status":"transient_failure","next_poll_seconds":120,"reason":"review_thread_resolution_failed","notes":"GitHub did not confirm every requested Gator thread resolution. Retry reconciliation before advancing the PR state."}`
+and retry the reconciliation later.
 
 ## Labels
 
@@ -350,7 +396,7 @@ For closed-unmerged PRs:
 
 For closed or merged PRs that have no active `gator:*` label and already have a monitoring-complete gator comment, take no GitHub write action.
 
-In supervised watch mode, return `OPENSHELL_AGENT_RESULT {"status":"complete","reason":"pr_merged"}` or `OPENSHELL_AGENT_RESULT {"status":"complete","reason":"pr_closed"}` only when all targeted PRs in the cycle are closed, merged, or otherwise complete. If any targeted PR still needs future reconciliation, return the appropriate `waiting` or `blocked` sentinel for the active work.
+In supervised watch mode, return `OPENSHELL_AGENT_RESULT {"status":"complete","reason":"pr_merged","notes":"The monitored PR was merged, so Gator monitoring is complete."}` or `OPENSHELL_AGENT_RESULT {"status":"complete","reason":"pr_closed","notes":"The monitored PR was closed without merging, so Gator monitoring is complete."}` only when all targeted PRs in the cycle are closed, merged, or otherwise complete. If any targeted PR still needs future reconciliation, return the appropriate `waiting` or `blocked` sentinel for the active work.
 
 ## Watch Loop Rules
 
@@ -359,10 +405,10 @@ Every gator state is a watch state. On each invocation, determine the current st
 When `OPENSHELL_AGENT_RUN_MODE=watch`, the OpenShell agent supervisor owns the sleep/relaunch loop. In that mode, perform exactly one reconciliation cycle, do not run `sleep 900` or an unbounded polling loop inside the harness, and finish with a single final-line result sentinel:
 
 ```text
-OPENSHELL_AGENT_RESULT {"status":"waiting","next_poll_seconds":900,"reason":"checks_pending"}
+OPENSHELL_AGENT_RESULT {"status":"waiting","next_poll_seconds":900,"reason":"checks_pending","notes":"Required checks are still running on the current head. Gator will inspect the results next cycle."}
 ```
 
-Use `status=waiting` for routine CI/PR activity waits, `status=blocked` for human or process blockers, `status=complete` for closed or merged PRs and other complete items, `status=terminal_failure` for unrecoverable errors, and `status=transient_failure` only when the supervisor should retry soon. The supervisor will sleep and invoke the harness again with fresh GitHub state.
+Use `status=waiting` for routine CI/PR activity waits, `status=blocked` for human or process blockers, `status=complete` for closed or merged PRs and other complete items, `status=terminal_failure` for unrecoverable errors, and `status=transient_failure` only when the supervisor should retry soon. Every sentinel must include `notes`: one or two concise, plain-language sentences that summarize the current diagnosis, identify any notable issue or unanswered question, and state the next useful action or owner. Make the notes understandable when read aloud. Do not repeat mechanical metadata, dump raw logs, or include secrets. The supervisor will persist the result, sleep, and invoke the harness again with fresh GitHub state.
 
 When not running under supervised watch mode, do not stop after a one-shot check when a PR is in an active waiting state unless the operator explicitly asks for a one-shot status check. Enter a polling loop and state the interval and stop conditions before waiting.
 
@@ -408,7 +454,7 @@ Move to `gator:blocked` when any of these apply:
 - PR is blocked by the vouch system or was auto-closed for lack of vouch
 - DCO is missing or failing
 - PR has merge conflicts or `mergeStateStatus` indicates dirty/blocked for conflict reasons
-- Required `/ok to test <sha>` is needed and the current user lacks maintainer authority
+- Required `/ok to test <full-head-sha>` is needed and the current user lacks maintainer authority
 - Required CI cannot run because the copy-pr mirror is missing or stale and maintainer authority is unavailable
 
 For auto-closed vouch-gate PRs, do not treat the proposal as invalid. Comment only if useful, then stop and wait until the author is vouched and the PR is reopened.
@@ -499,9 +545,9 @@ Validate small and concentrated work when it has clear motivation and one of the
 
 Documentation changes from non-maintainers must not reorder ToC items, change fundamental hierarchy, or restructure docs without a clear maintainer-approved reason.
 
-### Provider V2 and Credential Support
+### Provider Profiles and Credential Support
 
-Provider V2 work is a supported high-traction area, but require all of the following:
+Provider-profile work is a supported high-traction area, but requires all of the following:
 
 - Clear UX path for how users configure and use the provider feature in OpenShell
 - Clear statement of why the change is important
@@ -509,7 +555,13 @@ Provider V2 work is a supported high-traction area, but require all of the follo
 - Security boundary analysis for credential handling
 - Explanation of whether secrets remain hidden from the sandbox agent
 
-Provider additions and updates must use providers v2 through provider profiles. Treat any new or modified legacy `ProviderDiscoverySpec` entries as a blocking review finding unless a maintainer explicitly requests the legacy path. Do not ask contributors to update both systems for compatibility; the provider profile is the source of truth for new provider network policy, credentials, discovery, and refresh metadata.
+Provider profiles are the authoritative provider model. Provider additions and
+updates must define their network policy, credentials, discovery, refresh
+metadata, and user-facing semantics through a built-in or imported profile.
+Treat any new or modified legacy `ProviderDiscoverySpec` entries as a blocking
+review finding unless a maintainer explicitly requests the legacy path. Do not
+ask contributors to update both systems for compatibility or to enable a
+gateway feature switch; profile-backed behavior is always active.
 
 Be skeptical of changes that expose raw credentials to agents or weaken the credential proxy model, even if the user story is clear.
 
@@ -606,6 +658,14 @@ Keep reviews proportional, scope-bound, and convergent:
 - Route pre-existing security defects through the private security process.
   Do not publish exploit details or make them blockers on the current PR.
   Route other pre-existing defects to a non-blocking follow-up.
+- A pre-existing unsafe primitive does not make a new PR-owned exposure
+  pre-existing. Compare base and head: if the PR creates a new reachable path,
+  trusted sink, or security contract that makes the defect exploitable, surface
+  the regression in the PR review with its invariant, impact, fix, and verification.
+  Do not substitute a generic private-security notice for actionable feedback
+  or invent a `private_security_review_required` gate solely because the finding
+  is security-related. Existing review blockers still follow normal state rules;
+  this distinction does not waive findings or authorize tests otherwise forbidden.
 - Treat docs, skill drift, diagnostic wording, and test-strength feedback as
   non-blocking unless the published contract is materially false, the
   diagnostic causes an operational or safety failure, or missing coverage
@@ -746,10 +806,50 @@ Post findings using these rules:
 - Submit all inline comments for a head SHA together in one `COMMENT` review. The review summary plus its complete inline-comment batch is the single gator disposition for that SHA.
 - Begin the review summary and each inline body with `> **gator-agent**`. Put the current head SHA in the summary using the canonical `Head SHA: <sha>` field.
 - Put the stable finding ID in every blocking summary item and inline comment.
-- In each blocker, state reachability, impact, why the PR owns the problem, and
-  the proportionate requested change. Also state the prerequisite, supported
-  entry point and sink, base-vs-head behavior, and deterministic reproducer
-  from the validated evidence contract.
+- Keep the normalized evidence contract in `review-findings.json`; do not copy
+  its field labels into the public comment. Render each new blocker as the
+  human-first card below.
+- Write `Summary` as natural prose that can be read aloud to someone who has
+  not seen the code. In one compact paragraph, explain who encounters the
+  problem, what they do, what goes wrong, and the concrete consequence. Prefer
+  product concepts over internal identifiers unless an identifier is needed
+  to understand the issue.
+- Write `Fix` as a proportionate imperative derived from `requested_change`.
+  Retain every operative constraint and required regression-test outcome.
+- Write `Verify` as a deterministic setup, action, and current-versus-expected
+  observation derived from `reproducer`. Preserve identity and equality
+  qualifiers and distinguish concurrent calls, staged objects, and durable
+  state when those distinctions matter.
+- Across the visible card and its agent context, preserve the operative facts
+  needed to understand, fix, and verify the blocker: exact trigger conditions,
+  actor or permission scope, supported-path qualifiers, causal direction,
+  observable impact, relevant identifiers, and negations. Never move a read,
+  transform, store, forward, reject, or delete operation to a neighboring
+  component for brevity. Do not infer missing facts.
+- Do not expose `Invariant`, `Prerequisite`, `Entry point`, `Sink`, `Base`,
+  `Head`, or `PR ownership` as headings. Those fields validate the finding;
+  they are not the public explanation.
+- Add collapsed `Agent context` after the visible card. Always include the
+  validated `changed_location` as `path:line`. Include the exact execution
+  path, PR ownership, minimal historical contrast, or concrete sibling sites
+  only when that information is not already clear above and helps an agent act
+  or establishes otherwise-unclear PR causality. Do not add empty rows or
+  duplicate the visible prose. Most findings need no historical comparison.
+- Target roughly 130 total words and about half the legacy evidence-dump
+  length. Operative fidelity is the escape hatch: exceed the target rather
+  than make the defect, fix, or verification ambiguous.
+- Put review-process bookkeeping at the end of the review summary in one
+  collapsed `<details><summary>Gator metadata</summary>` block. This includes
+  validation provenance, docs and E2E disposition, check status, head/base/
+  merge-base SHAs, patch ID, payload version, review mode, previous reviewed
+  SHA, review-budget state, maintainer-decision state, next Gator state, and a
+  machine-readable blocked reason. Keep the canonical `Head SHA: <sha>` and
+  `Gator payload: <version>` text intact inside the block so the write guard
+  and feedback ledger can parse them.
+- Do not hide an action a person must take. When blocked, approval-needed, or
+  awaiting clarification, put one plain-language `Action required:` sentence
+  in the visible summary. Keep the redundant state code and operational detail
+  in `Gator metadata`.
 - Use the review summary for blocking design concerns, missing tests,
   cross-file findings, and blockers that cannot be anchored because the
   relevant line is outside the mode-appropriate diff. For an unanchored
@@ -770,13 +870,13 @@ Build the batch as one REST request. Verify every requested line appears in the 
 {
   "commit_id": "<head-sha>",
   "event": "COMMENT",
-  "body": "> **gator-agent**\n\n## PR Review Status\n\nHead SHA: `<head-sha>`\nBase SHA: `<base-sha>`\nMerge base SHA: `<merge-base-sha>`\nPatch ID: `<patch-id>`\nGator payload: `<payload-version>`\n\n<summary and general findings>",
+  "body": "> **gator-agent**\n\n## PR Review Status\n\n<plain-language disposition and general findings>\n\n<details>\n<summary>Gator metadata</summary>\n\n- Head SHA: `<head-sha>`\n- Base SHA: `<base-sha>`\n- Merge base SHA: `<merge-base-sha>`\n- Patch ID: `<patch-id>`\n- Gator payload: `<payload-version>`\n\n</details>",
   "comments": [
     {
       "path": "crates/example/src/lib.rs",
       "line": 123,
       "side": "RIGHT",
-      "body": "> **gator-agent**\n\n**Warning — GATOR-12345678-01**\n\nInvariant: <root cause and sibling family>\n\nPrerequisite: <attacker or operator capability>\n\nEntry point → sink: <supported path> → <effectful operation>\n\nBase → head: <old behavior> → <introduced or worsened behavior>\n\nImpact: <material observable impact>\n\nReproducer: <minimal deterministic test>\n\nPR ownership: <why this change owns the defect>\n\nRequested change: <proportionate fix>"
+      "body": "> **gator-agent**\n\n**Warning — GATOR-12345678-01 · Authorization happens after lookup**\n\n**Summary:** A user who can request a workspace can make the server look up another workspace before checking access. That discloses whether the workspace exists.\n\n**Fix:** Restore the authorization check before the workspace lookup and cover cross-workspace requests.\n\n**Verify:** Request another workspace as an unauthorized user; the server must return 404 without performing the lookup.\n\n<details>\n<summary>Agent context</summary>\n\n- **Agent path:** `GET /workspaces/{name}` → workspace record lookup\n- **Ownership:** This PR reordered the authorization check and lookup.\n- **Location:** `server.rs:123`\n\n</details>"
     }
   ]
 }
@@ -804,12 +904,14 @@ determine which Gator findings or trusted maintainer comments are still
 unanswered. Ignore unacknowledged third-party comments and reviews. If the PR
 author has pushed commits and `review_scope.mode` is `follow_up`, review only
 the unresolved obligations plus `<previous_reviewed_sha>..HEAD`, carrying all
-other dispositions without duplicating them. If the author replied without
-pushing a new commit, do not re-review, repost findings, or post a same-SHA
-disposition; inspect the response internally and wait for a new commit or
-maintainer override. If CI changes state without a new commit, do not post a
-same-SHA CI update. A due TTL author nudge remains allowed when the unresolved
-feedback still requires an author action.
+other dispositions without duplicating them. Resolve the Gator-owned inline
+threads for obligations that the follow-up confirms are fixed or explicitly
+waived before posting the new-head disposition or advancing the label. If the
+author replied without pushing a new commit, do not re-review, repost findings,
+or post a same-SHA disposition; inspect the response internally and wait for a
+new commit or maintainer override. If CI changes state without a new commit, do
+not post a same-SHA CI update. A due TTL author nudge remains allowed when the
+unresolved feedback still requires an author action.
 
 If review feedback is waiting on the PR author for more than 48 business hours, post a single author nudge. Use the latest of these timestamps as the TTL start:
 
@@ -838,19 +940,29 @@ Use `test:e2e` for changes that affect:
 
 Use `test:e2e-gpu` for GPU runtime, CDI, CUDA, GPU driver, or GPU policy behavior.
 
-Use `test:e2e-kubernetes` for Kubernetes HA, Helm, Agent Sandbox CRDs, Kubernetes scheduling, namespace, or controller behavior when the Kubernetes-specific suite is needed.
+Use `test:e2e` for Helm, Agent Sandbox CRDs, Kubernetes scheduling, namespace, workspace mode, or controller behavior; it runs the Kubernetes, managed-workspace, and operator-workspace suites.
+
+Add `test:e2e-kubernetes` for gateway high availability or Kubernetes Secrets and Vault credential driver storage. It runs only the HA and credential-driver suites, so apply it alongside `test:e2e` when other Kubernetes coverage is also needed.
+
+Apply `test:windows` whenever a PR affects Windows support. This includes Windows or MSVC CI and `mise` tasks, Windows lock-file platform entries, the MXC driver, and `cfg(windows)` implementations or tests in otherwise cross-platform crates. Apply it alongside any applicable E2E label; it is not a substitute for runtime coverage.
 
 After applying a `test:*` label, read the bot comment that is posted by the E2E Label Help workflow and follow its instructions.
 
 If a mirror is missing or stale and you have maintainer authority, post:
 
 ```text
-/ok to test <sha>
+/ok to test <full-head-sha>
 ```
 
-The `/ok to test <sha>` comment must contain only that command. Do not include the `> **gator-agent**` marker, explanations, Markdown fences, or any other text in the same comment.
+`<full-head-sha>` MUST be the full 40-character SHA-1 of the current PR head. Read it fresh from GitHub immediately before posting instead of reusing a SHA from earlier in the cycle:
 
-If you do not have maintainer authority, move to `gator:blocked` and state that a maintainer must post `/ok to test <sha>`.
+```bash
+gh api repos/NVIDIA/OpenShell/pulls/<number> --jq .head.sha
+```
+
+The `/ok to test <full-head-sha>` comment must contain only that command. Do not include the `> **gator-agent**` marker, explanations, Markdown fences, or any other text in the same comment.
+
+If you do not have maintainer authority, move to `gator:blocked` and state that a maintainer must post `/ok to test <full-head-sha>` with the full current head SHA written out.
 
 Do not treat a test label or `/ok to test` comment as proof that testing
 started. Confirm that every required workflow has a check or run for the
@@ -881,8 +993,10 @@ Required gates include at least:
 
 - `OpenShell / Branch Checks`
 - `OpenShell / Helm Lint`
+- `OpenShell / Trivy Changes`
 - `OpenShell / E2E` when `test:e2e` is applied
 - `OpenShell / GPU E2E` when `test:e2e-gpu` is applied
+- Both x64 and ARM64 `Windows MSVC / PR lint and test` checks when `test:windows` is applied
 
 If checks are pending, wait a reasonable interval and re-check.
 
@@ -986,16 +1100,9 @@ Recommended next step: <create-spike/build-from-issue/human planning/other>.
 
 ## PR Review Status
 
-Validation: <why this PR is project-valid>
-Head SHA: `<sha>`
-Base SHA: `<sha>`
-Merge base SHA: `<sha>`
-Patch ID: `<stable patch id>`
-Gator payload: `<payload version>`
-Review mode: `<initial|follow_up|critical_only>`
-Previous reviewed SHA: `<sha or none>`
-Review budget exhausted: `<yes|no>`
-Maintainer decision required: `<yes|no — concrete reason when yes>`
+<one or two natural sentences describing the review disposition>
+
+Action required: <specific human action; include only when one is required>
 
 Blocking findings:
 - `<finding-id>`: <finding or "No blocking findings remain">
@@ -1006,9 +1113,26 @@ Carried findings:
 Non-blocking suggestions:
 - <initial-review suggestion or "None"; omit on follow-up reviews>
 
-Docs: <Fern docs updated / not needed because ... / missing for direct UX change>
+<details>
+<summary>Gator metadata</summary>
 
-Next state: `<gator:in-review|gator:watch-pipeline|gator:follow-up-needed|gator:blocked>`
+- Validation: <why this PR is project-valid>
+- Docs: <Fern docs updated / not needed because ... / missing for direct UX change>
+- Checks: <current-head required-check disposition>
+- E2E: <current-head E2E disposition or N/A>
+- Head SHA: `<sha>`
+- Base SHA: `<sha>`
+- Merge base SHA: `<sha>`
+- Patch ID: `<stable patch id>`
+- Gator payload: `<payload version>`
+- Review mode: `<initial|follow_up|critical_only>`
+- Previous reviewed SHA: `<sha or none>`
+- Review budget exhausted: `<yes|no>`
+- Maintainer decision required: `<yes|no — concrete reason when yes>`
+- Next state: `<gator:in-review|gator:watch-pipeline|gator:follow-up-needed|gator:blocked>`
+- Blocked reason: `<machine-readable reason; include only when blocked>`
+
+</details>
 ```
 
 ### Maintainer Convergence Decision
@@ -1017,12 +1141,6 @@ Next state: `<gator:in-review|gator:watch-pipeline|gator:follow-up-needed|gator:
 > **gator-agent**
 
 ## Maintainer Convergence Decision
-
-Head SHA: `<sha>`
-Base SHA: `<sha>`
-Merge base SHA: `<sha>`
-Patch ID: `<stable patch id>`
-Gator payload: `<payload version>`
 
 The autonomous Warning budget is exhausted, and a specific maintainer decision
 is required before review can proceed.
@@ -1039,8 +1157,18 @@ Reviewer-quality signals:
 Maintainer action: <state only the applicable choice, affected finding or scope
 boundary, and exact next action>
 
-Next state: `gator:blocked`
-Blocked reason: `review_convergence_decision_required`
+<details>
+<summary>Gator metadata</summary>
+
+- Head SHA: `<sha>`
+- Base SHA: `<sha>`
+- Merge base SHA: `<sha>`
+- Patch ID: `<stable patch id>`
+- Gator payload: `<payload version>`
+- Next state: `gator:blocked`
+- Blocked reason: `review_convergence_decision_required`
+
+</details>
 ```
 
 ### Human Response Disposition
@@ -1054,12 +1182,6 @@ Post this as a new comment after a substantive author, maintainer, or reviewer r
 
 Thanks <person>. I re-evaluated latest head `<sha>` after your <date/time> comment about <short paraphrase>.
 
-Head SHA: `<sha>`
-Base SHA: `<sha>`
-Merge base SHA: `<sha>`
-Patch ID: `<stable patch id>`
-Gator payload: `<payload version>`
-
 What I checked: <specific files, checks, or behavior inspected because of the comment>.
 
 Disposition: <resolved / partially resolved / not resolved / needs clarification>.
@@ -1067,7 +1189,20 @@ Disposition: <resolved / partially resolved / not resolved / needs clarification
 Remaining items:
 - <specific unresolved item, or "No blocking items remain">
 
-Next state: `<gator:in-review|gator:watch-pipeline|gator:follow-up-needed|gator:blocked|gator:approval-needed|gator:merge-ready>`
+Action required: <specific human action; include only when one is required>
+
+<details>
+<summary>Gator metadata</summary>
+
+- Head SHA: `<sha>`
+- Base SHA: `<sha>`
+- Merge base SHA: `<sha>`
+- Patch ID: `<stable patch id>`
+- Gator payload: `<payload version>`
+- Next state: `<gator:in-review|gator:watch-pipeline|gator:follow-up-needed|gator:blocked|gator:approval-needed|gator:merge-ready>`
+- Blocked reason: `<machine-readable reason; include only when blocked>`
+
+</details>
 ```
 
 ### Approval Needed
@@ -1079,13 +1214,20 @@ Next state: `<gator:in-review|gator:watch-pipeline|gator:follow-up-needed|gator:
 
 Gator validation and PR monitoring are complete.
 
-Validation: <summary>
 Review: <summary>
-Docs: <summary>
-Checks: <summary>
-E2E: <summary or N/A>
 
 Human maintainer approval is now required.
+
+<details>
+<summary>Gator metadata</summary>
+
+- Validation: <summary>
+- Docs: <summary>
+- Checks: <summary>
+- E2E: <summary or N/A>
+- Next state: `gator:approval-needed`
+
+</details>
 ```
 
 ### Merge Ready
@@ -1097,14 +1239,21 @@ Human maintainer approval is now required.
 
 Gator validation and PR monitoring are complete, and maintainer approval is present.
 
-Validation: <summary>
 Review: <summary>
 Approval: <summary>
-Docs: <summary>
-Checks: <summary>
-E2E: <summary or N/A>
 
 Human maintainer merge or close decision is now required.
+
+<details>
+<summary>Gator metadata</summary>
+
+- Validation: <summary>
+- Docs: <summary>
+- Checks: <summary>
+- E2E: <summary or N/A>
+- Next state: `gator:merge-ready`
+
+</details>
 ```
 
 ### Monitoring Complete

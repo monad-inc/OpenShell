@@ -225,13 +225,14 @@ mod tests {
 
     #[test]
     fn accepts_supported_endpoint_forms() {
-        for endpoint in [
-            "http://127.0.0.1:50051",
-            "https://middleware.example:443",
-            "unix:///run/openshell/middleware.sock",
-        ] {
+        for endpoint in ["http://127.0.0.1:50051", "https://middleware.example:443"] {
             validate_config(&ExtensionChannelConfig::new(endpoint)).unwrap();
         }
+        #[cfg(unix)]
+        validate_config(&ExtensionChannelConfig::new(
+            "unix:///run/openshell/middleware.sock",
+        ))
+        .unwrap();
     }
 
     #[test]
@@ -291,7 +292,6 @@ mod tests {
 
     #[tokio::test]
     async fn custom_ca_verifies_certificate_and_hostname() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
         let ca_key = KeyPair::generate().unwrap();
         let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
         ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);

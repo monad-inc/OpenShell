@@ -4,6 +4,7 @@
 package converter
 
 import (
+	"math"
 	"testing"
 	"time"
 
@@ -35,6 +36,23 @@ func TestRefreshStrategyFromProto(t *testing.T) {
 	}
 }
 
+func TestRefreshRecoveryActionFromProto(t *testing.T) {
+	tests := []struct {
+		proto pb.ProviderCredentialRefreshRecoveryAction
+		want  v1.RefreshRecoveryAction
+	}{
+		{pb.ProviderCredentialRefreshRecoveryAction_PROVIDER_CREDENTIAL_REFRESH_RECOVERY_ACTION_UNSPECIFIED, v1.RefreshRecoveryActionUnspecified},
+		{pb.ProviderCredentialRefreshRecoveryAction_PROVIDER_CREDENTIAL_REFRESH_RECOVERY_ACTION_RETRY, v1.RefreshRecoveryActionRetry},
+		{pb.ProviderCredentialRefreshRecoveryAction_PROVIDER_CREDENTIAL_REFRESH_RECOVERY_ACTION_REAUTHORIZE, v1.RefreshRecoveryActionReauthorize},
+		{pb.ProviderCredentialRefreshRecoveryAction_PROVIDER_CREDENTIAL_REFRESH_RECOVERY_ACTION_FIX_CONFIGURATION, v1.RefreshRecoveryActionFixConfiguration},
+		{pb.ProviderCredentialRefreshRecoveryAction_PROVIDER_CREDENTIAL_REFRESH_RECOVERY_ACTION_INVESTIGATE, v1.RefreshRecoveryActionInvestigate},
+		{pb.ProviderCredentialRefreshRecoveryAction(999), v1.RefreshRecoveryActionUnspecified},
+	}
+	for _, tt := range tests {
+		assert.Equal(t, tt.want, RefreshRecoveryActionFromProto(tt.proto))
+	}
+}
+
 func TestRefreshStrategyToProto(t *testing.T) {
 	tests := []struct {
 		sdk  v1.RefreshStrategy
@@ -60,21 +78,25 @@ func TestRefreshStrategyToProto(t *testing.T) {
 
 func TestRefreshStatusFromProto(t *testing.T) {
 	proto := &pb.ProviderCredentialRefreshStatus{
-		ProviderName:    "anthropic",
-		ProviderId:      "prov-1",
-		CredentialKey:   "API_KEY",
-		Strategy:        pb.ProviderCredentialRefreshStrategy_PROVIDER_CREDENTIAL_REFRESH_STRATEGY_OAUTH2_REFRESH_TOKEN,
-		Status:          "active",
-		ExpiresAtMs:     1700000000000,
-		NextRefreshAtMs: 1699999000000,
-		LastRefreshAtMs: 1699998000000,
-		LastError:       "none",
+		Provider:             "anthropic",
+		ProviderId:           "prov-1",
+		CredentialKey:        "API_KEY",
+		Strategy:             pb.ProviderCredentialRefreshStrategy_PROVIDER_CREDENTIAL_REFRESH_STRATEGY_OAUTH2_REFRESH_TOKEN,
+		Status:               "active",
+		ExpirationTime:       TimestampFromMillis(1700000000000),
+		NextRefreshTime:      TimestampFromMillis(1699999000000),
+		LastRefreshTime:      TimestampFromMillis(1699998000000),
+		LastError:            "none",
+		RecoveryAction:       pb.ProviderCredentialRefreshRecoveryAction_PROVIDER_CREDENTIAL_REFRESH_RECOVERY_ACTION_REAUTHORIZE,
+		FailureCode:          "oauth_invalid_grant",
+		ProviderErrorSubtype: "invalid_rapt",
+		LastErrorTime:        TimestampFromMillis(1699997000000),
 	}
 
 	status := RefreshStatusFromProto(proto)
 
 	require.NotNil(t, status)
-	assert.Equal(t, "anthropic", status.ProviderName)
+	assert.Equal(t, "anthropic", status.Provider)
 	assert.Equal(t, "prov-1", status.ProviderID)
 	assert.Equal(t, "API_KEY", status.CredentialKey)
 	assert.Equal(t, v1.RefreshStrategyOAuth2RefreshToken, status.Strategy)
@@ -83,6 +105,10 @@ func TestRefreshStatusFromProto(t *testing.T) {
 	assert.Equal(t, TimeFromMillis(1699999000000), status.NextRefreshAt)
 	assert.Equal(t, TimeFromMillis(1699998000000), status.LastRefreshAt)
 	assert.Equal(t, "none", status.LastError)
+	assert.Equal(t, v1.RefreshRecoveryActionReauthorize, status.RecoveryAction)
+	assert.Equal(t, "oauth_invalid_grant", status.FailureCode)
+	assert.Equal(t, "invalid_rapt", status.ProviderErrorSubtype)
+	assert.Equal(t, TimeFromMillis(1699997000000), status.LastErrorAt)
 }
 
 func TestRefreshStatusFromProto_Nil(t *testing.T) {
@@ -92,7 +118,7 @@ func TestRefreshStatusFromProto_Nil(t *testing.T) {
 
 func TestRefreshStatusFromProto_ZeroTimestamps(t *testing.T) {
 	proto := &pb.ProviderCredentialRefreshStatus{
-		ProviderName:  "test",
+		Provider:      "test",
 		CredentialKey: "KEY",
 		Strategy:      pb.ProviderCredentialRefreshStrategy_PROVIDER_CREDENTIAL_REFRESH_STRATEGY_STATIC,
 	}
@@ -104,6 +130,24 @@ func TestRefreshStatusFromProto_ZeroTimestamps(t *testing.T) {
 	assert.True(t, status.ExpiresAt.IsZero())
 	assert.True(t, status.NextRefreshAt.IsZero())
 	assert.True(t, status.LastRefreshAt.IsZero())
+	assert.True(t, status.LastErrorAt.IsZero())
+	assert.Equal(t, v1.RefreshRecoveryActionUnspecified, status.RecoveryAction)
+}
+
+func TestRefreshStatusFromProto_ParkedRefreshHasNoNextTime(t *testing.T) {
+	proto := &pb.ProviderCredentialRefreshStatus{
+		Provider:        "test",
+		CredentialKey:   "KEY",
+		NextRefreshTime: nil,
+		RecoveryAction:  pb.ProviderCredentialRefreshRecoveryAction_PROVIDER_CREDENTIAL_REFRESH_RECOVERY_ACTION_REAUTHORIZE,
+	}
+
+	status := RefreshStatusFromProto(proto)
+
+	require.NotNil(t, status)
+	assert.True(t, status.NextRefreshAt.IsZero())
+	assert.Equal(t, v1.RefreshRecoveryActionReauthorize, status.RecoveryAction)
+	assert.False(t, TimeFromMillis(math.MaxInt64).IsZero())
 }
 
 // --- RefreshConfig ---
@@ -145,8 +189,8 @@ func TestRefreshConfigToProto(t *testing.T) {
 	assert.Equal(t, "client_secret", proto.SecretMaterialKeys[0], "secret keys must be deep copied")
 
 	// ExpiresAt conversion
-	require.NotNil(t, proto.ExpiresAtMs)
-	assert.Equal(t, MillisFromTime(expiresAt), *proto.ExpiresAtMs)
+	require.NotNil(t, proto.ExpirationTime)
+	assert.Equal(t, MillisFromTime(expiresAt), MillisFromProto(proto.ExpirationTime))
 }
 
 func TestRefreshConfigToProto_NilExpiresAt(t *testing.T) {
@@ -159,7 +203,7 @@ func TestRefreshConfigToProto_NilExpiresAt(t *testing.T) {
 	proto := RefreshConfigToProto(config)
 
 	require.NotNil(t, proto)
-	assert.Nil(t, proto.ExpiresAtMs)
+	assert.Nil(t, proto.ExpirationTime)
 }
 
 func TestRefreshConfigToProto_Nil(t *testing.T) {

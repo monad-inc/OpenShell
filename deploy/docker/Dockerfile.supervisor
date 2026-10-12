@@ -3,35 +3,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Supervisor image build.
-#
-# The final image carries the static `openshell-sandbox` binary used by Docker
-# extraction, Podman image volumes, and the Kubernetes init container copy-self
-# path. It also includes nftables so the Kubernetes supervisor sidecar can
-# install pod-namespace egress enforcement rules.
-#
-# The Rust binary is built natively before this image build runs and staged at:
-#   deploy/docker/.build/prebuilt-binaries/<arch>/openshell-sandbox
-#
-# Use tasks/scripts/docker-build-image.sh supervisor (or `mise run build:docker:supervisor`)
-# to stage the binary and build the image in one step. CI builds the binary
-# per-architecture via the `rust-native-build.yml` workflow and uploads it as an
-# artifact, which is downloaded into the same staging directory before the image
-# build job runs.
-#
-# The binary is static under either supported libc variant (`SUPERVISOR_LIBC`:
-# musl by default, or glibc-static), so this Alpine base runs it unchanged.
+# The dynamically linked GNU supervisor binary is staged under
+# deploy/docker/.build/prebuilt-binaries/<arch>/.
 
-FROM alpine:3.22 AS supervisor
+# Keep the GNU runtime and CA roots without a shell or unused native TLS libraries.
+# The default variant preserves UID 0 and /; compute drivers set the runtime UID.
+ARG SUPERVISOR_BASE_IMAGE=gcr.io/distroless/base-nossl-debian13@sha256:af5cb8dd589b8520b8c06bebb9efb73d7e16406cab58e85c51761fff49d370a0
+FROM ${SUPERVISOR_BASE_IMAGE} AS supervisor
 
 ARG TARGETARCH
 
-RUN apk add --no-cache nftables iptables iptables-legacy
+COPY --chmod=0555 deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell-supervisor /openshell-supervisor
 
-# --chmod=0555 restores execute bits after the actions/upload-artifact +
-# download-artifact roundtrip strips them. Ownership stays root (0:0) for
-# Podman image-volume mounts, while world-execute lets the Kubernetes
-# network sidecar run this binary as the dedicated non-root proxy UID.
-COPY --chmod=0555 deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell-sandbox /openshell-sandbox
-
-ENTRYPOINT ["/openshell-sandbox"]
+ENTRYPOINT ["/openshell-supervisor"]
