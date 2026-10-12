@@ -24,6 +24,31 @@ use std::io::Read as _;
 use std::sync::Arc;
 use tempfile::TempDir;
 
+#[test]
+fn startup_error_log_tails_fit_grpc_header_budget() {
+    // Multibyte text exercises both the UTF-8 cut and worst-case gRPC message
+    // percent encoding. Preserve the supervisor's final diagnostic.
+    let logs = format!("{}\nstartup timed out", "🦀".repeat(8192));
+    let message = format!(
+        "Docker supervisor exited before becoming ready{}",
+        format_log_tail(&logs),
+    );
+    assert_eq!(message.matches("[truncated]").count(), 1);
+    assert_eq!(message.matches("startup timed out").count(), 1);
+    let response = Status::unavailable(message).into_http::<()>();
+    let header_bytes: usize = response
+        .headers()
+        .iter()
+        .map(|(name, value)| name.as_str().len() + value.as_bytes().len() + 32)
+        .sum();
+    assert!(
+        header_bytes < 16 * 1024,
+        "status headers: {header_bytes} bytes"
+    );
+    assert_eq!(format_log_tail("small error"), "; log tail: small error");
+    assert!(format_log_tail("").is_empty());
+}
+
 fn test_launch_authentication() -> Vec<u8> {
     serde_json::to_vec(&SandboxLaunchAuthentication {
         supervisor: SupervisorAuthBundle {
@@ -38,6 +63,7 @@ fn test_launch_authentication() -> Vec<u8> {
             gateway_expires_at: i64::MAX,
             sandbox_token: SecretJwt::parse("sandbox.token.value").unwrap(),
             sandbox_expires_at: i64::MAX,
+            ssh_host_private_key: None,
         },
         gateway_id: "gateway-test".to_string(),
         verification_keys: vec![SessionVerificationKey {
@@ -185,6 +211,7 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         sandbox_binary: Arc::new(b"\x7fELFtest".to_vec()),
         supervisor_image_id: "sha256:supervisor-test".to_string(),
         supervisor_grpc_endpoint: "https://host.openshell.internal:8443".to_string(),
+        supervisor_otlp_endpoint: None,
         ssh_socket_path: openshell_core::container_paths::SSH_SOCKET_PATH.to_string(),
         guest_tls: Some(DockerGuestTlsPaths {
             ca: PathBuf::from("/tmp/ca.crt"),
@@ -1365,6 +1392,21 @@ fn docker_child_environment_strips_supervisor_control_keys() {
 }
 
 #[test]
+fn supervisor_tracing_environment_requires_an_endpoint() {
+    let mut config = runtime_config();
+    assert!(supervisor_tracing_environment(&config).is_empty());
+
+    config.supervisor_otlp_endpoint = Some("http://127.0.0.1:4317".to_string());
+    assert_eq!(
+        supervisor_tracing_environment(&config),
+        [format!(
+            "{}=http://127.0.0.1:4317",
+            openshell_core::sandbox_env::OTLP_ENDPOINT
+        )]
+    );
+}
+
+#[test]
 fn boundary_environment_contains_only_driver_owned_values() {
     let env = build_boundary_environment(&test_sandbox(), &runtime_config());
 
@@ -2479,6 +2521,23 @@ fn validate_sandbox_rejects_unknown_driver_config_fields() {
 }
 
 #[test]
+fn sandbox_driver_config_rejects_trusted_runtime_image_overrides() {
+    for field in ["sandbox_runtime_image", "supervisor_image"] {
+        let template = DriverSandboxTemplate {
+            driver_config: Some(json_struct(serde_json::json!({
+                (field): "registry.example.com/openshell/runtime:untrusted"
+            }))),
+            ..Default::default()
+        };
+
+        let error = DockerSandboxDriverConfig::from_template(&template)
+            .expect_err("sandbox requests must not select trusted runtime images");
+        assert!(error.contains("unknown field"), "{error}");
+        assert!(error.contains(field), "{error}");
+    }
+}
+
+#[test]
 fn validate_sandbox_accepts_gpu_count_request_shape() {
     let mut config = runtime_config();
     config.gpu.cdi_supported = true;
@@ -2659,6 +2718,91 @@ fn build_container_create_body_omits_devices_without_resolved_default_cdi_device
             .and_then(|host_config| host_config.device_requests.as_ref())
             .is_none()
     );
+}
+
+#[test]
+fn container_spec_accepts_non_nvidia_explicit_and_resolved_cdi_devices() {
+    let mut config = runtime_config();
+    config.gpu.cdi_supported = true;
+    let mut sandbox = test_sandbox();
+    sandbox.spec.as_mut().unwrap().resource_requirements = Some(gpu_resources(None));
+    for device in ["example.com/gpu=0", "intel.com/gpu=0", "amd.com/gpu=0"] {
+        sandbox
+            .spec
+            .as_mut()
+            .unwrap()
+            .template
+            .as_mut()
+            .unwrap()
+            .driver_config = Some(cdi_devices_config(&[device]));
+        let explicit = build_container_create_body(&sandbox, &config).unwrap();
+        sandbox
+            .spec
+            .as_mut()
+            .unwrap()
+            .template
+            .as_mut()
+            .unwrap()
+            .driver_config = None;
+        let resolved = build_container_create_body_with_gpu_devices(
+            &sandbox,
+            &config,
+            &DockerSandboxDriverConfig::default(),
+            Some(&[device.to_string()]),
+        )
+        .unwrap();
+        for body in [explicit, resolved] {
+            let requests = body.host_config.unwrap().device_requests.unwrap();
+            assert_eq!(requests[0].driver.as_deref(), Some("cdi"));
+            assert_eq!(
+                requests[0].device_ids.as_ref().unwrap(),
+                &[device.to_string()]
+            );
+        }
+    }
+}
+
+#[test]
+fn container_spec_rejects_host_paths_in_explicit_and_resolved_cdi_devices() {
+    let mut config = runtime_config();
+    config.gpu.cdi_supported = true;
+    let mut sandbox = test_sandbox();
+    sandbox.spec.as_mut().unwrap().resource_requirements = Some(gpu_resources(None));
+    for device in [
+        "/dev/sda",
+        "/dev",
+        "/dev/sda:/dev/sda:rwm",
+        "vendor/gpu=0/1",
+    ] {
+        sandbox
+            .spec
+            .as_mut()
+            .unwrap()
+            .template
+            .as_mut()
+            .unwrap()
+            .driver_config = Some(cdi_devices_config(&[device]));
+        let explicit_error = build_container_create_body(&sandbox, &config).unwrap_err();
+        sandbox
+            .spec
+            .as_mut()
+            .unwrap()
+            .template
+            .as_mut()
+            .unwrap()
+            .driver_config = None;
+        let resolved_error = build_container_create_body_with_gpu_devices(
+            &sandbox,
+            &config,
+            &DockerSandboxDriverConfig::default(),
+            Some(&[device.to_string()]),
+        )
+        .unwrap_err();
+        for error in [explicit_error, resolved_error] {
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+            assert!(error.message().contains("CDI qualified names"));
+        }
+    }
 }
 
 #[test]
@@ -3662,4 +3806,33 @@ fn admission_provisioning_failure_distinguishes_denials_from_lookup_failures() {
     ));
     assert_eq!(lookup.reason, "ResourceAdmissionLookupFailed");
     assert_eq!(lookup.message, "inspect docker volume failed");
+}
+
+#[test]
+fn normalize_pull_reference_appends_latest_only_when_untagged() {
+    // A bare repository reference must resolve to a single tag so the daemon
+    // does not pull every tag in the repository (issue #4029).
+    assert_eq!(
+        normalize_pull_reference("nicolaka/netshoot"),
+        "nicolaka/netshoot:latest"
+    );
+    // An explicit tag is preserved untouched.
+    assert_eq!(normalize_pull_reference("foo:1.2"), "foo:1.2");
+    // A digest-pinned reference already names an exact image.
+    assert_eq!(
+        normalize_pull_reference(
+            "foo@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+        ),
+        "foo@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    );
+    // A registry port is not a tag, so `:latest` is still appended.
+    assert_eq!(
+        normalize_pull_reference("registry:5000/team/app"),
+        "registry:5000/team/app:latest"
+    );
+    // A registry port combined with an explicit tag is left unchanged.
+    assert_eq!(
+        normalize_pull_reference("registry:5000/team/app:v1"),
+        "registry:5000/team/app:v1"
+    );
 }

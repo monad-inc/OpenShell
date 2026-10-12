@@ -997,6 +997,7 @@ impl ProviderTypeProfile {
                     refresh: credential.refresh.as_ref().map(credential_refresh_to_proto),
                     path_template: credential.path_template.clone(),
                     token_grant: credential.token_grant.as_ref().map(token_grant_to_proto),
+                    token_grant_owners: Vec::new(),
                 })
                 .collect(),
             files: self
@@ -1660,6 +1661,7 @@ fn endpoint_to_proto(endpoint: &EndpointProfile) -> NetworkEndpoint {
         request_body_credential_rewrite: endpoint.request_body_credential_rewrite,
         allow_uninspected_credentials: endpoint.allow_uninspected_credentials,
         provider_credentialed: false,
+        token_grant_owner: String::new(),
         advisor_proposed: false,
         persisted_queries: endpoint.persisted_queries.clone(),
         graphql_persisted_queries: endpoint
@@ -1972,7 +1974,31 @@ fn graphql_operation_from_proto(operation: &GraphqlOperation) -> GraphqlOperatio
 }
 
 pub fn parse_profile_yaml(input: &str) -> Result<ProviderTypeProfile, ProfileError> {
-    Ok(serde_yml::from_str::<ProviderTypeProfile>(input)?)
+    Ok(openshell_core::yaml::from_str_with_object_paths::<
+        ProviderTypeProfile,
+    >(
+        input,
+        &[
+            "annotations",
+            "discovery",
+            "credentials.*",
+            "files.*",
+            "endpoints.*",
+            "binaries.*",
+            "credentials.*.refresh.material.*",
+            "credentials.*.refresh.additional_outputs.*",
+            "credentials.*.token_grant.audience_overrides.*",
+            "endpoints.*.mcp",
+            "endpoints.*.graphql_persisted_queries",
+            "endpoints.*.graphql_persisted_queries.*",
+            "endpoints.*.rules.*",
+            "endpoints.*.rules.*.allow.query",
+            "endpoints.*.rules.*.allow.params",
+            "endpoints.*.deny_rules.*",
+            "endpoints.*.deny_rules.*.query",
+            "endpoints.*.deny_rules.*.params",
+        ],
+    )?)
 }
 
 pub fn parse_profile_json(input: &str) -> Result<ProviderTypeProfile, ProfileError> {
@@ -1980,7 +2006,7 @@ pub fn parse_profile_json(input: &str) -> Result<ProviderTypeProfile, ProfileErr
 }
 
 pub fn profile_to_yaml(profile: &ProviderTypeProfile) -> Result<String, ProfileError> {
-    Ok(serde_yml::to_string(profile)?)
+    Ok(openshell_core::yaml::to_string(profile)?)
 }
 
 pub fn profile_to_json(profile: &ProviderTypeProfile) -> Result<String, ProfileError> {
@@ -1988,7 +2014,7 @@ pub fn profile_to_json(profile: &ProviderTypeProfile) -> Result<String, ProfileE
 }
 
 pub fn profiles_to_yaml(profiles: &[ProviderTypeProfile]) -> Result<String, ProfileError> {
-    Ok(serde_yml::to_string(profiles)?)
+    Ok(openshell_core::yaml::to_string(profiles)?)
 }
 
 pub fn profiles_to_json(profiles: &[ProviderTypeProfile]) -> Result<String, ProfileError> {
@@ -2207,6 +2233,15 @@ pub fn validate_profile_set(
                         format!("file environment key '{env_var}' conflicts with a credential"),
                     ));
                 }
+            }
+            if credential.name.chars().any(char::is_control) {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    "credentials.name",
+                    "credential name must not contain control characters",
+                ));
+                continue;
             }
             let credential_name = credential.name.trim();
             if credential_name.is_empty() {
@@ -2647,6 +2682,10 @@ pub fn validate_profile_set(
             }
         }
 
+        let has_token_grant = profile
+            .credentials
+            .iter()
+            .any(|credential| credential.token_grant.is_some());
         for (index, endpoint) in profile.endpoints.iter().enumerate() {
             if !endpoint_is_valid(endpoint) {
                 diagnostics.push(ProfileValidationDiagnostic::error(
@@ -3007,6 +3046,35 @@ pub fn validate_profile_set(
                 }
             }
 
+            if has_token_grant {
+                for (field, value) in [("host", &endpoint.host), ("path", &endpoint.path)] {
+                    if value.chars().any(char::is_control) {
+                        diagnostics.push(ProfileValidationDiagnostic::error(
+                            source,
+                            profile_id,
+                            format!("endpoints[{index}].{field}"),
+                            "token_grant endpoint selectors must not contain control characters",
+                        ));
+                    }
+                }
+                if endpoint.protocol.trim().eq_ignore_ascii_case("sql") {
+                    diagnostics.push(ProfileValidationDiagnostic::error(
+                        source,
+                        profile_id,
+                        format!("endpoints[{index}].protocol"),
+                        "token_grant credentials require HTTP header injection, which protocol sql does not support",
+                    ));
+                }
+                if endpoint.tls.trim().eq_ignore_ascii_case("skip") {
+                    diagnostics.push(ProfileValidationDiagnostic::error(
+                        source,
+                        profile_id,
+                        format!("endpoints[{index}].tls"),
+                        "token_grant credentials require HTTP header injection, which tls: skip bypasses; remove tls: skip",
+                    ));
+                }
+            }
+
             if profile.has_credentialed_endpoints()
                 && !endpoint.allow_uninspected_credentials
                 && (endpoint.protocol.trim().is_empty()
@@ -3308,6 +3376,19 @@ fn validate_token_grant_audience_overrides(
     let mut diagnostics = Vec::new();
     let mut bindings: Vec<TokenGrantOverrideBinding> = Vec::new();
     for (override_index, override_config) in token_grant.audience_overrides.iter().enumerate() {
+        for (field, value) in [
+            ("host", &override_config.host),
+            ("path", &override_config.path),
+        ] {
+            if value.chars().any(char::is_control) {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    format!("credentials.token_grant.audience_overrides[{override_index}].{field}"),
+                    "token_grant audience override selectors must not contain control characters",
+                ));
+            }
+        }
         for endpoint in endpoints {
             for port in endpoint_ports(endpoint.port, &endpoint.ports) {
                 if !token_grant_override_matches_endpoint(override_config, &endpoint.host, port) {
@@ -3738,9 +3819,18 @@ credentials:
 
         let exact = ProviderTypeProfile::from_proto(&proto);
         let yaml = profile_to_yaml(&exact).unwrap();
-        assert!(yaml.contains("refresh_before: \"0s\""), "{yaml}");
-        assert!(yaml.contains("max_lifetime: \"1.500s\""), "{yaml}");
-        assert!(yaml.contains("cache_ttl: \"0.500s\""), "{yaml}");
+        // Check string values rather than the emitter's choice of quote style.
+        let document: serde_yml::Value = serde_yml::from_str(&yaml).unwrap();
+        let credential = &document["credentials"][0];
+        assert_eq!(credential["refresh"]["refresh_before"].as_str(), Some("0s"));
+        assert_eq!(
+            credential["refresh"]["max_lifetime"].as_str(),
+            Some("1.500s")
+        );
+        assert_eq!(
+            credential["token_grant"]["cache_ttl"].as_str(),
+            Some("0.500s")
+        );
         assert!(!yaml.contains("refresh_before_seconds"));
         assert!(!yaml.contains("max_lifetime_seconds"));
         assert!(!yaml.contains("cache_ttl_seconds"));
@@ -3754,6 +3844,24 @@ credentials:
             reparsed.credentials[0].token_grant,
             proto.credentials[0].token_grant
         );
+    }
+
+    #[test]
+    fn yaml_profile_rejects_null_objects_and_duplicate_fields() {
+        for field in [
+            "annotations: null",
+            "discovery: null",
+            "endpoints: [null]",
+            "endpoints: [{host: example.com, port: 443, rules: [{allow: {query: null}}]}]",
+            "endpoints: [{host: example.com, port: 443, rules: [{allow: {params: null}}]}]",
+            "endpoints: [{host: example.com, port: 443, graphql_persisted_queries: null}]",
+        ] {
+            let yaml = format!("id: sample\ndisplay_name: Sample\n{field}\n");
+            assert!(parse_profile_yaml(&yaml).is_err(), "{yaml}");
+        }
+        assert!(parse_profile_yaml("id: first\nid: second\ndisplay_name: Sample\n").is_err());
+        // Existing optional fields still accept null as absence.
+        assert!(parse_profile_yaml("id: sample\ndisplay_name: Sample\nendpoints: [{host: example.com, port: 443, rules: [{allow: null}]}]\n").is_ok());
     }
 
     #[test]
@@ -5398,6 +5506,157 @@ credentials:
                 diagnostics.is_empty(),
                 "unexpected diagnostics for {token_endpoint}: {diagnostics:?}"
             );
+        }
+    }
+
+    #[test]
+    fn validate_profile_set_rejects_control_characters_in_token_grant_keys() {
+        let valid = parse_profile_yaml(
+            r"
+id: grant-key
+display_name: Grant Key
+credentials:
+  - name: access_token
+    auth_style: bearer
+    header_name: Authorization
+    token_grant:
+      token_endpoint: https://auth.example.com/token
+endpoints:
+  - host: api.example.com
+    port: 443
+    protocol: rest
+    access: full
+",
+        )
+        .unwrap();
+        for name in [
+            "access_token",
+            "namespace:access_token",
+            "\taccess_token",
+            "access_token\n",
+        ] {
+            let mut profile = valid.clone();
+            profile.credentials[0].name = name.into();
+            let diagnostics = validate_profile_set(&[("profile.yaml".into(), profile)]);
+            if name.chars().any(char::is_control) {
+                assert!(
+                    diagnostics.iter().any(|diagnostic| {
+                        diagnostic.field == "credentials.name"
+                            && diagnostic.message.contains("control characters")
+                    }),
+                    "{diagnostics:?}"
+                );
+            } else {
+                assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            }
+        }
+        for (field, value) in [("host", "api.example.com\n"), ("path", "/api\t/private")] {
+            let mut profile = valid.clone();
+            if field == "host" {
+                profile.endpoints[0].host = value.into();
+            } else {
+                profile.endpoints[0].path = value.into();
+            }
+            let diagnostics = validate_profile_set(&[("profile.yaml".into(), profile)]);
+            assert!(
+                diagnostics.iter().any(|diagnostic| {
+                    diagnostic.field == format!("endpoints[0].{field}")
+                        && diagnostic.message.contains("control characters")
+                }),
+                "{diagnostics:?}"
+            );
+
+            let mut profile = valid.clone();
+            let grant = profile.credentials[0].token_grant.as_mut().unwrap();
+            grant
+                .audience_overrides
+                .push(super::TokenGrantAudienceOverrideProfile {
+                    host: if field == "host" {
+                        value.into()
+                    } else {
+                        String::new()
+                    },
+                    path: if field == "path" {
+                        value.into()
+                    } else {
+                        String::new()
+                    },
+                    port: 0,
+                    audience: String::new(),
+                    scopes: Vec::new(),
+                });
+            let diagnostics = validate_profile_set(&[("profile.yaml".into(), profile)]);
+            assert!(
+                diagnostics.iter().any(|diagnostic| {
+                    diagnostic.field
+                        == format!("credentials.token_grant.audience_overrides[0].{field}")
+                        && diagnostic.message.contains("control characters")
+                }),
+                "{diagnostics:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_profile_set_rejects_token_grants_without_http_injection() {
+        for (protocol, tls, token_grant, rejected_field) in [
+            ("sql", "", true, Some("protocol")),
+            ("rest", "skip", true, Some("tls")),
+            ("graphql", "skip", true, Some("tls")),
+            ("json-rpc", "skip", true, Some("tls")),
+            ("mcp", "skip", true, Some("tls")),
+            ("tcp", "skip", true, Some("tls")),
+            ("", "skip", true, Some("tls")),
+            ("rest", "", true, None),
+            ("graphql", "", true, None),
+            ("json-rpc", "", true, None),
+            ("mcp", "", true, None),
+            ("tcp", "", true, None),
+            ("", "", true, None),
+            ("tcp", "skip", false, None),
+        ] {
+            let admission = match protocol {
+                "" | "tcp" => "",
+                "json-rpc" => "    rules: [{allow: {method: echo}}]",
+                "mcp" => "    rules: [{allow: {method: tools/call}}]",
+                _ => "    access: full",
+            };
+            let mut profile = parse_profile_yaml(&format!(
+                r#"
+id: grant-transport
+display_name: Grant Transport
+credentials:
+  - name: access_token
+    env_vars: [ACCESS_TOKEN]
+    auth_style: bearer
+    header_name: Authorization
+    token_grant:
+      token_endpoint: https://auth.example.com/token
+      audience: api://default
+endpoints:
+  - host: api.example.com
+    port: 443
+    protocol: "{protocol}"
+{admission}
+    tls: "{tls}"
+    allow_uninspected_credentials: true
+binaries:
+  - /usr/bin/app
+"#,
+            ))
+            .expect("profile should parse");
+            if !token_grant {
+                profile.credentials[0].token_grant = None;
+            }
+            let diagnostics = validate_profile_set(&[("transport.yaml".to_string(), profile)]);
+            if let Some(field) = rejected_field {
+                assert_eq!(diagnostics.len(), 1, "{protocol}/{tls}: {diagnostics:?}");
+                assert_eq!(diagnostics[0].field, format!("endpoints[0].{field}"));
+                assert!(diagnostics[0].message.contains("token_grant"));
+                assert_eq!(diagnostics[0].severity, "error");
+            } else {
+                assert!(diagnostics.is_empty(), "{protocol}/{tls}: {diagnostics:?}");
+            }
         }
     }
 

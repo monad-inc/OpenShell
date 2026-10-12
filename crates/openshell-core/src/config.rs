@@ -103,21 +103,45 @@ pub const DEFAULT_SANDBOX_RUNTIME_IMAGE_REPO: &str =
         None => "ghcr.io/nvidia/openshell/sandbox",
     };
 
-/// Return the default sandbox runtime image reference with a version-pinned tag.
-#[must_use]
-pub fn default_sandbox_runtime_image() -> String {
+/// Process-level default for the trusted sandbox runtime image.
+pub const SANDBOX_RUNTIME_IMAGE_ENV: &str = "OPENSHELL_SANDBOX_RUNTIME_IMAGE";
+
+/// Process-level default for the trusted supervisor image.
+pub const SUPERVISOR_IMAGE_ENV: &str = "OPENSHELL_SUPERVISOR_IMAGE";
+
+fn compiled_sandbox_runtime_image() -> String {
     format!(
         "{DEFAULT_SANDBOX_RUNTIME_IMAGE_REPO}:{}",
         default_supervisor_image_tag()
     )
 }
 
-/// Return the default supervisor image reference with a version-pinned tag.
-#[must_use]
-pub fn default_supervisor_image() -> String {
+fn compiled_supervisor_image() -> String {
     format!(
         "{DEFAULT_SUPERVISOR_IMAGE_REPO}:{}",
         default_supervisor_image_tag()
+    )
+}
+
+fn runtime_image_default(environment_value: Option<String>, compiled_default: String) -> String {
+    environment_value.unwrap_or(compiled_default)
+}
+
+/// Return the process-configured sandbox runtime image, or the compiled default.
+#[must_use]
+pub fn default_sandbox_runtime_image() -> String {
+    runtime_image_default(
+        std::env::var(SANDBOX_RUNTIME_IMAGE_ENV).ok(),
+        compiled_sandbox_runtime_image(),
+    )
+}
+
+/// Return the process-configured supervisor image, or the compiled default.
+#[must_use]
+pub fn default_supervisor_image() -> String {
+    runtime_image_default(
+        std::env::var(SUPERVISOR_IMAGE_ENV).ok(),
+        compiled_supervisor_image(),
     )
 }
 
@@ -256,6 +280,10 @@ pub struct Config {
 
     /// TTL for SSH session tokens, in seconds. 0 disables expiry.
     pub ssh_session_ttl_secs: u64,
+
+    /// Absolute image preparation and initial supervisor startup budget for new
+    /// sandbox attempts, in seconds. Must be between 1 and 86400, inclusive.
+    pub image_preparation_timeout_seconds: u32,
 
     /// Maximum gRPC requests allowed per rate-limit window.
     ///
@@ -399,6 +427,10 @@ pub struct OidcConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MtlsAuthConfig {
+    /// Enable gateway-wide operators authenticated by verified certificates with OU=operator.
+    /// Independent of ordinary mTLS user authentication; defaults off.
+    #[serde(default)]
+    pub operator_enabled: bool,
     /// When true, the gateway maps a verified TLS client certificate into a
     /// user principal. Sandbox and supervisor clients use bearer identity, so
     /// this setting is independent of the selected compute driver.
@@ -935,6 +967,7 @@ impl Config {
             credential_drivers: Vec::new(),
             default_credential_driver: None,
             ssh_session_ttl_secs: default_ssh_session_ttl_secs(),
+            image_preparation_timeout_seconds: 1800,
             grpc_rate_limit_requests: None,
             grpc_rate_limit_window_secs: None,
             service_routing: ServiceRoutingConfig::default(),
@@ -1711,16 +1744,31 @@ mod tests {
     fn default_supervisor_image_is_version_pinned() {
         use super::{
             DEFAULT_SANDBOX_RUNTIME_IMAGE_REPO, DEFAULT_SUPERVISOR_IMAGE_REPO,
-            default_sandbox_runtime_image, default_supervisor_image,
+            compiled_sandbox_runtime_image, compiled_supervisor_image,
         };
-        let image = default_supervisor_image();
+        let image = compiled_supervisor_image();
         assert!(image.starts_with(&format!("{DEFAULT_SUPERVISOR_IMAGE_REPO}:")));
         let tag = image.rsplit_once(':').unwrap().1;
         assert!(!tag.is_empty());
 
-        let sandbox_image = default_sandbox_runtime_image();
+        let sandbox_image = compiled_sandbox_runtime_image();
         assert!(sandbox_image.starts_with(&format!("{DEFAULT_SANDBOX_RUNTIME_IMAGE_REPO}:")));
         let sandbox_tag = sandbox_image.rsplit_once(':').unwrap().1;
         assert!(!sandbox_tag.is_empty());
+    }
+
+    #[test]
+    fn runtime_image_environment_value_replaces_compiled_default() {
+        use super::runtime_image_default;
+
+        let digest = format!("registry.example.com/sandbox@sha256:{}", "a".repeat(64));
+        assert_eq!(
+            runtime_image_default(Some(digest.clone()), "compiled:default".to_string()),
+            digest
+        );
+        assert_eq!(
+            runtime_image_default(None, "compiled:default".to_string()),
+            "compiled:default"
+        );
     }
 }

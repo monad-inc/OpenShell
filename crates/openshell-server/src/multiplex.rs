@@ -48,7 +48,7 @@ use crate::{
     auth::authz::AuthzPolicy,
     auth::identity::Identity,
     auth::oidc::{self, OidcAuthenticator},
-    auth::principal::{Principal, UserPrincipal},
+    auth::principal::{OperatorPrincipal, Principal, UserPrincipal},
     auth::workspace_authz::{MinWorkspaceRole, authorize_workspace},
     http_router, service_http_router,
 };
@@ -269,6 +269,36 @@ impl MultiplexService {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        self.serve_with_verified_certificate(stream, peer_identity, None, peer_addr)
+            .await
+    }
+
+    /// TLS listener only: fingerprint and identity must originate from its verified handshake.
+    pub async fn serve_with_verified_certificate<S>(
+        &self,
+        stream: S,
+        peer_identity: Option<Identity>,
+        certificate_sha256: Option<String>,
+        peer_addr: Option<SocketAddr>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let operator = if self.state.config.mtls_auth.operator_enabled {
+            peer_identity
+                .as_ref()
+                .filter(|identity| {
+                    identity.provider == crate::auth::identity::IdentityProvider::Mtls
+                        && identity.roles.iter().any(|role| role == "operator")
+                })
+                .zip(certificate_sha256)
+                .map(|(identity, certificate_sha256)| OperatorPrincipal {
+                    identity: identity.clone(),
+                    certificate_sha256,
+                })
+        } else {
+            None
+        };
         let openshell = OpenShellServer::new(OpenShellService::new(self.state.clone()))
             .max_decoding_message_size(MAX_GRPC_DECODE_SIZE);
         let openshell = GatewayInterceptorGrpcService::new(
@@ -295,6 +325,7 @@ impl MultiplexService {
             self.state.config.mtls_auth.enabled,
             self.state.config.auth.allow_unauthenticated_users,
         )
+        .with_operator(operator)
         .with_audit(self.state.config.audit.clone(), peer_addr);
         let grpc_service =
             GrpcRateLimitService::new(grpc_service, self.state.grpc_rate_limiter.clone());
@@ -741,6 +772,15 @@ fn gateway_principal_fields(principal: &Principal) -> BTreeMap<String, String> {
                 fields.insert("scopes".to_string(), user.identity.scopes.join(","));
             }
         }
+        Principal::Operator(operator) => {
+            fields.insert("kind".to_string(), "operator".to_string());
+            fields.insert("subject".to_string(), operator.identity.subject.clone());
+            fields.insert("provider".to_string(), "mtls".to_string());
+            fields.insert(
+                "certificate_sha256".to_string(),
+                operator.certificate_sha256.clone(),
+            );
+        }
         Principal::Sandbox(sandbox) => {
             fields.insert("kind".to_string(), "sandbox".to_string());
             fields.insert("sandbox_id".to_string(), sandbox.sandbox_id.clone());
@@ -1001,6 +1041,7 @@ pub struct AuthGrpcRouter<S> {
     peer_identity: Option<Identity>,
     mtls_auth_enabled: bool,
     allow_unauthenticated_users: bool,
+    operator: Option<OperatorPrincipal>,
     /// Audit toggles for Authentication \[3002\] boundary events.
     audit: openshell_core::GatewayAuditConfig,
     /// Remote socket address of the connection, for audit `src_endpoint`.
@@ -1032,9 +1073,15 @@ impl<S> AuthGrpcRouter<S> {
             peer_identity,
             mtls_auth_enabled,
             allow_unauthenticated_users,
+            operator: None,
             audit: openshell_core::GatewayAuditConfig::default(),
             peer_addr: None,
         }
+    }
+
+    fn with_operator(mut self, operator: Option<OperatorPrincipal>) -> Self {
+        self.operator = operator;
+        self
     }
 
     /// Attach the audit toggles and connection peer address for
@@ -1087,6 +1134,7 @@ where
         let peer_identity = self.peer_identity.clone();
         let mtls_auth_enabled = self.mtls_auth_enabled;
         let allow_unauthenticated_users = self.allow_unauthenticated_users;
+        let operator = self.operator.clone();
         let audit = self.audit.clone();
         let peer_addr = self.peer_addr;
         let mut inner = self.inner.clone();
@@ -1135,7 +1183,18 @@ where
             // Success events carry what actually authenticated the request,
             // so a dev-mode principal audits as `local_dev` rather than
             // implying a stray Authorization header was validated.
-            let (principal, authn_mechanism) = if let Some(chain) = chain {
+            let (principal, authn_mechanism) = if let Some(operator) = operator {
+                if req.headers().contains_key(http::header::AUTHORIZATION) {
+                    authn_failure(
+                        "rejected_credential",
+                        "operator certificates must not be combined with authorization headers",
+                    );
+                    return Ok(status_response(tonic::Status::unauthenticated(
+                        "operator certificates must not be combined with authorization headers",
+                    )));
+                }
+                (Principal::Operator(operator), "mtls")
+            } else if let Some(chain) = chain {
                 match chain.authenticate(req.headers(), &path).await {
                     Ok(Some(p)) => (p, mechanism),
                     Ok(None) => match (mtls_auth_enabled, peer_identity) {
@@ -1187,6 +1246,13 @@ where
             };
 
             match principal {
+                Principal::Operator(_) => {
+                    if !crate::auth::method_authz::is_operator_callable(&path) {
+                        return Ok(status_response(tonic::Status::permission_denied(
+                            "operators may not call supervisor, peer, or unknown methods",
+                        )));
+                    }
+                }
                 Principal::User(ref user) => {
                     if !crate::auth::method_authz::is_user_callable(&path) {
                         return Ok(status_response(tonic::Status::permission_denied(
@@ -1440,6 +1506,15 @@ where
         scopes: Vec::new(),
         provider: IdentityProvider::Mtls,
     })
+}
+
+/// Fingerprint of the leaf certificate verified during the TLS handshake.
+pub fn extract_peer_certificate_sha256<S>(
+    stream: &tokio_rustls::server::TlsStream<S>,
+) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let certificate = stream.get_ref().1.peer_certificates()?.first()?;
+    Some(format!("{:x}", Sha256::digest(certificate.as_ref())))
 }
 
 /// Boxed body type for uniform handling.
@@ -2951,6 +3026,95 @@ mod tests {
                 },
                 trust_domain: Some("openshell".to_string()),
             })
+        }
+
+        fn operator_principal() -> OperatorPrincipal {
+            let mut identity = mtls_identity("operator");
+            identity.roles = vec!["operator".to_string()];
+            OperatorPrincipal {
+                identity,
+                certificate_sha256: "verified-leaf".to_string(),
+            }
+        }
+
+        #[tokio::test]
+        async fn operator_is_admin_but_not_supervisor_peer_or_unknown() {
+            for (method, permitted) in [
+                ("GetProviderCredentials", true),
+                ("CreateWorkspace", true),
+                ("UpdateProvider", true),
+                ("GetSandboxConfig", true),
+                ("ConnectSupervisor", false),
+                ("PeerRelay", false),
+                ("IssueSandboxToken", false),
+                ("Unknown", false),
+            ] {
+                let (recorder, seen) = PrincipalRecorder::new();
+                let mut router = AuthGrpcRouter::with_peer_identity(
+                    recorder,
+                    None,
+                    Some(AuthzPolicy {
+                        admin_role: "oidc-admin".into(),
+                        user_role: "oidc-user".into(),
+                        scopes_enabled: true,
+                    }),
+                    None,
+                    false,
+                    false,
+                )
+                .with_operator(Some(operator_principal()));
+                let response = router
+                    .call(empty_request(&format!("/openshell.v1.OpenShell/{method}")))
+                    .await
+                    .unwrap();
+                if permitted {
+                    assert!(grpc_status(&response).is_none());
+                    assert!(matches!(
+                        *seen.lock().unwrap(),
+                        Some(Principal::Operator(_))
+                    ));
+                } else {
+                    assert_eq!(grpc_status(&response).as_deref(), Some("7"));
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn user_bearer_claims_and_local_dev_cannot_export_credentials() {
+            let mut user = mtls_identity("ordinary-user");
+            user.provider = IdentityProvider::Oidc;
+            user.roles = vec!["operator".into(), "openshell-admin".into()];
+            user.scopes = vec!["openshell:all".into()];
+            for principal in [
+                Principal::User(UserPrincipal { identity: user }),
+                sandbox_principal(),
+                Principal::Peer(crate::auth::principal::PeerPrincipal {
+                    replica_id: "replica".into(),
+                    pod_uid: "pod".into(),
+                }),
+            ] {
+                let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(
+                    Ok(Some(principal)),
+                ))]);
+                let (recorder, _) = PrincipalRecorder::new();
+                let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
+                let response = router
+                    .call(empty_request(
+                        "/openshell.v1.OpenShell/GetProviderCredentials",
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(grpc_status(&response).as_deref(), Some("7"));
+            }
+            let (recorder, _) = PrincipalRecorder::new();
+            let mut router = AuthGrpcRouter::new(recorder, None, None);
+            let response = router
+                .call(empty_request(
+                    "/openshell.v1.OpenShell/GetProviderCredentials",
+                ))
+                .await
+                .unwrap();
+            assert_eq!(grpc_status(&response).as_deref(), Some("7"));
         }
 
         #[derive(Serialize)]

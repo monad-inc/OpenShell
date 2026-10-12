@@ -116,6 +116,9 @@ pub struct GatewayFileSection {
     // ── Sandbox / SSH ────────────────────────────────────────────────────
     #[serde(default)]
     pub ssh_session_ttl_secs: Option<u64>,
+    /// Absolute preparation budget for new attempts; existing deadlines persist.
+    #[serde(default)]
+    pub image_preparation_timeout_seconds: Option<u32>,
     #[serde(default)]
     pub grpc_rate_limit_requests: Option<u64>,
     #[serde(default)]
@@ -798,6 +801,17 @@ mod tests {
                 load(tmp.path()),
                 Err(ConfigFileError::InvalidDriverTable { ref name }) if name == "docker"
             ));
+        }
+    }
+
+    #[test]
+    fn gateway_rate_limits_reject_negative_values_during_toml_parsing() {
+        for field in ["grpc_rate_limit_requests", "grpc_rate_limit_window_seconds"] {
+            let tmp = write_tmp(&format!("[openshell.gateway]\n{field} = -1\n"));
+            assert!(
+                matches!(load(tmp.path()), Err(ConfigFileError::Parse { .. })),
+                "{field} must reject negative values because gateway rate limits are unsigned"
+            );
         }
     }
 

@@ -22,7 +22,9 @@ pub use logs::{OtlpLogConfig, build_log_exporter, log_exporter_for, logger};
 pub use opentelemetry_otlp::LogExporter as OtlpLogExporter;
 pub use opentelemetry_sdk::logs::SdkLoggerProvider;
 pub use propagation::{
-    HeaderMapExtractor, MetadataMapInjector, TraceContextInterceptor, current_trace_context_carrier,
+    HeaderMapExtractor, MetadataMapInjector, TRACEPARENT_ENV, TRACESTATE_ENV,
+    TraceContextInterceptor, current_trace_context_carrier, current_trace_context_environment,
+    set_parent_from_environment, trace_context_environment,
 };
 
 use opentelemetry::KeyValue;

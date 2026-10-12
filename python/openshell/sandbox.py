@@ -135,6 +135,8 @@ if TYPE_CHECKING:
     import builtins
     from collections.abc import Callable, Iterator, Mapping, Sequence
 
+    from .providers import ProviderClient
+
 
 @dataclass(frozen=True)
 class TlsConfig:
@@ -521,6 +523,8 @@ class SandboxRef:
     service_urls: Mapping[str, str] = field(
         default_factory=_ImmutableLabels, compare=False
     )
+    # Stable SSH host identity; absent on older runtimes.
+    host_key_fingerprint: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "labels", _ImmutableLabels(self.labels))
@@ -926,6 +930,12 @@ class SandboxClient:
 
     def sandbox_templates(self) -> SandboxTemplateClient:
         return SandboxTemplateClient(self._channel, timeout=self._timeout)
+
+    def providers(self) -> ProviderClient:
+        """Reuse this transport for provider operations; no sandbox is required."""
+        from .providers import ProviderClient
+
+        return ProviderClient(self._channel, timeout=self._timeout)
 
     def get(self, name: str, *, workspace: str) -> SandboxRef:
         response = self._stub.GetSandbox(
@@ -1796,6 +1806,7 @@ def _sandbox_ref(
         labels=sandbox.metadata.labels if sandbox.metadata else {},
         created_from_workload_template=provenance,
         service_urls=service_urls or {},
+        host_key_fingerprint=sandbox.host_key_fingerprint or None,
     )
 
 

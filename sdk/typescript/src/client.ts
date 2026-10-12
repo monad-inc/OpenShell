@@ -32,6 +32,7 @@ import {
 } from './gen/openshell_pb.js';
 import type { EffectiveSetting, GetSandboxConfigResponse, SandboxPolicy, SettingValue } from './gen/sandbox_pb.js';
 import { PolicySource, type SandboxPolicySchema, SettingScope, type SettingValueSchema } from './gen/sandbox_pb.js';
+import { ProviderClient } from './providers.js';
 import { validateSshResponse } from './ssh-validate.js';
 import { buildTransport, type ConnectOptions } from './transport.js';
 
@@ -216,6 +217,8 @@ export interface SandboxRef {
   labels: Record<string, string>;
   /** u64 rendered as a string — JS numbers can't hold it safely. */
   resourceVersion: string;
+  /** Stable SSH host identity; absent on older runtimes. */
+  hostKeyFingerprint?: string;
   mainProcessInstanceId?: string;
   exitCode?: number;
   createdFromWorkloadTemplate?: SandboxWorkloadTemplateProvenance;
@@ -535,6 +538,7 @@ function sandboxRef(sandbox: Sandbox | undefined, serviceUrls: Record<string, st
     phase: phaseName(sandbox.status?.phase ?? SandboxPhase.UNSPECIFIED),
     labels: meta?.labels ?? {},
     resourceVersion: (meta?.resourceVersion ?? 0n).toString(),
+    hostKeyFingerprint: sandbox.hostKeyFingerprint || undefined,
     mainProcessInstanceId: sandbox.status?.mainProcessInstanceId || undefined,
     exitCode: sandbox.status?.exitCode,
     createdFromWorkloadTemplate: sandbox.createdFromWorkloadTemplate
@@ -1806,6 +1810,8 @@ export class OpenShellClient {
   readonly sandbox: SandboxClient;
   /** Reusable sandbox workload template lifecycle. */
   readonly sandboxTemplates: SandboxTemplateClient;
+  /** Privileged provider credential retrieval; requires direct operator mTLS. */
+  readonly providers: ProviderClient;
 
   /**
    * Advanced escape hatch: a generated client for every gateway RPC, including
@@ -1826,6 +1832,7 @@ export class OpenShellClient {
     this.raw = this.grpc;
     this.sandbox = new SandboxClient(transport, this.grpc);
     this.sandboxTemplates = new SandboxTemplateClient(transport, this.grpc);
+    this.providers = new ProviderClient(transport);
   }
 
   /**

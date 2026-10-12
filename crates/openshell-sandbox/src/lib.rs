@@ -3,12 +3,11 @@
 
 //! Capability-free in-workload sandbox boundary.
 
-#[cfg(target_os = "linux")]
-mod accept_interrupt;
 pub mod boundary_exec;
 pub mod boundary_io;
 mod boundary_server;
 pub mod child_env;
+pub mod container_log;
 #[cfg(target_os = "linux")]
 pub(crate) mod delegated;
 #[cfg(target_os = "linux")]
@@ -43,6 +42,7 @@ pub struct RuntimeQualification {
     pub tcp_dns_round_trip: bool,
     pub tcp_allow_round_trip: bool,
     pub tcp_deny_round_trip: bool,
+    pub socket_loopback_confinement: bool,
 }
 
 /// Placeholder used when compiling the package on a non-Linux host.

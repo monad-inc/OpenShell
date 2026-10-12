@@ -1461,8 +1461,10 @@ enum SandboxCommands {
         /// Format: `<LOCAL_PATH>[:<SANDBOX_PATH>]`.
         /// When `SANDBOX_PATH` is omitted, files are uploaded to the container's
         /// working directory.
-        /// `.gitignore` rules are applied by default; use `--no-git-ignore` to
-        /// upload everything.
+        /// Inside a Git work tree, `.gitignore` rules are applied by default.
+        /// Outside a Git work tree, uploads proceed unfiltered with a warning.
+        /// Filtering errors or empty selections stop the upload; use
+        /// `--no-git-ignore` to intentionally upload everything.
         #[arg(
             long,
             value_hint = ValueHint::AnyPath,
@@ -1766,6 +1768,11 @@ enum SandboxCommands {
     },
 
     /// Upload local files to a sandbox.
+    ///
+    /// Inside a Git work tree, `.gitignore` rules are applied by default.
+    /// Outside a Git work tree, uploads proceed unfiltered with a warning.
+    /// Filtering errors or empty selections stop the upload; use
+    /// `--no-git-ignore` to intentionally upload everything.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Upload {
         /// Sandbox name.
@@ -1776,7 +1783,11 @@ enum SandboxCommands {
         #[arg(value_hint = ValueHint::AnyPath)]
         local_path: String,
 
-        /// Destination path in the sandbox (defaults to the container's working directory).
+        /// Destination path in the sandbox (defaults to its working directory).
+        ///
+        /// For an unfiltered single-file upload, an existing directory or a
+        /// trailing slash places the file inside that directory. A missing
+        /// nested path without a trailing slash renames the file.
         dest: Option<String>,
 
         /// Disable `.gitignore` filtering (uploads everything).
@@ -3408,14 +3419,6 @@ async fn run_async() -> Result<()> {
                             (local, remote, !no_git_ignore)
                         })
                         .collect();
-
-                    // Validate all local paths before creating the sandbox so failures are
-                    // fast and have no side effects.
-                    for (local, _, _) in &upload_specs {
-                        if std::fs::symlink_metadata(local).is_err() {
-                            return Err(miette::miette!("local path does not exist: {}", local));
-                        }
-                    }
 
                     let editor = editor.map(Into::into);
                     let forward = forward
