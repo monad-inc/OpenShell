@@ -994,7 +994,7 @@ Editing configuration after expiry does not restart compute. An explicit retry g
 | Ready        | The sandbox is running and its supervisor control session is connected. You can connect, execute commands, sync files, and view logs.                          |
 | Stopping     | The gateway accepted a stop request and is stopping compute while retaining persistent state.                                                         |
 | Stopped      | Compute was stopped explicitly and access is unavailable.                                                                                 |
-| Starting     | Compute is starting, or a selected main-process restart is waiting for backoff or a fresh supervisor session. Access resumes after the new session connects. |
+| Starting     | Compute is starting, or a main-process restart or lost-runtime replacement is waiting for backoff or a fresh supervisor session. Access resumes after the new session connects. |
 | Completed    | The canonical main process exited with code 0. Its normalized result is available in `status.exit_code`.                                           |
 | Error        | The canonical main process failed, or sandbox infrastructure failed. Inspect the condition reason and `status.exit_code`.                  |
 | Deleting     | The sandbox is being torn down. The system releases resources and purges credentials.                                                                          |
@@ -1014,7 +1014,9 @@ selects replacement, `status.restart_count` and `status.next_restart_time`
 show the attempt number and next deadline. Inspect them with
 `openshell sandbox get <name>`. `sandbox stop` cancels a pending replacement;
 an explicit later start resets the restart count. Compute runtimes do not
-apply their own restart policy.
+apply their own restart policy. On Kubernetes, the gateway also replaces a
+running sandbox whose runtime was lost, with reason `SandboxRuntimeLost`; see
+[Kubernetes Runtime Loss](/how-it-works/sandboxes/runtimes#kubernetes-runtime-loss).
 
 ## Sandbox Runtimes
 

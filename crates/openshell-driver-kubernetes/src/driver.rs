@@ -44,8 +44,9 @@ use kube::runtime::watcher::{self, Event};
 use kube::{Client, Error as KubeError};
 use openshell_core::driver_mounts;
 use openshell_core::driver_utils::{
-    LABEL_GATEWAY_ID, LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID,
-    LABEL_SANDBOX_NAME, LABEL_SANDBOX_WORKSPACE, openshell_sandbox_label_selector,
+    CONDITION_RUNTIME_LOST, LABEL_GATEWAY_ID, LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE,
+    LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME, LABEL_SANDBOX_WORKSPACE,
+    openshell_sandbox_label_selector,
 };
 use openshell_core::gpu::{driver_gpu_requirements, effective_driver_gpu_count};
 use openshell_core::progress::{
@@ -104,6 +105,23 @@ const ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_UID: &str =
     "openshell.ai/sandbox-runtime-network-policy-uid";
 const ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_GENERATION: &str =
     "openshell.ai/sandbox-runtime-network-policy-generation";
+/// Set when the driver suspends a running sandbox because its runtime was
+/// lost, so the snapshot can tell that suspension apart from a user stop.
+/// Cleared by every explicit stop and start.
+const ANNOTATION_SANDBOX_RUNTIME_SUSPENSION_CAUSE: &str =
+    "openshell.ai/sandbox-runtime-suspension-cause";
+const SANDBOX_RUNTIME_SUSPENSION_CAUSE_RUNTIME_LOST: &str = "runtime-lost";
+
+/// Why reconciliation suspends a sandbox.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SandboxRuntimeSuspensionCause {
+    /// The boundary failed validation (admission, an altered fence, a stale
+    /// bootstrap). The sandbox stays suspended until someone acts on it.
+    FailClosed,
+    /// The supervisor, workload, or boundary Service was lost or replaced. The
+    /// gateway may start a fresh generation.
+    RuntimeLost,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SandboxRuntimeBootstrapPhase {
@@ -3137,7 +3155,16 @@ impl KubernetesComputeDriver {
     async fn stop_sandbox_inner(&self, sandbox_id: &str) -> Result<(), KubernetesDriverError> {
         let (agent_sandbox_api, kube_name, pod_name, namespace, stop_timeout, phase) =
             self.prepare_sandbox_stop(sandbox_id).await?;
-        if phase != Some(SandboxRuntimeBootstrapPhase::Suspending) {
+        if phase == Some(SandboxRuntimeBootstrapPhase::Suspending) {
+            // Reconciliation may be suspending a lost runtime. Record the stop
+            // intent now so a stop that times out cannot later auto-recover.
+            patch_dynamic_object_with_resource_version_retry(
+                &agent_sandbox_api.api,
+                &kube_name,
+                sandbox_runtime_clear_suspension_cause_patch,
+            )
+            .await?;
+        } else {
             self.delete_sandbox_runtime_supervisor_pod(sandbox_id, &namespace)
                 .await?;
             patch_dynamic_object_with_resource_version_retry(
@@ -3195,7 +3222,7 @@ impl KubernetesComputeDriver {
                 patch_dynamic_object_with_resource_version_retry(
                     &agent_sandbox_api.api,
                     &kube_name,
-                    sandbox_runtime_suspension_completion_patch,
+                    sandbox_runtime_stop_completion_patch,
                 )
                 .await?;
                 return Ok(());
@@ -3490,6 +3517,7 @@ impl KubernetesComputeDriver {
                         ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_STARTED_AT: openshell_core::time::now_ms().to_string(),
                         ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_OPERATION: "restart",
                         ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_PHASE: SandboxRuntimeBootstrapPhase::Preparing.as_str(),
+                        ANNOTATION_SANDBOX_RUNTIME_SUSPENSION_CAUSE: serde_json::Value::Null,
                         ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_SESSION: launch_authentication.supervisor.session_id.to_string(),
                         ANNOTATION_SANDBOX_RUNTIME_GENERATION: generation.as_str(),
                         ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_UID: supervisor_uid.clone(),
@@ -3969,8 +3997,12 @@ impl KubernetesComputeDriver {
             if let Err(error) = self.admit_stored_resources(&object).await {
                 warn!(%sandbox_id, reason = %error.message(), "Sandbox resource admission revalidation failed");
                 if error.code() == tonic::Code::FailedPrecondition {
-                    self.suspend_sandbox_runtime_after_dependency_failure(&lookup_api, &object)
-                        .await;
+                    self.suspend_sandbox_runtime_after_dependency_failure(
+                        &lookup_api,
+                        &object,
+                        SandboxRuntimeSuspensionCause::FailClosed,
+                    )
+                    .await;
                 }
                 continue;
             }
@@ -4012,8 +4044,12 @@ impl KubernetesComputeDriver {
                 Ok(()) => {}
                 Err(KubernetesDriverError::Precondition(error)) => {
                     warn!(sandbox_id, %error, "sandbox-runtime workload fence is altered; suspending workload");
-                    self.suspend_sandbox_runtime_after_dependency_failure(&lookup_api, &object)
-                        .await;
+                    self.suspend_sandbox_runtime_after_dependency_failure(
+                        &lookup_api,
+                        &object,
+                        SandboxRuntimeSuspensionCause::FailClosed,
+                    )
+                    .await;
                     continue;
                 }
                 Err(error) => {
@@ -4035,8 +4071,12 @@ impl KubernetesComputeDriver {
                     sandbox_id,
                     "namespace workload fence generation changed; suspending stale boundary"
                 );
-                self.suspend_sandbox_runtime_after_dependency_failure(&lookup_api, &object)
-                    .await;
+                self.suspend_sandbox_runtime_after_dependency_failure(
+                    &lookup_api,
+                    &object,
+                    SandboxRuntimeSuspensionCause::RuntimeLost,
+                )
+                .await;
                 continue;
             }
             if sandbox_runtime_bootstrap_in_progress(&object) {
@@ -4069,8 +4109,12 @@ impl KubernetesComputeDriver {
                             sandbox_id,
                             "sandbox-runtime workload generation changed; suspending stale boundary"
                         );
-                        self.suspend_sandbox_runtime_after_dependency_failure(&lookup_api, &object)
-                            .await;
+                        self.suspend_sandbox_runtime_after_dependency_failure(
+                            &lookup_api,
+                            &object,
+                            SandboxRuntimeSuspensionCause::RuntimeLost,
+                        )
+                        .await;
                         continue;
                     }
                     SandboxRuntimeControlAvailability::Unknown => {
@@ -4096,8 +4140,12 @@ impl KubernetesComputeDriver {
                             sandbox_id,
                             "sandbox-runtime supervisor generation changed; suspending stale boundary"
                         );
-                        self.suspend_sandbox_runtime_after_dependency_failure(&lookup_api, &object)
-                            .await;
+                        self.suspend_sandbox_runtime_after_dependency_failure(
+                            &lookup_api,
+                            &object,
+                            SandboxRuntimeSuspensionCause::RuntimeLost,
+                        )
+                        .await;
                         continue;
                     }
                     SandboxRuntimeControlAvailability::Unknown => continue,
@@ -4115,8 +4163,12 @@ impl KubernetesComputeDriver {
                 Ok(()) => {}
                 Err(KubernetesDriverError::Precondition(error)) => {
                     warn!(sandbox_id, %error, "sandbox-runtime companion is missing; suspending workload");
-                    self.suspend_sandbox_runtime_after_dependency_failure(&lookup_api, &object)
-                        .await;
+                    self.suspend_sandbox_runtime_after_dependency_failure(
+                        &lookup_api,
+                        &object,
+                        SandboxRuntimeSuspensionCause::RuntimeLost,
+                    )
+                    .await;
                 }
                 Err(error) => {
                     warn!(sandbox_id, %error, "failed to reconcile sandbox-runtime supervisor Pod");
@@ -4129,8 +4181,12 @@ impl KubernetesComputeDriver {
                     sandbox_id,
                     "sandbox-runtime supervisor is unavailable; suspending workload"
                 );
-                self.suspend_sandbox_runtime_after_dependency_failure(&lookup_api, &object)
-                    .await;
+                self.suspend_sandbox_runtime_after_dependency_failure(
+                    &lookup_api,
+                    &object,
+                    SandboxRuntimeSuspensionCause::RuntimeLost,
+                )
+                .await;
                 continue;
             }
             self.publish_sandbox_runtime_readiness_transition(&lookup_api, &object, availability)
@@ -4297,6 +4353,7 @@ impl KubernetesComputeDriver {
         &self,
         lookup_api: &AgentSandboxApi,
         object: &DynamicObject,
+        cause: SandboxRuntimeSuspensionCause,
     ) {
         let Some(name) = object.metadata.name.as_deref() else {
             return;
@@ -4308,13 +4365,14 @@ impl KubernetesComputeDriver {
             .unwrap_or(&self.config.namespace);
         let api =
             Self::agent_sandbox_api(self.client.clone(), &lookup_api.resource.version, namespace);
-        let patch = sandbox_runtime_suspension_patch(
+        let patch = sandbox_runtime_dependency_suspension_patch(
             &lookup_api.resource.version,
             object
                 .metadata
                 .resource_version
                 .as_deref()
                 .unwrap_or_default(),
+            cause,
         );
         match tokio::time::timeout(
             KUBE_API_TIMEOUT,
@@ -4350,8 +4408,12 @@ impl KubernetesComputeDriver {
                 sandbox = object.metadata.name.as_deref().unwrap_or("<unknown>"),
                 "suspending stale sandbox-runtime restart bootstrap"
             );
-            self.suspend_sandbox_runtime_after_dependency_failure(lookup_api, object)
-                .await;
+            self.suspend_sandbox_runtime_after_dependency_failure(
+                lookup_api,
+                object,
+                SandboxRuntimeSuspensionCause::FailClosed,
+            )
+            .await;
             return;
         }
         let (Some(name), Some(uid), Some(resource_version)) = (
@@ -5761,7 +5823,39 @@ async fn sandbox_from_object_with_sandbox_runtime_readiness(
             mark_sandbox_runtime_control_unavailable(&mut sandbox);
         }
     }
+    if sandbox_runtime_lost(&obj) {
+        mark_sandbox_runtime_lost(&mut sandbox);
+    }
     Ok((name, sandbox))
+}
+
+fn sandbox_runtime_lost(object: &DynamicObject) -> bool {
+    object
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(ANNOTATION_SANDBOX_RUNTIME_SUSPENSION_CAUSE))
+        .is_some_and(|cause| cause == SANDBOX_RUNTIME_SUSPENSION_CAUSE_RUNTIME_LOST)
+}
+
+/// Report a runtime-lost suspension as `Ready=False` with
+/// [`CONDITION_RUNTIME_LOST`] so the gateway can distinguish it from a stop.
+fn mark_sandbox_runtime_lost(sandbox: &mut Sandbox) {
+    const MESSAGE: &str =
+        "sandbox runtime was lost; suspended until a replacement generation starts";
+    let Some(status) = sandbox.status.as_mut() else {
+        return;
+    };
+    status
+        .conditions
+        .retain(|condition| condition.r#type != "Ready");
+    status.conditions.push(SandboxCondition {
+        r#type: "Ready".to_string(),
+        status: "False".to_string(),
+        reason: CONDITION_RUNTIME_LOST.to_string(),
+        message: MESSAGE.to_string(),
+        transition_time: None,
+    });
 }
 
 fn mark_sandbox_runtime_bootstrapping(sandbox: &mut Sandbox) {
@@ -7354,10 +7448,46 @@ fn sandbox_runtime_suspension_patch(
                 ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_OPERATION: "stop",
                 ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_PHASE: SandboxRuntimeBootstrapPhase::Suspending.as_str(),
                 ANNOTATION_SANDBOX_RUNTIME_READINESS: "unavailable",
+                ANNOTATION_SANDBOX_RUNTIME_SUSPENSION_CAUSE: serde_json::Value::Null,
             },
         },
         "spec": desired_state,
     })
+}
+
+/// Suspend after reconciliation found a broken boundary. A lost runtime keeps
+/// a durable cause so the gateway can replace it; a fail-closed suspension
+/// carries no cause and stays stopped like an explicit stop.
+fn sandbox_runtime_dependency_suspension_patch(
+    api_version: &str,
+    resource_version: &str,
+    cause: SandboxRuntimeSuspensionCause,
+) -> serde_json::Value {
+    let mut patch = sandbox_runtime_suspension_patch(api_version, resource_version);
+    if cause == SandboxRuntimeSuspensionCause::RuntimeLost {
+        patch["metadata"]["annotations"][ANNOTATION_SANDBOX_RUNTIME_SUSPENSION_CAUSE] =
+            serde_json::json!(SANDBOX_RUNTIME_SUSPENSION_CAUSE_RUNTIME_LOST);
+    }
+    patch
+}
+
+fn sandbox_runtime_clear_suspension_cause_patch(resource_version: &str) -> serde_json::Value {
+    serde_json::json!({
+        "metadata": {
+            "resourceVersion": resource_version,
+            "annotations": {ANNOTATION_SANDBOX_RUNTIME_SUSPENSION_CAUSE: serde_json::Value::Null},
+        },
+    })
+}
+
+/// Completes an explicit stop. Unlike reconciliation's completion, it also
+/// clears a runtime-lost cause that a concurrent reconciliation may have set
+/// while the stop was in flight, so a deliberate stop never auto-recovers.
+fn sandbox_runtime_stop_completion_patch(resource_version: &str) -> serde_json::Value {
+    let mut patch = sandbox_runtime_suspension_completion_patch(resource_version);
+    patch["metadata"]["annotations"][ANNOTATION_SANDBOX_RUNTIME_SUSPENSION_CAUSE] =
+        serde_json::Value::Null;
+    patch
 }
 
 fn sandbox_runtime_suspension_completion_patch(resource_version: &str) -> serde_json::Value {
@@ -8746,6 +8876,17 @@ mod tests {
                         "items": [sandbox.clone()]
                     }),
                 ),
+            ),
+            // The stop first clears any runtime-lost cause.
+            (
+                http::Method::GET,
+                sandbox_path,
+                kube_test_response(http::StatusCode::OK, sandbox.clone()),
+            ),
+            (
+                http::Method::PATCH,
+                sandbox_path,
+                kube_test_response(http::StatusCode::OK, sandbox.clone()),
             ),
             (
                 http::Method::GET,
@@ -12525,6 +12666,109 @@ mod tests {
         assert_eq!(
             patch["metadata"]["annotations"][ANNOTATION_SANDBOX_RUNTIME_READINESS],
             "ready"
+        );
+    }
+
+    #[test]
+    fn runtime_lost_suspension_keeps_its_cause_until_an_explicit_stop() {
+        let cause = |patch: &serde_json::Value| {
+            patch["metadata"]["annotations"][ANNOTATION_SANDBOX_RUNTIME_SUSPENSION_CAUSE].clone()
+        };
+        let lost = sandbox_runtime_dependency_suspension_patch(
+            SANDBOX_VERSION_V1BETA1,
+            "42",
+            SandboxRuntimeSuspensionCause::RuntimeLost,
+        );
+        assert_eq!(cause(&lost), SANDBOX_RUNTIME_SUSPENSION_CAUSE_RUNTIME_LOST);
+        assert_eq!(lost["spec"]["operatingMode"], "Suspended");
+        assert_eq!(
+            lost["metadata"]["annotations"][ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_PHASE],
+            SandboxRuntimeBootstrapPhase::Suspending.as_str()
+        );
+
+        // A fail-closed suspension, like an explicit stop, clears any cause.
+        let fail_closed = sandbox_runtime_dependency_suspension_patch(
+            SANDBOX_VERSION_V1ALPHA1,
+            "42",
+            SandboxRuntimeSuspensionCause::FailClosed,
+        );
+        assert_eq!(cause(&fail_closed), serde_json::Value::Null);
+        assert_eq!(fail_closed["spec"]["replicas"], 0);
+        assert_eq!(
+            cause(&sandbox_runtime_suspension_patch(
+                SANDBOX_VERSION_V1BETA1,
+                "42"
+            )),
+            serde_json::Value::Null
+        );
+
+        // Reconciliation completes the suspension without touching the cause;
+        // an explicit stop's completion removes it.
+        let completion = sandbox_runtime_suspension_completion_patch("43");
+        assert!(
+            completion["metadata"]["annotations"]
+                .get(ANNOTATION_SANDBOX_RUNTIME_SUSPENSION_CAUSE)
+                .is_none()
+        );
+        assert_eq!(
+            cause(&sandbox_runtime_stop_completion_patch("43")),
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn runtime_lost_cause_is_reported_as_ready_false() {
+        let mut object = DynamicObject::new(
+            "sandbox-cr",
+            &ApiResource::from_gvk(&GroupVersionKind::gvk(
+                SANDBOX_GROUP,
+                SANDBOX_VERSION_V1BETA1,
+                SANDBOX_KIND,
+            )),
+        );
+        assert!(!sandbox_runtime_lost(&object));
+        object.metadata.annotations = Some(BTreeMap::from([(
+            ANNOTATION_SANDBOX_RUNTIME_SUSPENSION_CAUSE.to_string(),
+            SANDBOX_RUNTIME_SUSPENSION_CAUSE_RUNTIME_LOST.to_string(),
+        )]));
+        assert!(sandbox_runtime_lost(&object));
+
+        let mut sandbox = Sandbox {
+            status: Some(SandboxStatus {
+                conditions: vec![
+                    SandboxCondition {
+                        r#type: "Ready".to_string(),
+                        status: "False".to_string(),
+                        reason: "DependenciesNotReady".to_string(),
+                        message: String::new(),
+                        transition_time: None,
+                    },
+                    SandboxCondition {
+                        r#type: SANDBOX_SUSPENDED_CONDITION.to_string(),
+                        status: "True".to_string(),
+                        reason: "PodTerminated".to_string(),
+                        message: String::new(),
+                        transition_time: None,
+                    },
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        mark_sandbox_runtime_lost(&mut sandbox);
+
+        let conditions = &sandbox.status.unwrap().conditions;
+        let ready: Vec<_> = conditions
+            .iter()
+            .filter(|condition| condition.r#type == "Ready")
+            .collect();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].status, "False");
+        assert_eq!(ready[0].reason, CONDITION_RUNTIME_LOST);
+        assert!(
+            conditions
+                .iter()
+                .any(|condition| condition.r#type == SANDBOX_SUSPENDED_CONDITION)
         );
     }
 
