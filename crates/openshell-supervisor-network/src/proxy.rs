@@ -43,8 +43,6 @@ use openshell_ocsf::{
     HttpRequest, HttpResponse, NetworkActivityBuilder, Process, SeverityId, StatusId,
     Url as OcsfUrl, ocsf_emit,
 };
-#[cfg(target_os = "linux")]
-use std::mem::size_of;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -1414,47 +1412,18 @@ fn build_transparent_tcp_allow_ocsf_event(
 
 #[cfg(target_os = "linux")]
 fn original_destination(stream: &TcpStream) -> std::io::Result<SocketAddr> {
-    use std::os::fd::AsRawFd;
-    let fd = stream.as_raw_fd();
+    use nix::sys::socket::{getsockopt, sockopt};
+
     if stream.local_addr()?.is_ipv4() {
-        #[allow(unsafe_code)]
-        unsafe {
-            let mut address: libc::sockaddr_in = std::mem::zeroed();
-            let mut length = libc::socklen_t::try_from(size_of::<libc::sockaddr_in>())
-                .expect("sockaddr_in size fits socklen_t");
-            if libc::getsockopt(
-                fd,
-                libc::SOL_IP,
-                80, // SO_ORIGINAL_DST
-                std::ptr::addr_of_mut!(address).cast(),
-                std::ptr::addr_of_mut!(length),
-            ) != 0
-            {
-                return Err(std::io::Error::last_os_error());
-            }
-            return Ok(SocketAddr::new(
-                IpAddr::V4(std::net::Ipv4Addr::from(
-                    address.sin_addr.s_addr.to_ne_bytes(),
-                )),
-                u16::from_be(address.sin_port),
-            ));
-        }
-    }
-    #[allow(unsafe_code)]
-    unsafe {
-        let mut address: libc::sockaddr_in6 = std::mem::zeroed();
-        let mut length = libc::socklen_t::try_from(size_of::<libc::sockaddr_in6>())
-            .expect("sockaddr_in6 size fits socklen_t");
-        if libc::getsockopt(
-            fd,
-            libc::SOL_IPV6,
-            80, // IP6T_SO_ORIGINAL_DST
-            std::ptr::addr_of_mut!(address).cast(),
-            std::ptr::addr_of_mut!(length),
-        ) != 0
-        {
-            return Err(std::io::Error::last_os_error());
-        }
+        let address = getsockopt(stream, sockopt::OriginalDst)?;
+        Ok(SocketAddr::new(
+            IpAddr::V4(std::net::Ipv4Addr::from(
+                address.sin_addr.s_addr.to_ne_bytes(),
+            )),
+            u16::from_be(address.sin_port),
+        ))
+    } else {
+        let address = getsockopt(stream, sockopt::Ip6tOriginalDst)?;
         Ok(SocketAddr::new(
             IpAddr::V6(std::net::Ipv6Addr::from(address.sin6_addr.s6_addr)),
             u16::from_be(address.sin6_port),
@@ -5139,16 +5108,7 @@ fn complete_chunked_body_prefix_len(bytes: &[u8]) -> Option<usize> {
             .windows(2)
             .position(|window| window == b"\r\n")?
             + pos;
-        let size_line = std::str::from_utf8(&bytes[pos..line_end]).ok()?;
-        let size = usize::from_str_radix(
-            size_line
-                .split(';')
-                .next()
-                .map(str::trim)
-                .unwrap_or_default(),
-            16,
-        )
-        .ok()?;
+        let size = crate::l7::http::parse_chunk_size_line(&bytes[pos..line_end]).ok()?;
         pos = line_end.checked_add(2)?;
 
         if size == 0 {
@@ -5157,6 +5117,7 @@ fn complete_chunked_body_prefix_len(bytes: &[u8]) -> Option<usize> {
                     .windows(2)
                     .position(|window| window == b"\r\n")?
                     + pos;
+                crate::l7::http::validate_chunk_trailer_line(&bytes[pos..trailer_end]).ok()?;
                 let empty = trailer_end == pos;
                 pos = trailer_end.checked_add(2)?;
                 if empty {
@@ -7029,6 +6990,7 @@ fn is_benign_relay_error(err: &miette::Report) -> bool {
 )]
 mod tests {
     use super::*;
+    use crate::test_support::{executable_path, policy_with_native_executable_paths};
     use openshell_core::proposals::AgentProposals;
     use std::collections::HashMap as TestHashMap;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -7040,7 +7002,8 @@ mod tests {
     fn supplied_identity_preserves_authorized_endpoint_metadata() {
         let engine = OpaEngine::from_strings(
             include_str!("../data/sandbox-policy.rego"),
-            r#"
+            &policy_with_native_executable_paths(
+                r#"
 network_policies:
   inspected:
     name: inspected
@@ -7065,11 +7028,12 @@ process:
   run_as_user: sandbox
   run_as_group: sandbox
 "#,
+            ),
         )
         .expect("load policy");
         let identity = Ok(ContractBinaryIdentity {
             executable: ContractExecutableIdentity {
-                path: PathBuf::from("/usr/bin/python3"),
+                path: executable_path("/usr/bin/python3"),
                 digest: Some("00".repeat(32).parse().expect("digest")),
             },
             ancestors: Vec::new(),
@@ -7097,7 +7061,8 @@ process:
     fn supplied_identity_rejects_same_path_replacement() {
         let engine = OpaEngine::from_strings(
             include_str!("../data/sandbox-policy.rego"),
-            r#"
+            &policy_with_native_executable_paths(
+                r#"
 network_policies:
   credentialed:
     name: credentialed
@@ -7120,12 +7085,13 @@ process:
   run_as_user: sandbox
   run_as_group: sandbox
 "#,
+            ),
         )
         .expect("load policy");
         let identity = |digest_byte: &str| {
             Ok(ContractBinaryIdentity {
                 executable: ContractExecutableIdentity {
-                    path: PathBuf::from("/sandbox/bin/client"),
+                    path: executable_path("/sandbox/bin/client"),
                     digest: Some(digest_byte.repeat(32).parse().expect("digest")),
                 },
                 ancestors: Vec::new(),
@@ -7154,7 +7120,8 @@ process:
     fn supplied_identity_rejects_replaced_authorizing_ancestor() {
         let engine = OpaEngine::from_strings(
             include_str!("../data/sandbox-policy.rego"),
-            r#"
+            &policy_with_native_executable_paths(
+                r#"
 network_policies:
   allowed:
     name: allowed
@@ -7173,16 +7140,17 @@ process:
   run_as_user: sandbox
   run_as_group: sandbox
 "#,
+            ),
         )
         .expect("load policy");
         let identity = |ancestor_digest: &str| {
             Ok(ContractBinaryIdentity {
                 executable: ContractExecutableIdentity {
-                    path: PathBuf::from("/sandbox/bin/client"),
+                    path: executable_path("/sandbox/bin/client"),
                     digest: Some("11".repeat(32).parse().expect("digest")),
                 },
                 ancestors: vec![ContractExecutableIdentity {
-                    path: PathBuf::from("/sandbox/bin/launcher"),
+                    path: executable_path("/sandbox/bin/launcher"),
                     digest: Some(ancestor_digest.repeat(32).parse().expect("digest")),
                 }],
                 cmdline_paths: Vec::new(),
@@ -7225,11 +7193,13 @@ process:
   run_as_group: sandbox
 "#;
         let rego = include_str!("../data/sandbox-policy.rego");
-        let engine = OpaEngine::from_strings(rego, POLICY_DATA).expect("load policy");
+        let engine =
+            OpaEngine::from_strings(rego, &policy_with_native_executable_paths(POLICY_DATA))
+                .expect("load policy");
         let identity = |digest_byte: &str| {
             Ok(ContractBinaryIdentity {
                 executable: ContractExecutableIdentity {
-                    path: PathBuf::from("/sandbox/bin/client"),
+                    path: executable_path("/sandbox/bin/client"),
                     digest: Some(digest_byte.repeat(32).parse().expect("digest")),
                 },
                 ancestors: Vec::new(),
@@ -7243,7 +7213,9 @@ process:
             authorize_supplied_identity(&engine, &identity_cache, intent(), &identity("11"));
         assert!(matches!(original.action, NetworkAction::Allow { .. }));
 
-        engine.reload(rego, POLICY_DATA).expect("reload policy");
+        engine
+            .reload(rego, &policy_with_native_executable_paths(POLICY_DATA))
+            .expect("reload policy");
         let replacement =
             authorize_supplied_identity(&engine, &identity_cache, intent(), &identity("22"));
 
@@ -7259,7 +7231,8 @@ process:
     fn supplied_identity_rejects_missing_ancestor_digest_before_policy() {
         let engine = OpaEngine::from_strings(
             include_str!("../data/sandbox-policy.rego"),
-            r#"
+            &policy_with_native_executable_paths(
+                r#"
 network_policies:
   allowed:
     name: allowed
@@ -7278,15 +7251,16 @@ process:
   run_as_user: sandbox
   run_as_group: sandbox
 "#,
+            ),
         )
         .expect("load policy");
         let identity = Ok(ContractBinaryIdentity {
             executable: ContractExecutableIdentity {
-                path: PathBuf::from("/sandbox/bin/client"),
+                path: executable_path("/sandbox/bin/client"),
                 digest: Some("11".repeat(32).parse().expect("digest")),
             },
             ancestors: vec![ContractExecutableIdentity {
-                path: PathBuf::from("/sandbox/bin/launcher"),
+                path: executable_path("/sandbox/bin/launcher"),
                 digest: None,
             }],
             cmdline_paths: Vec::new(),
@@ -7310,7 +7284,8 @@ process:
     async fn staged_transparent_open_waits_for_l4_policy() {
         let engine = OpaEngine::from_strings(
             include_str!("../data/sandbox-policy.rego"),
-            r#"
+            &policy_with_native_executable_paths(
+                r#"
 network_policies:
   allowed:
     name: allowed
@@ -7331,6 +7306,7 @@ process:
   run_as_user: sandbox
   run_as_group: sandbox
 "#,
+            ),
         )
         .unwrap();
         let identity_cache = BinaryIdentityCache::new();
@@ -7338,7 +7314,7 @@ process:
         let identity = || {
             Ok(ContractBinaryIdentity {
                 executable: ContractExecutableIdentity {
-                    path: PathBuf::from("/usr/bin/curl"),
+                    path: executable_path("/usr/bin/curl"),
                     digest: Some("00".repeat(32).parse().unwrap()),
                 },
                 ancestors: Vec::new(),
@@ -7431,7 +7407,10 @@ process:
             .expect("policy denial is sent to mapper");
         assert_eq!(event.host, "203.0.113.8");
         assert_eq!(event.port, 443);
-        assert_eq!(event.binary, "/usr/bin/curl");
+        assert_eq!(
+            event.binary,
+            executable_path("/usr/bin/curl").to_str().unwrap()
+        );
         assert_eq!(event.denial_stage, "transparent_tcp_connect");
         assert!(denial_rx.try_recv().is_err(), "exactly one mapper event");
     }
@@ -7533,7 +7512,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
                 stream: Box::new(stream),
                 binary_identity: Ok(ContractBinaryIdentity {
                     executable: ContractExecutableIdentity {
-                        path: PathBuf::from("/usr/bin/curl"),
+                        path: executable_path("/usr/bin/curl"),
                         digest: Some("00".repeat(32).parse().unwrap()),
                     },
                     ancestors: Vec::new(),
@@ -7719,7 +7698,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
     async fn staged_transparent_open_dials_only_pinned_policy_dns_addresses() {
         let engine = OpaEngine::from_strings(
             include_str!("../data/sandbox-policy.rego"),
-            POLICY_DNS_OPEN_POLICY,
+            &policy_with_native_executable_paths(POLICY_DNS_OPEN_POLICY),
         )
         .unwrap();
         let store = policy_dns_test_store();
@@ -7759,7 +7738,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
     async fn staged_transparent_open_proposes_a_denied_observation_hostname() {
         let engine = OpaEngine::from_strings(
             include_str!("../data/sandbox-policy.rego"),
-            POLICY_DNS_OPEN_POLICY,
+            &policy_with_native_executable_paths(POLICY_DNS_OPEN_POLICY),
         )
         .unwrap();
         let store = policy_dns_test_store();
@@ -7792,14 +7771,17 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
         let event = denial_rx.try_recv().expect("denial is sent to the mapper");
         assert_eq!(event.host, "unknown.example");
         assert_eq!(event.port, 443);
-        assert_eq!(event.binary, "/usr/bin/curl");
+        assert_eq!(
+            event.binary,
+            executable_path("/usr/bin/curl").to_str().unwrap()
+        );
     }
 
     #[tokio::test]
     async fn staged_transparent_open_never_relays_an_observation_that_policy_allows() {
         let engine = OpaEngine::from_strings(
             include_str!("../data/sandbox-policy.rego"),
-            POLICY_DNS_OPEN_POLICY,
+            &policy_with_native_executable_paths(POLICY_DNS_OPEN_POLICY),
         )
         .unwrap();
         let identity_cache = BinaryIdentityCache::new();
@@ -7865,7 +7847,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
     fn pinned_plan_requires_the_mapping_of_the_deciding_generation() {
         let engine = OpaEngine::from_strings(
             include_str!("../data/sandbox-policy.rego"),
-            POLICY_DNS_OPEN_POLICY,
+            &policy_with_native_executable_paths(POLICY_DNS_OPEN_POLICY),
         )
         .unwrap();
         let store = policy_dns_test_store();
@@ -7908,7 +7890,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
         engine
             .reload(
                 include_str!("../data/sandbox-policy.rego"),
-                POLICY_DNS_OPEN_POLICY,
+                &policy_with_native_executable_paths(POLICY_DNS_OPEN_POLICY),
             )
             .unwrap();
         let reloaded = decide("db.example", 5432);
@@ -7931,7 +7913,10 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
         );
         assert_eq!(
             mapped.format_shorthand(),
-            "NET:OPEN [MED] DENIED /usr/bin/curl(0) -> blocked.invalid:80 [reason:transparent_tcp_policy_denied]"
+            format!(
+                "NET:OPEN [MED] DENIED {}(0) -> blocked.invalid:80 [reason:transparent_tcp_policy_denied]",
+                executable_path("/usr/bin/curl").display()
+            )
         );
         assert_eq!(
             serde_json::to_value(mapped).unwrap()["dst_endpoint"],
@@ -7963,7 +7948,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
         let cache = Arc::new(BinaryIdentityCache::new());
         let identity = ContractBinaryIdentity {
             executable: ContractExecutableIdentity {
-                path: PathBuf::from("/usr/bin/bash"),
+                path: executable_path("/usr/bin/bash"),
                 digest: Some("44".repeat(32).parse().unwrap()),
             },
             ancestors: Vec::new(),
@@ -8075,7 +8060,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
         let engine = Arc::new(
             OpaEngine::from_strings(
                 include_str!("../data/sandbox-policy.rego"),
-                &format!(
+                &policy_with_native_executable_paths(&format!(
                     r#"
 network_policies:
   allowed:
@@ -8088,7 +8073,7 @@ network_policies:
       - path: /usr/bin/curl
 "#,
                     port = destination.port()
-                ),
+                )),
             )
             .unwrap(),
         );
@@ -8099,7 +8084,7 @@ network_policies:
             stream: Box::new(stream),
             binary_identity: Ok(ContractBinaryIdentity {
                 executable: ContractExecutableIdentity {
-                    path: PathBuf::from("/usr/bin/curl"),
+                    path: executable_path("/usr/bin/curl"),
                     digest: Some("44".repeat(32).parse().unwrap()),
                 },
                 ancestors: Vec::new(),
@@ -8210,7 +8195,8 @@ network_policies:
     async fn staged_transparent_open_reports_invalid_identity_as_unavailable() {
         let engine = OpaEngine::from_strings(
             include_str!("../data/sandbox-policy.rego"),
-            r#"
+            &policy_with_native_executable_paths(
+                r#"
 network_policies:
   allowed:
     name: allowed
@@ -8229,6 +8215,7 @@ process:
   run_as_user: sandbox
   run_as_group: sandbox
 "#,
+            ),
         )
         .unwrap();
         let identity_cache = BinaryIdentityCache::new();
@@ -8238,7 +8225,7 @@ process:
             stream: Box::new(stream),
             binary_identity: Ok(ContractBinaryIdentity {
                 executable: ContractExecutableIdentity {
-                    path: PathBuf::from("/usr/bin/curl"),
+                    path: executable_path("/usr/bin/curl"),
                     digest: None,
                 },
                 ancestors: Vec::new(),
@@ -8279,7 +8266,8 @@ process:
     async fn staged_transparent_open_reports_identity_cache_capacity_exhaustion() {
         let engine = OpaEngine::from_strings(
             include_str!("../data/sandbox-policy.rego"),
-            r#"
+            &policy_with_native_executable_paths(
+                r#"
 network_policies:
   allowed:
     name: allowed
@@ -8298,6 +8286,7 @@ process:
   run_as_user: sandbox
   run_as_group: sandbox
 "#,
+            ),
         )
         .unwrap();
         let identity_cache = BinaryIdentityCache::new();
@@ -8305,7 +8294,7 @@ process:
             identity_cache
                 .verify_or_cache_supplied_identity(&ContractBinaryIdentity {
                     executable: ContractExecutableIdentity {
-                        path: PathBuf::from(format!("/sandbox/pinned-{index}")),
+                        path: executable_path(&format!("/sandbox/pinned-{index}")),
                         digest: Some("11".repeat(32).parse().unwrap()),
                     },
                     ancestors: Vec::new(),
@@ -8319,7 +8308,7 @@ process:
             stream: Box::new(stream),
             binary_identity: Ok(ContractBinaryIdentity {
                 executable: ContractExecutableIdentity {
-                    path: PathBuf::from("/sandbox/overflow"),
+                    path: executable_path("/sandbox/overflow"),
                     digest: Some("22".repeat(32).parse().unwrap()),
                 },
                 ancestors: Vec::new(),
@@ -14881,23 +14870,10 @@ network_policies:
     // binary causes /proc/<pid>/exe readlink to return ENOENT on
     // SELinux-enforcing hosts.  Fix by building a test-sleep-helper binary in
     // the same crate so it inherits the user_home_t label.
-    fn resolve_process_identity_denies_fork_exec_shared_socket_ambiguity() {
+    fn resolve_process_identity_denies_exec_shared_socket_ambiguity() {
         use crate::identity::BinaryIdentityCache;
-        use std::ffi::CString;
         use std::net::{TcpListener, TcpStream};
-        use std::os::fd::AsRawFd;
         use std::time::{Duration, Instant};
-
-        struct ChildGuard(libc::pid_t);
-        impl Drop for ChildGuard {
-            fn drop(&mut self) {
-                #[allow(unsafe_code)]
-                unsafe {
-                    libc::kill(self.0, libc::SIGKILL);
-                    libc::waitpid(self.0, std::ptr::null_mut(), 0);
-                }
-            }
-        }
 
         if !std::path::Path::new("/bin/sleep").exists() {
             eprintln!("skipping: /bin/sleep not available");
@@ -14921,41 +14897,8 @@ network_policies:
         let connection = crate::procfs::WorkloadProxyTcpConnection::new(workload_addr, proxy_addr);
         let (_accepted, _) = listener.accept().expect("accept");
 
-        let fd = stream.as_raw_fd();
-        // libc/syscall FFI requires unsafe
-        #[allow(unsafe_code)]
-        unsafe {
-            let flags = libc::fcntl(fd, libc::F_GETFD);
-            assert!(flags >= 0, "F_GETFD failed");
-            assert_eq!(
-                libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC),
-                0,
-                "F_SETFD failed"
-            );
-        }
-
-        let sleep_path = CString::new("/bin/sleep").unwrap();
-        let arg0 = CString::new("sleep").unwrap();
-        let arg1 = CString::new("30").unwrap();
-        // libc/syscall FFI requires unsafe
-        #[allow(unsafe_code)]
-        let child_pid = unsafe { libc::fork() };
-        assert!(child_pid >= 0, "fork failed");
-        if child_pid == 0 {
-            // libc/syscall FFI requires unsafe
-            #[allow(unsafe_code)]
-            unsafe {
-                libc::execl(
-                    sleep_path.as_ptr(),
-                    arg0.as_ptr(),
-                    arg1.as_ptr(),
-                    std::ptr::null::<libc::c_char>(),
-                );
-                libc::_exit(127);
-            }
-        }
-
-        let _guard = ChildGuard(child_pid);
+        let guard = crate::test_support::spawn_socket_holder(&stream, true);
+        let child_pid = guard.0.id();
         let entrypoint_pid = std::process::id();
 
         let deadline = Instant::now() + Duration::from_secs(5);
