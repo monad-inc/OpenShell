@@ -4017,6 +4017,7 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+ "memoffset",
 ]
 
 [[package]]
@@ -4420,17 +4421,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "openshell-conformance-cli"
-version = "0.0.0"
-dependencies = [
- "clap",
- "openshell-conformance",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
 name = "openshell-core"
 version = "0.0.0"
 dependencies = [
@@ -4788,13 +4778,10 @@ name = "openshell-isolation-interface"
 version = "0.0.0"
 dependencies = [
  "async-trait",
- "libc",
  "openshell-core",
- "rustix 1.1.4",
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "socket2",
  "tokio",
 ]
 
@@ -5097,6 +5084,7 @@ dependencies = [
  "toml",
  "tonic",
  "tonic-prost-build",
+ "tonic-reflection",
  "tower",
  "tower-http",
  "tracing",
@@ -5209,9 +5197,11 @@ dependencies = [
  "ipnet",
  "libc",
  "miette",
+ "nix 0.29.0",
  "noyalib",
  "openshell-binary-identity",
  "openshell-core",
+ "openshell-driver-vm",
  "openshell-isolation-interface",
  "openshell-ocsf",
  "openshell-otel",
@@ -5224,6 +5214,7 @@ dependencies = [
  "rcgen",
  "regorus",
  "reqwest 0.12.28",
+ "rustix 1.1.4",
  "rustls",
  "rustls-native-certs",
  "rustls-pemfile",
@@ -5264,6 +5255,7 @@ dependencies = [
  "openshell-ocsf",
  "rand 0.10.2",
  "russh",
+ "rustix 1.1.4",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
@@ -8449,6 +8441,20 @@ dependencies = [
  "syn 2.0.117",
  "tempfile",
  "tonic-build",
+]
+
+[[package]]
+name = "tonic-reflection"
+version = "0.14.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "acccd136a4bf19810a1fde9c74edc6129b42a66b44d0c1c8aaa67aeb49a146a7"
+dependencies = [
+ "prost",
+ "prost-types",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-prost",
 ]
 
 [[package]]
