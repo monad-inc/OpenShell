@@ -4660,10 +4660,8 @@ impl ComputeRuntime {
                 || driver_snapshot_reports_runtime_restart(&incoming));
         // A queued runtime-lost snapshot can arrive after its replacement is
         // already Ready. Revalidate it against live state before restarting.
-        let runtime_lost = matches!(
-            existing_phase,
-            SandboxPhase::Ready | SandboxPhase::Provisioning
-        ) && driver_snapshot_reports_runtime_lost(&incoming);
+        let runtime_lost = runtime_lost_is_recoverable_from(existing_phase)
+            && driver_snapshot_reports_runtime_lost(&incoming);
         if existing_phase != SandboxPhase::Starting && !ready_container_exit && !runtime_lost {
             return self.apply_sandbox_update_locked(incoming, existing).await;
         }
@@ -6645,24 +6643,26 @@ fn apply_driver_snapshot(
     let old_phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
     let sandbox_name = &incoming.name;
 
+    // A running sandbox whose runtime was lost underneath it is replaced by
+    // the restart controller. A stop owns its own transition, and a sandbox
+    // already Stopped stays stopped.
+    let runtime_lost = runtime_lost_is_recoverable_from(old_phase)
+        && driver_snapshot_reports_runtime_lost(incoming);
+
     // Infrastructure errors and successful main-process completions are
     // sticky until an explicit lifecycle operation changes desired state. A
     // late signal-exit snapshot must also not overwrite the terminal reason
     // recorded by a completed explicit stop.
-    if matches!(old_phase, SandboxPhase::Error | SandboxPhase::Completed)
-        || (old_phase == SandboxPhase::Stopped && driver_snapshot_reports_runtime_restart(incoming))
+    if !runtime_lost
+        && (matches!(old_phase, SandboxPhase::Error | SandboxPhase::Completed)
+            || (old_phase == SandboxPhase::Stopped
+                && driver_snapshot_reports_runtime_restart(incoming)))
     {
         if let Some(metadata) = sandbox.metadata.as_mut() {
             metadata.name.clone_from(sandbox_name);
         }
         return;
     }
-
-    // A running sandbox whose runtime was lost underneath it is replaced by
-    // the restart controller. A stop owns its own transition, and a sandbox
-    // already Stopped stays stopped.
-    let runtime_lost = matches!(old_phase, SandboxPhase::Ready | SandboxPhase::Provisioning)
-        && driver_snapshot_reports_runtime_lost(incoming);
 
     let cpv = sandbox.current_policy_version();
     let (mut phase, mut status) = incoming.status.as_ref().map_or_else(
@@ -6913,6 +6913,18 @@ fn driver_snapshot_confirms_starting(incoming: &DriverSandbox) -> bool {
                     && condition.status.eq_ignore_ascii_case("true")
             })
     })
+}
+
+/// Phases a lost runtime is replaced from. Error is included because a lost
+/// Pod is often first reported as a failed one (a deleted or node-killed
+/// workload Pod ends `Failed` before the driver attributes the loss), and the
+/// driver only reports runtime loss after it has proven the runtime is gone.
+/// Stopped, Stopping and Completed record intent or a finished main process.
+fn runtime_lost_is_recoverable_from(phase: SandboxPhase) -> bool {
+    matches!(
+        phase,
+        SandboxPhase::Ready | SandboxPhase::Provisioning | SandboxPhase::Error
+    )
 }
 
 fn driver_snapshot_reports_runtime_lost(incoming: &DriverSandbox) -> bool {
@@ -14438,8 +14450,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_lost_replaces_a_sandbox_first_reported_as_failed() {
+        // A deleted workload Pod is reported `PodFailed` (phase Error) before
+        // the driver proves the loss and stamps runtime-lost.
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        let mut sandbox = sandbox_record("sb-failed", "sandbox-failed", SandboxPhase::Ready);
+        sandbox.status = Some(SandboxStatus {
+            phase: SandboxPhase::Ready as i32,
+            main_process_instance_id: "instance-1".into(),
+            main_process_started_time: restart_timestamp(
+                openshell_core::time::now_ms() - RESTART_STABILITY_WINDOW_MS,
+            ),
+            ..Default::default()
+        });
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let mut failed = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
+        failed.status = Some(make_driver_status(make_driver_condition(
+            "PodFailed",
+            "Pod failed",
+        )));
+        runtime.apply_sandbox_update(failed).await.unwrap();
+        let errored = runtime
+            .store
+            .get_message::<Sandbox>("sb-failed")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(errored.phase(), SandboxPhase::Error as i32);
+
+        let lost = runtime_lost_driver_sandbox(sandbox.object_id(), sandbox.object_name());
+        driver.set_get_outcome(ControlledGetOutcome::Sandbox(Box::new(lost.clone())));
+        runtime.apply_sandbox_update(lost).await.unwrap();
+
+        let scheduled = runtime
+            .store
+            .get_message::<Sandbox>("sb-failed")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(scheduled.phase(), SandboxPhase::Starting as i32);
+        assert!(is_automatic_restart_transition(&scheduled));
+        assert!(is_runtime_lost_restart(&scheduled));
+
+        runtime.restart_due_sandboxes().await.unwrap();
+        assert_eq!(driver.start_calls(), 1);
+    }
+
+    #[tokio::test]
     async fn runtime_lost_does_not_revive_stopped_or_stopping_sandbox() {
-        for phase in [SandboxPhase::Stopped, SandboxPhase::Stopping] {
+        for phase in [
+            SandboxPhase::Stopped,
+            SandboxPhase::Stopping,
+            SandboxPhase::Completed,
+        ] {
             let runtime = test_runtime(Arc::new(TestDriver::default())).await;
             let sandbox = sandbox_record("sb-stopped", "sandbox-stopped", phase);
             runtime.store.put_message(&sandbox).await.unwrap();
