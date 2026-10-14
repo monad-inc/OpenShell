@@ -280,6 +280,11 @@ launch credentials. This happens whatever the sandbox's restart policy is,
 because the main process did not exit. Repeated losses use the restart backoff.
 The workspace PVC is kept, and process memory is lost.
 
+Recovery also covers a sandbox that briefly reports `Error` because its
+workload Pod ended `Failed` when it was deleted or its node went down, and a
+sandbox that loses its Pods while still starting, once those Pods have been
+released to run.
+
 A sandbox that you stopped stays stopped. A suspension caused by a failed
 admission check or an altered workload fence also stays stopped until you start
 the sandbox.

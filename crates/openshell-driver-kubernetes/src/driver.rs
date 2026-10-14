@@ -4080,6 +4080,43 @@ impl KubernetesComputeDriver {
                 continue;
             }
             if sandbox_runtime_bootstrap_in_progress(&object) {
+                // Once a create or restart has released its Pods, they are a
+                // running runtime even before the bootstrap completes. Losing
+                // one is runtime loss to replace, not a failed create to roll
+                // back.
+                if sandbox_runtime_bootstrap_released_runtime(&object) {
+                    let workload = sandbox_runtime_workload_generation_matches(
+                        &self.client,
+                        namespace,
+                        cr_name,
+                        &object,
+                    )
+                    .await;
+                    let supervisor = sandbox_runtime_supervisor_generation_matches(
+                        &self.client,
+                        namespace,
+                        &sandbox_id,
+                        &object,
+                    )
+                    .await;
+                    match released_sandbox_runtime_lost(workload, supervisor) {
+                        Some(true) => {
+                            warn!(
+                                sandbox_id,
+                                "sandbox-runtime Pods were lost before bootstrap completed; suspending for replacement"
+                            );
+                            self.suspend_sandbox_runtime_after_dependency_failure(
+                                &lookup_api,
+                                &object,
+                                SandboxRuntimeSuspensionCause::RuntimeLost,
+                            )
+                            .await;
+                            continue;
+                        }
+                        Some(false) => {}
+                        None => continue,
+                    }
+                }
                 if sandbox_runtime_control_availability(&self.client, namespace, &sandbox_id).await
                     == SandboxRuntimeControlAvailability::Available
                     && sandbox_runtime_bootstrap_is_ready_to_complete(&object)
@@ -4842,6 +4879,33 @@ fn sandbox_runtime_bootstrap_operation(object: &DynamicObject) -> Option<&str> {
         .as_ref()
         .and_then(|annotations| annotations.get(ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_OPERATION))
         .map(String::as_str)
+}
+
+/// A create or restart whose bootstrap has released the generation's Pods to
+/// the scheduler, so the recorded Pod UIDs describe a runtime that may run.
+fn sandbox_runtime_bootstrap_released_runtime(object: &DynamicObject) -> bool {
+    sandbox_runtime_bootstrap_in_progress(object)
+        && sandbox_runtime_bootstrap_phase(object) == Some(SandboxRuntimeBootstrapPhase::Released)
+        && matches!(
+            sandbox_runtime_bootstrap_operation(object),
+            Some("create" | "restart")
+        )
+}
+
+/// Whether a released generation lost its workload or supervisor Pod. `None`
+/// means either check could not be made and reconciliation should retry.
+fn released_sandbox_runtime_lost(
+    workload: SandboxRuntimeControlAvailability,
+    supervisor: SandboxRuntimeControlAvailability,
+) -> Option<bool> {
+    use SandboxRuntimeControlAvailability::{Unavailable, Unknown};
+    if workload == Unavailable || supervisor == Unavailable {
+        Some(true)
+    } else if workload == Unknown || supervisor == Unknown {
+        None
+    } else {
+        Some(false)
+    }
 }
 
 fn sandbox_runtime_bootstrap_is_ready_to_complete(object: &DynamicObject) -> bool {
@@ -12770,6 +12834,81 @@ mod tests {
                 .iter()
                 .any(|condition| condition.r#type == SANDBOX_SUSPENDED_CONDITION)
         );
+    }
+
+    #[test]
+    fn only_a_released_create_or_restart_bootstrap_can_lose_its_runtime() {
+        let bootstrap = |operation: &str, phase: SandboxRuntimeBootstrapPhase| {
+            let mut object = DynamicObject::new(
+                "sandbox-cr",
+                &ApiResource::from_gvk(&GroupVersionKind::gvk(
+                    SANDBOX_GROUP,
+                    SANDBOX_VERSION_V1BETA1,
+                    SANDBOX_KIND,
+                )),
+            );
+            object.metadata.annotations = Some(BTreeMap::from([
+                (
+                    ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAPPING.to_string(),
+                    "true".to_string(),
+                ),
+                (
+                    ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_OPERATION.to_string(),
+                    operation.to_string(),
+                ),
+                (
+                    ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_PHASE.to_string(),
+                    phase.as_str().to_string(),
+                ),
+            ]));
+            object
+        };
+
+        assert!(sandbox_runtime_bootstrap_released_runtime(&bootstrap(
+            "create",
+            SandboxRuntimeBootstrapPhase::Released
+        )));
+        assert!(sandbox_runtime_bootstrap_released_runtime(&bootstrap(
+            "restart",
+            SandboxRuntimeBootstrapPhase::Released
+        )));
+        // Before release the Pods are still gated: a lost one is a failed
+        // bootstrap, which keeps its fail-closed rollback.
+        assert!(!sandbox_runtime_bootstrap_released_runtime(&bootstrap(
+            "create",
+            SandboxRuntimeBootstrapPhase::Releasing
+        )));
+        assert!(!sandbox_runtime_bootstrap_released_runtime(&bootstrap(
+            "stop",
+            SandboxRuntimeBootstrapPhase::Suspending
+        )));
+    }
+
+    #[test]
+    fn a_released_runtime_is_lost_when_either_pod_is_gone_or_replaced() {
+        use SandboxRuntimeControlAvailability::{Available, Degraded, Unavailable, Unknown};
+        assert_eq!(
+            released_sandbox_runtime_lost(Available, Available),
+            Some(false)
+        );
+        assert_eq!(
+            released_sandbox_runtime_lost(Degraded, Available),
+            Some(false)
+        );
+        assert_eq!(
+            released_sandbox_runtime_lost(Available, Unavailable),
+            Some(true)
+        );
+        assert_eq!(
+            released_sandbox_runtime_lost(Unavailable, Available),
+            Some(true)
+        );
+        // A definite loss wins over a failed check of the other Pod.
+        assert_eq!(
+            released_sandbox_runtime_lost(Unavailable, Unknown),
+            Some(true)
+        );
+        assert_eq!(released_sandbox_runtime_lost(Unknown, Available), None);
     }
 
     #[test]
