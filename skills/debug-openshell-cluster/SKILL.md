@@ -907,6 +907,24 @@ Do not suspend or delete the workload Pod manually. The driver advances to
 `suspending` only after runtime control has been released, and then suspends the
 workload.
 
+When reconciliation finds a running sandbox's supervisor Pod, workload Pod, or
+boundary Service lost or replaced, it suspends the Sandbox and sets the
+`openshell.ai/sandbox-runtime-suspension-cause: runtime-lost` annotation. The
+gateway reports `Ready=False` with reason `SandboxRuntimeLost` and schedules a
+replacement generation through the restart controller, so the sandbox moves
+`Ready` → `Starting` → `Ready` without a manual start. If it stays `Starting`,
+check `status.restart_count`, `status.next_restart_time`, and a
+`SandboxRestartFailed` condition. A workload Pod stuck `Terminating` on an
+unreachable node blocks the replacement until the node returns or its `Node`
+object is deleted. Admission failures and an altered workload fence suspend
+without the annotation and stay stopped:
+
+```bash
+kubectl -n <sandbox-namespace> get sandbox <sandbox-name> \
+  -o jsonpath='{.metadata.annotations.openshell\.ai/sandbox-runtime-suspension-cause}{"\n"}'
+openshell sandbox get <name> --output json | jq '.status | {phase, restart_count, next_restart_time, conditions}'
+```
+
 If a Sandbox remains in the `suspending` bootstrap phase, verify that the
 gateway ServiceAccount can create and delete Secrets in the sandbox
 namespace. In operator mode, those permissions come only from the

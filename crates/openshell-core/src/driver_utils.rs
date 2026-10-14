@@ -75,6 +75,13 @@ pub const CONDITION_RUNTIME_RESTART: &str = "ContainerRuntimeRestart";
 /// runtime API (e.g. `podman stop`, gateway-initiated shutdown).
 pub const CONDITION_STOPPED: &str = "ContainerStopped";
 
+/// Ready-condition reason when a driver suspended a sandbox whose runtime was lost.
+///
+/// Part of the runtime disappeared underneath a running sandbox (a lost Pod or
+/// node, or a replaced supervisor or workload); no user stopped it. The driver keeps the sandbox fail-closed. The gateway treats this reason as
+/// an automatic restart transition and starts a fresh runtime generation.
+pub const CONDITION_RUNTIME_LOST: &str = "SandboxRuntimeLost";
+
 // ---------------------------------------------------------------------------
 
 /// Path to the sandbox supervisor binary inside the container image.

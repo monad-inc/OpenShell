@@ -269,6 +269,28 @@ oc -n openshell create configmap corporate-proxy-ca --from-file=ca.crt=corp-ca.p
 
 After upgrading Agent Sandbox, restart the gateway.
 
+### Kubernetes Runtime Loss
+
+The driver suspends a running sandbox when its supervisor Pod, workload Pod, or
+boundary Service is lost or replaced, for example after a node restart, a node
+failure, or a deleted Pod. The workload never runs without its supervisor. The
+sandbox reports `Ready=False` with reason `SandboxRuntimeLost`, and the gateway
+starts a replacement generation with new supervisor and workload Pods and fresh
+launch credentials. This happens whatever the sandbox's restart policy is,
+because the main process did not exit. Repeated losses use the restart backoff.
+The workspace PVC is kept, and process memory is lost.
+
+A sandbox that you stopped stays stopped. A suspension caused by a failed
+admission check or an altered workload fence also stays stopped until you start
+the sandbox.
+
+A replacement can start only after the old workload Pod is gone. When a node
+becomes unreachable, its Pods stay `Terminating` until the node returns or its
+`Node` object is deleted, so recovery waits for that. Cloud providers delete the
+`Node` object when the instance is removed; for a node that will not return,
+apply the `node.kubernetes.io/out-of-service` taint. Recovery onto another node
+also requires a `StorageClass` whose volumes can attach to that node.
+
 <Note>
 Workspace storage settings cannot change after a sandbox is created. Delete and recreate the sandbox to change them.
 </Note>

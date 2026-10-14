@@ -65,6 +65,10 @@ use tonic::{Code, Request, Status};
 pub const COMPUTE_DRIVER_ANNOTATION: &str = "internal.openshell.ai/compute-driver";
 pub const COMPUTE_RUNTIME_IDENTITY_ANNOTATION: &str =
     "internal.openshell.ai/compute-runtime-identity";
+/// Marks an automatic restart that replaces a lost runtime rather than an
+/// exited main process. It has no exit code, so `exit_code` cannot mark it.
+const RESTART_CAUSE_ANNOTATION: &str = "internal.openshell.ai/restart-cause";
+const RESTART_CAUSE_RUNTIME_LOST: &str = "runtime-lost";
 #[cfg(unix)]
 use tower::service_fn;
 use tracing::{Instrument as _, debug, info, warn};
@@ -4107,6 +4111,11 @@ impl ComputeRuntime {
         }
 
         let sandbox_name = current.object_name().to_string();
+        let restart_message = if is_runtime_lost_restart(&current) {
+            "Replacing sandbox runtime after it was lost"
+        } else {
+            "Replacing sandbox runtime after canonical main process exit"
+        };
         let authority = self.restart_authority.get().and_then(Option::as_deref);
         let already_claimed = current
             .status
@@ -4145,9 +4154,7 @@ impl ComputeRuntime {
                                 r#type: "Ready".to_string(),
                                 status: "False".to_string(),
                                 reason: "SandboxRestarting".to_string(),
-                                message:
-                                    "Replacing sandbox runtime after canonical main process exit"
-                                        .to_string(),
+                                message: restart_message.to_string(),
                                 transition_time: None,
                             },
                         );
@@ -4651,7 +4658,13 @@ impl ComputeRuntime {
         let ready_container_exit = existing_phase == SandboxPhase::Ready
             && (driver_snapshot_confirms_stopped(&incoming)
                 || driver_snapshot_reports_runtime_restart(&incoming));
-        if existing_phase != SandboxPhase::Starting && !ready_container_exit {
+        // A queued runtime-lost snapshot can arrive after its replacement is
+        // already Ready. Revalidate it against live state before restarting.
+        let runtime_lost = matches!(
+            existing_phase,
+            SandboxPhase::Ready | SandboxPhase::Provisioning
+        ) && driver_snapshot_reports_runtime_lost(&incoming);
+        if existing_phase != SandboxPhase::Starting && !ready_container_exit && !runtime_lost {
             return self.apply_sandbox_update_locked(incoming, existing).await;
         }
 
@@ -4773,8 +4786,14 @@ impl ComputeRuntime {
 
         self.sandbox_index.update_from_sandbox(&sandbox);
         self.sandbox_watch_bus.notify(sandbox.object_id());
-        if existing_phase != SandboxPhase::Stopped
-            && sandbox.phase() == SandboxPhase::Stopped as i32
+        // A lost runtime's sessions end now rather than after the replacement's
+        // driver stop, which can wait indefinitely on an unreachable node.
+        let runtime_lost_now = existing_phase != SandboxPhase::Starting
+            && is_automatic_restart_transition(&sandbox)
+            && is_runtime_lost_restart(&sandbox);
+        if (existing_phase != SandboxPhase::Stopped
+            && sandbox.phase() == SandboxPhase::Stopped as i32)
+            || runtime_lost_now
         {
             self.cleanup_stopped_sandbox_sessions(&sandbox).await?;
         }
@@ -4953,6 +4972,7 @@ impl ComputeRuntime {
                     expected_resource_version,
                     |sandbox| {
                         if connected {
+                            clear_restart_cause(sandbox);
                             ensure_supervisor_ready_status(&mut sandbox.status);
                             let status = sandbox.status.get_or_insert_with(Default::default);
                             let same_instance =
@@ -5901,10 +5921,76 @@ fn is_automatic_restart_status(status: &SandboxStatus) -> bool {
 
 fn is_automatic_restart_transition(sandbox: &Sandbox) -> bool {
     SandboxPhase::try_from(sandbox.phase()) == Ok(SandboxPhase::Starting)
-        && sandbox
+        && (sandbox
             .status
             .as_ref()
             .is_some_and(is_automatic_restart_status)
+            || is_runtime_lost_restart(sandbox))
+}
+
+fn is_runtime_lost_restart(sandbox: &Sandbox) -> bool {
+    sandbox
+        .status
+        .as_ref()
+        .is_some_and(|status| status.restart_count > 0)
+        && sandbox.metadata.as_ref().is_some_and(|metadata| {
+            metadata
+                .annotations
+                .get(RESTART_CAUSE_ANNOTATION)
+                .is_some_and(|cause| cause == RESTART_CAUSE_RUNTIME_LOST)
+        })
+}
+
+fn clear_restart_cause(sandbox: &mut Sandbox) {
+    if let Some(metadata) = sandbox.metadata.as_mut() {
+        metadata.annotations.remove(RESTART_CAUSE_ANNOTATION);
+    }
+}
+
+/// Schedule a fresh runtime generation after the driver reported that a
+/// running sandbox lost its runtime. This reuses the main-process restart
+/// controller, including its crash-loop backoff, but applies regardless of
+/// the restart policy: the main process did not exit, its infrastructure
+/// went away, as with a Docker daemon or host restart.
+fn apply_runtime_lost_restart(sandbox: &mut Sandbox, now_ms: i64) {
+    let status = sandbox.status.get_or_insert_with(SandboxStatus::default);
+    let stable_run = main_process_started_at_ms(status) > 0
+        && now_ms.saturating_sub(main_process_started_at_ms(status)) >= RESTART_STABILITY_WINDOW_MS;
+    status.restart_count = if stable_run || status.restart_count == 0 {
+        1
+    } else {
+        status.restart_count.saturating_add(1)
+    };
+    let restart_count = status.restart_count;
+    let delay_ms = restart_delay_ms(restart_count);
+    status.exit_code = None;
+    set_main_process_started_at_ms(status, 0);
+    set_next_restart_at_ms(status, now_ms.saturating_add(delay_ms));
+    let message = if delay_ms == 0 {
+        format!("Sandbox runtime was lost; restart {restart_count} scheduled immediately")
+    } else {
+        format!(
+            "Sandbox runtime was lost; restart {restart_count} scheduled in {} seconds",
+            delay_ms / 1_000
+        )
+    };
+    upsert_ready_condition(
+        &mut sandbox.status,
+        SandboxCondition {
+            r#type: "Ready".to_string(),
+            status: "False".to_string(),
+            reason: openshell_core::driver_utils::CONDITION_RUNTIME_LOST.to_string(),
+            message,
+            transition_time: None,
+        },
+    );
+    if let Some(metadata) = sandbox.metadata.as_mut() {
+        metadata.annotations.insert(
+            RESTART_CAUSE_ANNOTATION.to_string(),
+            RESTART_CAUSE_RUNTIME_LOST.to_string(),
+        );
+    }
+    sandbox.set_phase(SandboxPhase::Starting as i32);
 }
 
 fn restart_delay_ms(restart_count: u32) -> i64 {
@@ -6572,6 +6658,12 @@ fn apply_driver_snapshot(
         return;
     }
 
+    // A running sandbox whose runtime was lost underneath it is replaced by
+    // the restart controller. A stop owns its own transition, and a sandbox
+    // already Stopped stays stopped.
+    let runtime_lost = matches!(old_phase, SandboxPhase::Ready | SandboxPhase::Provisioning)
+        && driver_snapshot_reports_runtime_lost(incoming);
+
     let cpv = sandbox.current_policy_version();
     let (mut phase, mut status) = incoming.status.as_ref().map_or_else(
         || {
@@ -6618,6 +6710,7 @@ fn apply_driver_snapshot(
     }
 
     phase = match old_phase {
+        _ if runtime_lost => SandboxPhase::Starting,
         // Backoff and replacement are gateway-owned. Driver snapshots can
         // describe the old runtime stopping but cannot cancel restart intent.
         SandboxPhase::Starting if is_automatic_restart_transition(sandbox) => {
@@ -6719,6 +6812,14 @@ fn apply_driver_snapshot(
     sandbox.status = status;
     sandbox.set_phase(phase as i32);
     sandbox.set_current_policy_version(cpv);
+    if runtime_lost {
+        warn!(
+            sandbox_id = %incoming.id,
+            sandbox_name = %sandbox_name,
+            "Sandbox runtime was lost; scheduling a replacement generation"
+        );
+        apply_runtime_lost_restart(sandbox, openshell_core::time::now_ms());
+    }
     apply_configuration_readiness(sandbox);
 }
 
@@ -6810,6 +6911,17 @@ fn driver_snapshot_confirms_starting(incoming: &DriverSandbox) -> bool {
             && !status.conditions.iter().any(|condition| {
                 condition.r#type.eq_ignore_ascii_case("Suspended")
                     && condition.status.eq_ignore_ascii_case("true")
+            })
+    })
+}
+
+fn driver_snapshot_reports_runtime_lost(incoming: &DriverSandbox) -> bool {
+    incoming.status.as_ref().is_some_and(|status| {
+        !status.deleting
+            && status.conditions.iter().any(|condition| {
+                condition.r#type == "Ready"
+                    && condition.status.eq_ignore_ascii_case("false")
+                    && condition.reason == openshell_core::driver_utils::CONDITION_RUNTIME_LOST
             })
     })
 }
@@ -7104,6 +7216,7 @@ fn apply_lifecycle_phase(
 ) {
     sandbox.set_phase(phase as i32);
     if matches!(phase, SandboxPhase::Stopping | SandboxPhase::Starting) {
+        clear_restart_cause(sandbox);
         let status = sandbox.status.get_or_insert_with(Default::default);
         // Retain the previous instance id as a tombstone until the restarted
         // supervisor registers its new id.
@@ -7173,6 +7286,7 @@ fn is_terminal_failure_reason(reason: &str) -> bool {
     let transient_reasons = [
         "reconcilererror",
         "dependenciesnotready",
+        "sandboxruntimelost",
         "supervisornotconnected",
         "starting",
         "containerstarting",
@@ -14195,6 +14309,194 @@ mod tests {
         assert_eq!(
             stored.status.unwrap().conditions[0].reason,
             "ContainerRuntimeRestart"
+        );
+    }
+
+    fn runtime_lost_driver_sandbox(id: &str, name: &str) -> DriverSandbox {
+        let mut lost = ready_driver_sandbox(id, name);
+        lost.status = Some(make_driver_status(make_driver_condition(
+            openshell_core::driver_utils::CONDITION_RUNTIME_LOST,
+            "sandbox runtime was lost",
+        )));
+        lost
+    }
+
+    #[tokio::test]
+    async fn runtime_lost_schedules_restart_regardless_of_restart_policy() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        let mut sandbox = sandbox_record("sb-lost", "sandbox-lost", SandboxPhase::Ready);
+        sandbox.spec = Some(SandboxSpec {
+            restart_policy: SandboxRestartPolicy::Never as i32,
+            ..Default::default()
+        });
+        sandbox.status = Some(SandboxStatus {
+            phase: SandboxPhase::Ready as i32,
+            main_process_instance_id: "instance-1".into(),
+            main_process_started_time: restart_timestamp(
+                openshell_core::time::now_ms() - RESTART_STABILITY_WINDOW_MS,
+            ),
+            ..Default::default()
+        });
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let lost = runtime_lost_driver_sandbox(sandbox.object_id(), sandbox.object_name());
+        driver.set_get_outcome(ControlledGetOutcome::Sandbox(Box::new(lost.clone())));
+
+        runtime.apply_sandbox_update(lost).await.unwrap();
+
+        let scheduled = runtime
+            .store
+            .get_message::<Sandbox>("sb-lost")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(scheduled.phase(), SandboxPhase::Starting as i32);
+        assert!(is_automatic_restart_transition(&scheduled));
+        let status = scheduled.status.as_ref().unwrap();
+        assert_eq!(status.restart_count, 1);
+        assert_eq!(status.exit_code, None);
+        assert_eq!(status.main_process_instance_id, "instance-1");
+        assert!(status.conditions.iter().any(|condition| {
+            condition.r#type == "Ready"
+                && condition.reason == openshell_core::driver_utils::CONDITION_RUNTIME_LOST
+        }));
+
+        runtime.restart_due_sandboxes().await.unwrap();
+
+        assert_eq!(driver.stop_calls(), 1);
+        assert_eq!(driver.start_calls(), 1);
+        let restarted = runtime
+            .store
+            .get_message::<Sandbox>("sb-lost")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(restarted.phase(), SandboxPhase::Starting as i32);
+        assert!(is_automatic_restart_transition(&restarted));
+    }
+
+    #[tokio::test]
+    async fn stale_runtime_lost_snapshot_does_not_restart_a_replaced_sandbox() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record("sb-lost", "sandbox-lost", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        // The live runtime is the healthy replacement; the queued snapshot
+        // still describes the lost generation.
+        driver.set_get_outcome(ControlledGetOutcome::Sandbox(Box::new(
+            ready_driver_sandbox(sandbox.object_id(), sandbox.object_name()),
+        )));
+
+        runtime
+            .apply_sandbox_update(runtime_lost_driver_sandbox(
+                sandbox.object_id(),
+                sandbox.object_name(),
+            ))
+            .await
+            .unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-lost")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(stored.phase(), SandboxPhase::Starting as i32);
+        assert!(!is_automatic_restart_transition(&stored));
+    }
+
+    #[tokio::test]
+    async fn later_runtime_lost_snapshots_keep_scheduled_restart() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record("sb-lost", "sandbox-lost", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let lost = runtime_lost_driver_sandbox(sandbox.object_id(), sandbox.object_name());
+        driver.set_get_outcome(ControlledGetOutcome::Sandbox(Box::new(lost.clone())));
+
+        runtime.apply_sandbox_update(lost.clone()).await.unwrap();
+        let first = runtime
+            .store
+            .get_message::<Sandbox>("sb-lost")
+            .await
+            .unwrap()
+            .unwrap();
+        runtime.apply_sandbox_update(lost).await.unwrap();
+        let second = runtime
+            .store
+            .get_message::<Sandbox>("sb-lost")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(second.phase(), SandboxPhase::Starting as i32);
+        assert_eq!(second.status.as_ref().unwrap().restart_count, 1);
+        assert_eq!(
+            second.status.as_ref().unwrap().next_restart_time,
+            first.status.as_ref().unwrap().next_restart_time
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_lost_does_not_revive_stopped_or_stopping_sandbox() {
+        for phase in [SandboxPhase::Stopped, SandboxPhase::Stopping] {
+            let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+            let sandbox = sandbox_record("sb-stopped", "sandbox-stopped", phase);
+            runtime.store.put_message(&sandbox).await.unwrap();
+
+            runtime
+                .apply_sandbox_update(runtime_lost_driver_sandbox(
+                    sandbox.object_id(),
+                    sandbox.object_name(),
+                ))
+                .await
+                .unwrap();
+
+            let stored = runtime
+                .store
+                .get_message::<Sandbox>("sb-stopped")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.phase(), phase as i32, "{phase:?}");
+            assert!(!is_automatic_restart_transition(&stored), "{phase:?}");
+        }
+    }
+
+    #[test]
+    fn repeated_runtime_loss_backs_off() {
+        let now_ms = openshell_core::time::now_ms();
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        sandbox.status = Some(SandboxStatus {
+            restart_count: 3,
+            main_process_started_time: restart_timestamp(now_ms - RESTART_STABILITY_WINDOW_MS + 1),
+            ..Default::default()
+        });
+
+        apply_runtime_lost_restart(&mut sandbox, now_ms);
+
+        let status = sandbox.status.as_ref().unwrap();
+        assert_eq!(status.restart_count, 4);
+        assert_eq!(next_restart_at_ms(status), now_ms + 4_000);
+        assert!(is_automatic_restart_transition(&sandbox));
+    }
+
+    #[test]
+    fn explicit_lifecycle_transition_clears_runtime_lost_restart() {
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        apply_runtime_lost_restart(&mut sandbox, openshell_core::time::now_ms());
+        assert!(is_automatic_restart_transition(&sandbox));
+
+        apply_lifecycle_phase(&mut sandbox, SandboxPhase::Starting, "Starting", "", 0);
+
+        assert!(!is_automatic_restart_transition(&sandbox));
+        assert!(
+            !sandbox
+                .metadata
+                .as_ref()
+                .unwrap()
+                .annotations
+                .contains_key(RESTART_CAUSE_ANNOTATION)
         );
     }
 
