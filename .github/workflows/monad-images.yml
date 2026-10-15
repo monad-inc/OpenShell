@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Builds Monad's OpenShell images (gateway, supervisor, sandbox) and pushes
-# them to ghcr.io/monad-inc/openshell. See MONAD.md.
+# Builds Monad's OpenShell images (gateway, supervisor, sandbox, CLI and
+# provider sync) and pushes them to ghcr.io/monad-inc/openshell. See MONAD.md.
 
 name: Monad Images
 
@@ -82,6 +82,8 @@ jobs:
           - { package: openshell-sandbox, binary: openshell-sandbox, triple: aarch64-unknown-linux-musl }
           - { package: openshell-cli, binary: openshell, triple: x86_64-unknown-linux-musl }
           - { package: openshell-cli, binary: openshell, triple: aarch64-unknown-linux-musl }
+          - { package: openshell-provider-sync, binary: openshell-provider-sync, triple: x86_64-unknown-linux-gnu }
+          - { package: openshell-provider-sync, binary: openshell-provider-sync, triple: aarch64-unknown-linux-gnu }
     # Repository variables MONAD_RUNNER_X64 / MONAD_RUNNER_ARM64 select larger runners
     # (e.g. ubuntu-24.04-8core / ubuntu-24.04-arm-8core); unset uses the standard ones.
     runs-on: ${{ startsWith(matrix.triple, 'aarch64') && (vars.MONAD_RUNNER_ARM64 || 'ubuntu-24.04-arm') || (vars.MONAD_RUNNER_X64 || 'ubuntu-24.04') }}
@@ -117,6 +119,7 @@ jobs:
           - { component: supervisor, binary: openshell-supervisor, target-suffix: unknown-linux-gnu }
           - { component: sandbox, binary: openshell-sandbox, target-suffix: unknown-linux-musl }
           - { component: cli, binary: openshell, target-suffix: unknown-linux-musl }
+          - { component: provider-sync, binary: openshell-provider-sync, target-suffix: unknown-linux-gnu }
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:

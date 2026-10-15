@@ -8,12 +8,12 @@
 //! a fingerprint is useless outside it. After a restart every Secret is pushed
 //! once more, which is a value-only update and harmless to running sandboxes.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 
 use sha2::{Digest, Sha256};
 
-use crate::mapping::{CredentialValues, SyncTarget};
+use crate::mapping::{CredentialValues, KeyMap, SyncTarget};
 
 /// `namespace/name` of a Secret.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -46,12 +46,15 @@ impl fmt::Display for CredentialSlot {
     }
 }
 
+/// What a Secret last pushed to one provider.
 #[derive(Clone)]
 struct Applied {
     workspace: String,
-    provider: String,
     fingerprints: BTreeMap<String, [u8; 32]>,
 }
+
+/// A Secret and one provider it feeds.
+type AppliedKey = (SecretRef, String);
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[error("credential {slot} is already synced from Secret {owner}")]
@@ -60,15 +63,9 @@ pub struct Conflict {
     pub owner: SecretRef,
 }
 
-/// The keys a Secret needs to push, from [`SyncState::plan`].
-#[derive(Debug)]
-pub struct Plan {
-    pub changed: CredentialValues,
-}
-
 pub struct SyncState {
     salt: [u8; 32],
-    applied: HashMap<SecretRef, Applied>,
+    applied: HashMap<AppliedKey, Applied>,
     owners: HashMap<CredentialSlot, SecretRef>,
 }
 
@@ -76,6 +73,16 @@ impl Default for SyncState {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn slots(workspace: &str, provider: &str, keys: &KeyMap) -> Vec<CredentialSlot> {
+    keys.keys()
+        .map(|credential_key| CredentialSlot {
+            workspace: workspace.to_string(),
+            provider: provider.to_string(),
+            credential_key: credential_key.clone(),
+        })
+        .collect()
 }
 
 impl SyncState {
@@ -94,28 +101,36 @@ impl SyncState {
         hasher.finalize().into()
     }
 
-    /// Claim the target's credentials for `secret` and return the keys whose
-    /// values differ from what was last applied.
+    /// Drop the claims and applied state `secret` holds outside `target`, as
+    /// when an entry is removed or the workspace changes.
+    pub fn retain(&mut self, secret: &SecretRef, target: &SyncTarget) {
+        let wanted: HashSet<CredentialSlot> = target
+            .providers
+            .iter()
+            .flat_map(|(provider, keys)| slots(&target.workspace, provider, keys))
+            .collect();
+        self.release(secret, |slot| !wanted.contains(slot));
+        self.applied.retain(|(owner, provider), applied| {
+            owner != secret
+                || (applied.workspace == target.workspace
+                    && target.providers.contains_key(provider))
+        });
+    }
+
+    /// Claim one provider's credentials for `secret`.
     ///
     /// `owner_exists` reports whether a Secret that holds a claim still
     /// exists and is still labelled; a claim from a deleted Secret is taken
     /// over rather than blocking its replacement.
-    pub fn plan(
+    pub fn claim(
         &mut self,
         secret: &SecretRef,
-        target: &SyncTarget,
-        values: &CredentialValues,
+        workspace: &str,
+        provider: &str,
+        keys: &KeyMap,
         owner_exists: impl Fn(&SecretRef) -> bool,
-    ) -> Result<Plan, Conflict> {
-        let slots: Vec<CredentialSlot> = target
-            .keys
-            .keys()
-            .map(|credential_key| CredentialSlot {
-                workspace: target.workspace.clone(),
-                provider: target.provider.clone(),
-                credential_key: credential_key.clone(),
-            })
-            .collect();
+    ) -> Result<(), Conflict> {
+        let slots = slots(workspace, provider, keys);
         for slot in &slots {
             if let Some(owner) = self.owners.get(slot)
                 && owner != secret
@@ -127,55 +142,74 @@ impl SyncState {
                 });
             }
         }
-
-        self.release(secret, |slot| !slots.contains(slot));
         for slot in slots {
             if let Some(previous) = self.owners.insert(slot, secret.clone())
                 && &previous != secret
             {
-                self.applied.remove(&previous);
+                self.applied.remove(&(previous, provider.to_string()));
             }
         }
-
-        let applied = self.applied.get(secret).filter(|applied| {
-            applied.workspace == target.workspace && applied.provider == target.provider
-        });
-        let changed = values
-            .0
-            .iter()
-            .filter(|(key, value)| {
-                applied
-                    .and_then(|applied| applied.fingerprints.get(*key))
-                    .is_none_or(|fingerprint| *fingerprint != self.fingerprint(value))
-            })
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect();
-        Ok(Plan {
-            changed: CredentialValues(changed),
-        })
+        Ok(())
     }
 
-    /// Record that `values` are now what the gateway holds for `secret`.
-    pub fn commit(&mut self, secret: &SecretRef, target: &SyncTarget, values: &CredentialValues) {
+    /// The values that differ from what `secret` last applied to `provider`.
+    pub fn changed(
+        &self,
+        secret: &SecretRef,
+        workspace: &str,
+        provider: &str,
+        values: &CredentialValues,
+    ) -> CredentialValues {
+        let applied = self
+            .applied
+            .get(&(secret.clone(), provider.to_string()))
+            .filter(|applied| applied.workspace == workspace);
+        CredentialValues(
+            values
+                .0
+                .iter()
+                .filter(|(key, value)| {
+                    applied
+                        .and_then(|applied| applied.fingerprints.get(*key))
+                        .is_none_or(|fingerprint| *fingerprint != self.fingerprint(value))
+                })
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        )
+    }
+
+    /// Record that `values` are now what the gateway holds for `provider`.
+    pub fn commit(
+        &mut self,
+        secret: &SecretRef,
+        workspace: &str,
+        provider: &str,
+        values: &CredentialValues,
+    ) {
         let fingerprints = values
             .0
             .iter()
             .map(|(key, value)| (key.clone(), self.fingerprint(value)))
             .collect();
         self.applied.insert(
-            secret.clone(),
+            (secret.clone(), provider.to_string()),
             Applied {
-                workspace: target.workspace.clone(),
-                provider: target.provider.clone(),
+                workspace: workspace.to_string(),
                 fingerprints,
             },
         );
     }
 
+    /// Forget what `secret` pushed to `provider`, so the next values it holds
+    /// are sent in full. The claim is kept.
+    pub fn clear_applied(&mut self, secret: &SecretRef, provider: &str) {
+        self.applied.remove(&(secret.clone(), provider.to_string()));
+    }
+
     /// Drop everything known about a Secret that was deleted, unlabelled or
     /// made invalid. Provider credentials are left as they are.
     pub fn forget(&mut self, secret: &SecretRef) {
-        self.applied.remove(secret);
+        self.applied.retain(|(owner, _), _| owner != secret);
         self.release(secret, |_| true);
     }
 
@@ -200,13 +234,19 @@ mod tests {
         }
     }
 
-    fn target(provider: &str, keys: &[&str]) -> SyncTarget {
+    fn keys(names: &[&str]) -> KeyMap {
+        names
+            .iter()
+            .map(|k| ((*k).to_string(), (*k).to_lowercase()))
+            .collect()
+    }
+
+    fn target(providers: &[(&str, &[&str])]) -> SyncTarget {
         SyncTarget {
             workspace: "default".to_string(),
-            provider: provider.to_string(),
-            keys: keys
+            providers: providers
                 .iter()
-                .map(|k| ((*k).to_string(), (*k).to_lowercase()))
+                .map(|(provider, names)| ((*provider).to_string(), keys(names)))
                 .collect(),
         }
     }
@@ -220,98 +260,173 @@ mod tests {
         )
     }
 
-    fn changed_keys(plan: &Plan) -> Vec<&str> {
-        plan.changed.keys().map(String::as_str).collect()
+    fn changed_keys(values: &CredentialValues) -> Vec<&str> {
+        values.keys().map(String::as_str).collect()
     }
 
     #[test]
     fn first_sight_pushes_everything_then_only_changes() {
         let mut state = SyncState::new();
         let s = secret("gh");
-        let t = target("github", &["A", "B"]);
         let v1 = values(&[("A", "1"), ("B", "2")]);
-
-        let plan = state.plan(&s, &t, &v1, |_| true).unwrap();
-        assert_eq!(changed_keys(&plan), ["A", "B"]);
-        state.commit(&s, &t, &v1);
-
-        assert!(
-            state
-                .plan(&s, &t, &v1, |_| true)
-                .unwrap()
-                .changed
-                .is_empty()
+        state
+            .claim(&s, "default", "github", &keys(&["A", "B"]), |_| true)
+            .unwrap();
+        assert_eq!(
+            changed_keys(&state.changed(&s, "default", "github", &v1)),
+            ["A", "B"]
         );
+        state.commit(&s, "default", "github", &v1);
+        assert!(state.changed(&s, "default", "github", &v1).is_empty());
 
         let v2 = values(&[("A", "1"), ("B", "3")]);
         assert_eq!(
-            changed_keys(&state.plan(&s, &t, &v2, |_| true).unwrap()),
+            changed_keys(&state.changed(&s, "default", "github", &v2)),
             ["B"]
         );
     }
 
     #[test]
-    fn failed_push_is_retried() {
+    fn providers_of_one_secret_are_tracked_apart() {
         let mut state = SyncState::new();
-        let s = secret("gh");
-        let t = target("github", &["A"]);
+        let s = secret("pm");
+        let token = values(&[("TOKEN", "1")]);
+        state.commit(&s, "default", "slack", &token);
+        assert!(state.changed(&s, "default", "slack", &token).is_empty());
+        assert_eq!(
+            changed_keys(&state.changed(&s, "default", "linear", &token)),
+            ["TOKEN"]
+        );
+    }
+
+    #[test]
+    fn failed_push_is_retried() {
+        let state = SyncState::new();
         let v = values(&[("A", "1")]);
-        state.plan(&s, &t, &v, |_| true).unwrap();
         // No commit: the gateway call failed.
         assert_eq!(
-            changed_keys(&state.plan(&s, &t, &v, |_| true).unwrap()),
+            changed_keys(&state.changed(&secret("gh"), "default", "github", &v)),
             ["A"]
         );
     }
 
     #[test]
-    fn retargeting_pushes_all_keys_to_the_new_provider() {
+    fn removed_provider_releases_its_claims_and_state() {
         let mut state = SyncState::new();
         let s = secret("gh");
         let v = values(&[("A", "1")]);
-        let old = target("github", &["A"]);
-        state.plan(&s, &old, &v, |_| true).unwrap();
-        state.commit(&s, &old, &v);
+        state
+            .claim(&s, "default", "github", &keys(&["A"]), |_| true)
+            .unwrap();
+        state.commit(&s, "default", "github", &v);
 
-        let new = target("github-2", &["A"]);
+        state.retain(&s, &target(&[("github-2", &["A"])]));
+        // The old slot is free for another Secret.
+        assert!(
+            state
+                .claim(&secret("other"), "default", "github", &keys(&["A"]), |_| {
+                    true
+                })
+                .is_ok()
+        );
+        // And returning to it pushes in full.
         assert_eq!(
-            changed_keys(&state.plan(&s, &new, &v, |_| true).unwrap()),
+            changed_keys(&state.changed(&s, "default", "github", &v)),
             ["A"]
         );
-        // The old slot is released.
-        assert!(state.plan(&secret("other"), &old, &v, |_| true).is_ok());
+    }
+
+    #[test]
+    fn workspace_change_pushes_in_full() {
+        let mut state = SyncState::new();
+        let s = secret("gh");
+        let v = values(&[("A", "1")]);
+        state.commit(&s, "default", "github", &v);
+        let mut moved = target(&[("github", &["A"])]);
+        moved.workspace = "oncall".to_string();
+        state.retain(&s, &moved);
+        assert_eq!(
+            changed_keys(&state.changed(&s, "oncall", "github", &v)),
+            ["A"]
+        );
     }
 
     #[test]
     fn two_live_secrets_cannot_feed_one_credential() {
         let mut state = SyncState::new();
-        let t = target("github", &["A"]);
-        let v = values(&[("A", "1")]);
-        state.plan(&secret("first"), &t, &v, |_| true).unwrap();
-        let err = state.plan(&secret("second"), &t, &v, |_| true).unwrap_err();
+        state
+            .claim(&secret("first"), "default", "github", &keys(&["A"]), |_| {
+                true
+            })
+            .unwrap();
+        let err = state
+            .claim(
+                &secret("second"),
+                "default",
+                "github",
+                &keys(&["A"]),
+                |_| true,
+            )
+            .unwrap_err();
         assert_eq!(err.owner, secret("first"));
+        // A different key of the same provider is fine.
+        assert!(
+            state
+                .claim(
+                    &secret("second"),
+                    "default",
+                    "github",
+                    &keys(&["B"]),
+                    |_| { true }
+                )
+                .is_ok()
+        );
     }
 
     #[test]
     fn claim_of_a_deleted_secret_is_taken_over() {
         let mut state = SyncState::new();
-        let t = target("github", &["A"]);
         let v = values(&[("A", "1")]);
-        state.plan(&secret("first"), &t, &v, |_| true).unwrap();
-        state.commit(&secret("first"), &t, &v);
-        let plan = state
-            .plan(&secret("second"), &t, &v, |owner| owner != &secret("first"))
+        state
+            .claim(&secret("first"), "default", "github", &keys(&["A"]), |_| {
+                true
+            })
             .unwrap();
-        assert_eq!(changed_keys(&plan), ["A"]);
+        state.commit(&secret("first"), "default", "github", &v);
+        state
+            .claim(
+                &secret("second"),
+                "default",
+                "github",
+                &keys(&["A"]),
+                |owner| owner != &secret("first"),
+            )
+            .unwrap();
+        assert_eq!(
+            changed_keys(&state.changed(&secret("second"), "default", "github", &v)),
+            ["A"]
+        );
     }
 
     #[test]
     fn forget_releases_claims() {
         let mut state = SyncState::new();
-        let t = target("github", &["A"]);
-        let v = values(&[("A", "1")]);
-        state.plan(&secret("first"), &t, &v, |_| true).unwrap();
+        state
+            .claim(&secret("first"), "default", "github", &keys(&["A"]), |_| {
+                true
+            })
+            .unwrap();
         state.forget(&secret("first"));
-        assert!(state.plan(&secret("second"), &t, &v, |_| true).is_ok());
+        assert!(
+            state
+                .claim(
+                    &secret("second"),
+                    "default",
+                    "github",
+                    &keys(&["A"]),
+                    |_| { true }
+                )
+                .is_ok()
+        );
     }
 }

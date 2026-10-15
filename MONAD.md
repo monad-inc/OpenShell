@@ -17,7 +17,7 @@ This fork carries Monad's changes on top of upstream OpenShell releases: OCSF Au
 
 ## Images
 
-`.github/workflows/monad-images.yml` builds the gateway, supervisor, sandbox runtime, and CLI for amd64 and arm64 and pushes them to `ghcr.io/monad-inc/openshell/{gateway,supervisor,sandbox,cli}`. The packages are private.
+`.github/workflows/monad-images.yml` builds the gateway, supervisor, sandbox runtime, CLI, and provider sync controller for amd64 and arm64 and pushes them to `ghcr.io/monad-inc/openshell/{gateway,supervisor,sandbox,cli,provider-sync}`. The packages are private.
 
 The `cli` image only carries the static `openshell` binary. Copy it into images that need a client matching the gateway build:
 
@@ -33,6 +33,8 @@ COPY --from=ghcr.io/monad-inc/openshell/cli:<tag> /usr/local/bin/openshell /usr/
 | `latest` | Latest `monad-v*` release tag. |
 
 The gateway binary is compiled to launch Monad's supervisor and sandbox runtime images at the same `sha-` tag, so the gateway and supervisor always match.
+
+The `provider-sync` image runs `openshell-provider-sync`, which pushes credential values from labelled Kubernetes Secrets to gateway providers. It is a separate Deployment with the same tag as the gateway; see `crates/openshell-provider-sync/README.md`.
 
 Binaries build on the standard `ubuntu-24.04` and `ubuntu-24.04-arm` runners. To use larger org runners, set the repository variables `MONAD_RUNNER_X64` and `MONAD_RUNNER_ARM64` (for example `ubuntu-24.04-8core` and `ubuntu-24.04-arm-8core`); the runner group must allow this repository.
 

@@ -943,6 +943,39 @@ done
 Any `no` result can strand recovery before workload Pod creation. Upgrade the
 OpenShell chart rather than treating missing workload Pods as Pod failures.
 
+#### Provider sync controller
+
+Some deployments run `openshell-provider-sync` (image `provider-sync`) as its
+own Deployment. It watches Secrets labelled `openshell.nvidia.com/provider-sync=true`
+and pushes changed values to gateway providers with value-only `UpdateProvider`
+calls. It never creates or deletes providers. When a rotated credential does not
+reach a sandbox, read the Events on the Secret first. They name each provider
+the Secret feeds and the outcome:
+
+```bash
+kubectl -n <secret-namespace> get secret <secret> -o jsonpath='{.metadata.annotations}{"\n"}'
+kubectl -n <secret-namespace> get events --field-selector involvedObject.name=<secret> --sort-by=.lastTimestamp | tail -n 20
+kubectl -n <sync-namespace> logs deployment/<provider-sync> --tail=200
+```
+
+| Event reason | Meaning |
+|---|---|
+| `ProviderSynced` | Changed keys were sent; the log line carries the gateway `mutation_id` |
+| `ProviderSyncSkipped` | Every key of that provider is missing or empty in the Secret, as with an unused alternative credential |
+| `ProviderNotFound` | The provider does not exist in that workspace yet; retried every 30s |
+| `ProviderSyncConflict` | Another live Secret already feeds the same workspace, provider and key |
+| `InvalidProviderSync` | Bad annotations, or only some of a provider's keys are set, or a value is not UTF-8 |
+| `ProviderSyncFailed` | The gateway rejected the update or was unreachable |
+
+No Events at all means the controller is not watching the Secret: check the
+label, its `OPENSHELL_PROVIDER_SYNC_NAMESPACE`, and its RBAC (`get`, `list` and
+`watch` on Secrets, `create` and `patch` on `events.k8s.io` Events). A
+`ProviderSynced` event without the change reaching a running process usually
+means the credential's profile lacks `stable_placeholder: true`; only processes
+started after the update see the new value. Avoid rotating while gateways are
+rolling: a supervisor whose provider refetch fails revokes its static
+credentials.
+
 #### Corporate upstream proxy
 
 When the deployment routes sandbox egress through a corporate HTTP forward
@@ -1079,6 +1112,7 @@ credential failures.
 | Gateway fails before serving health after enabling an interceptor | Interceptor endpoint unavailable or manifest/binding validation failed | Gateway and interceptor logs; interceptor socket; `binding_policy`, phases, and failure policy |
 | Authenticated interceptor or middleware rejects gateway calls | Private CA or hostname mismatch, expected audience or issuer mismatch, stale/unknown `kid`, or malformed extension token | `tls_ca_cert_path`, registration `audience`, service verifier config and logs; fetch well-known metadata only through the already-trusted gateway TLS endpoint |
 | Provider profiles disappear after enabling an interceptor catalog | `provider_profile_sources` selected only an authoritative interceptor or returned invalid/duplicate IDs | Inspect source list and interceptor `Describe`/catalog logs; include `user` when composition with imported profiles is intended |
+| A rotated Kubernetes Secret never reaches the provider | `openshell-provider-sync` is not watching it (label, namespace, RBAC), the provider is missing, or the annotations are invalid | Events on the Secret and the provider-sync logs; see [Provider sync controller](#provider-sync-controller) |
 | `provider list-profiles` is empty on a new gateway | Profiles are import-only and nothing has been imported | Import with `openshell provider profile import --from providers --global`; an empty catalog is a valid ready state, not a failure |
 | Sandbox create or provider attach fails naming a missing profile | The provider's profile was never imported, was deleted, or lives at another scope | Import it at the scope the provider uses; the error names the profile ID and the command |
 | Gateway fails after registering supervisor middleware | Service unavailable, invalid manifest, duplicate binding, reserved name, or invalid payload/timeout limit | Middleware service and gateway logs; `[[openshell.supervisor.middleware]]`; `Describe` response |

@@ -17,7 +17,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use crate::gateway::{ProviderUpdater, UpdateError};
-use crate::mapping::{self, MappingError};
+use crate::mapping::{self, Extracted, MappingError};
 use crate::state::{Conflict, SecretRef, SyncState};
 
 /// How long to wait before retrying a provider that does not exist yet.
@@ -28,18 +28,18 @@ const TRANSIENT_RETRY: Duration = Duration::from_secs(10);
 /// the provider or the gateway's configuration changes.
 const INVALID_RETRY: Duration = Duration::from_mins(5);
 
-/// The result of one sync, for logging and events.
+/// The result of syncing one provider.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
     /// Values pushed; `keys` lists the credential keys that changed.
     Updated {
-        workspace: String,
-        provider: String,
         keys: Vec<String>,
         mutation_id: String,
     },
     /// Nothing changed since the last push.
     Unchanged,
+    /// The Secret holds none of this provider's keys, so nothing was sent.
+    Absent { keys: Vec<String> },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -73,6 +73,25 @@ impl SyncError {
     }
 }
 
+/// What happened to each provider a Secret feeds.
+#[derive(Debug)]
+pub struct SyncReport {
+    pub workspace: String,
+    /// In provider-name order. Each provider succeeds or fails on its own.
+    pub providers: Vec<(String, Result<Outcome, SyncError>)>,
+}
+
+impl SyncReport {
+    /// When to look at the Secret again: the soonest retry of any failed
+    /// provider, or `None` when every provider succeeded.
+    fn retry_after(&self) -> Option<Duration> {
+        self.providers
+            .iter()
+            .filter_map(|(_, result)| result.as_ref().err().map(SyncError::retry_after))
+            .min()
+    }
+}
+
 /// Shared by every reconcile.
 pub struct Context {
     updater: Arc<dyn ProviderUpdater>,
@@ -89,45 +108,67 @@ impl Context {
         }
     }
 
-    /// Sync one Secret: parse its annotations, read the mapped keys, and push
-    /// the ones that changed.
+    /// Sync one Secret: parse its annotations, then for each provider read
+    /// the mapped keys and push the ones that changed.
+    ///
+    /// Fails only when the annotations are invalid. A provider that fails is
+    /// reported in the [`SyncReport`] and does not hold back the others.
     ///
     /// `owner_exists` reports whether another Secret holding a claim still
-    /// exists; see [`SyncState::plan`].
+    /// exists; see [`SyncState::claim`].
     pub async fn sync(
         &self,
         secret_ref: &SecretRef,
         secret: &Secret,
-        owner_exists: impl Fn(&SecretRef) -> bool,
-    ) -> Result<Outcome, SyncError> {
+        owner_exists: impl Fn(&SecretRef) -> bool + Sync,
+    ) -> Result<SyncReport, MappingError> {
         let target = match mapping::parse_target(secret.annotations(), &self.default_workspace) {
             Ok(target) => target,
             Err(err) => {
                 // An invalid Secret holds no claims, so fixing a sibling is
                 // not blocked by it.
                 self.state.lock().await.forget(secret_ref);
-                return Err(err.into());
+                return Err(err);
             }
         };
-        let values = mapping::extract_values(&target, secret.data.as_ref())?;
 
-        // The lock is held across the gateway call. Updates are rare and
+        // The lock is held across the gateway calls. Updates are rare and
         // small, and holding it keeps two Secrets from racing on a claim.
         let mut state = self.state.lock().await;
-        let plan = state.plan(secret_ref, &target, &values, owner_exists)?;
-        if plan.changed.is_empty() {
-            return Ok(Outcome::Unchanged);
+        state.retain(secret_ref, &target);
+        let mut providers = Vec::with_capacity(target.providers.len());
+        for (provider, keys) in &target.providers {
+            let result: Result<Outcome, SyncError> = async {
+                state.claim(secret_ref, &target.workspace, provider, keys, &owner_exists)?;
+                let values = match mapping::extract_values(keys, secret.data.as_ref())? {
+                    Extracted::Present(values) => values,
+                    Extracted::Absent => {
+                        state.clear_applied(secret_ref, provider);
+                        return Ok(Outcome::Absent {
+                            keys: keys.keys().cloned().collect(),
+                        });
+                    }
+                };
+                let changed = state.changed(secret_ref, &target.workspace, provider, &values);
+                if changed.is_empty() {
+                    return Ok(Outcome::Unchanged);
+                }
+                let mutation_id = self
+                    .updater
+                    .update_credentials(&target.workspace, provider, &changed)
+                    .await?;
+                state.commit(secret_ref, &target.workspace, provider, &values);
+                Ok(Outcome::Updated {
+                    keys: changed.keys().cloned().collect(),
+                    mutation_id,
+                })
+            }
+            .await;
+            providers.push((provider.clone(), result));
         }
-        let mutation_id = self
-            .updater
-            .update_credentials(&target.workspace, &target.provider, &plan.changed)
-            .await?;
-        state.commit(secret_ref, &target, &values);
-        Ok(Outcome::Updated {
+        Ok(SyncReport {
             workspace: target.workspace,
-            provider: target.provider,
-            keys: plan.changed.keys().cloned().collect(),
-            mutation_id,
+            providers,
         })
     }
 
@@ -161,33 +202,14 @@ async fn reconcile(secret: Arc<Secret>, runtime: Arc<Runtime>) -> Result<Action,
         runtime.ctx.forget(&secret_ref).await;
         return Ok(Action::await_change());
     }
-    let result = runtime
+    let report = match runtime
         .ctx
         .sync(&secret_ref, &secret, |owner| is_live(&runtime.store, owner))
-        .await;
-    match &result {
-        Ok(Outcome::Updated {
-            workspace,
-            provider,
-            keys,
-            mutation_id,
-        }) => {
-            info!(
-                secret = %secret_ref,
-                workspace,
-                provider,
-                keys = ?keys,
-                mutation_id,
-                "provider credentials updated from Secret"
-            );
-            let note = format!(
-                "Updated {} on provider {workspace}/{provider}",
-                keys.join(", ")
-            );
-            publish(&runtime, &secret, EventType::Normal, "ProviderSynced", note).await;
-        }
-        Ok(Outcome::Unchanged) => debug!(secret = %secret_ref, "provider credentials unchanged"),
+        .await
+    {
+        Ok(report) => report,
         Err(err) => {
+            let err = SyncError::from(err);
             warn!(secret = %secret_ref, error = %err, "provider sync failed");
             publish(
                 &runtime,
@@ -197,9 +219,67 @@ async fn reconcile(secret: Arc<Secret>, runtime: Arc<Runtime>) -> Result<Action,
                 err.to_string(),
             )
             .await;
+            return Err(err);
+        }
+    };
+    let workspace = &report.workspace;
+    for (provider, result) in &report.providers {
+        match result {
+            Ok(Outcome::Updated { keys, mutation_id }) => {
+                info!(
+                    secret = %secret_ref,
+                    workspace,
+                    provider,
+                    keys = ?keys,
+                    mutation_id,
+                    "provider credentials updated from Secret"
+                );
+                let note = format!(
+                    "Updated {} on provider {workspace}/{provider}",
+                    keys.join(", ")
+                );
+                publish(&runtime, &secret, EventType::Normal, "ProviderSynced", note).await;
+            }
+            Ok(Outcome::Unchanged) => {
+                debug!(secret = %secret_ref, workspace, provider, "provider credentials unchanged");
+            }
+            Ok(Outcome::Absent { keys }) => {
+                debug!(
+                    secret = %secret_ref,
+                    workspace,
+                    provider,
+                    keys = ?keys,
+                    "Secret holds none of the provider's keys"
+                );
+                let note = format!(
+                    "Skipped provider {workspace}/{provider}: Secret has no value for {}",
+                    keys.join(", ")
+                );
+                publish(
+                    &runtime,
+                    &secret,
+                    EventType::Normal,
+                    "ProviderSyncSkipped",
+                    note,
+                )
+                .await;
+            }
+            Err(err) => {
+                warn!(
+                    secret = %secret_ref,
+                    workspace,
+                    provider,
+                    error = %err,
+                    "provider sync failed"
+                );
+                let note = format!("Provider {workspace}/{provider}: {err}");
+                publish(&runtime, &secret, EventType::Warning, err.reason(), note).await;
+            }
         }
     }
-    result.map(|_| Action::await_change())
+    Ok(report
+        .retry_after()
+        .map_or_else(Action::await_change, Action::requeue))
 }
 
 fn error_policy(_secret: Arc<Secret>, err: &SyncError, _runtime: Arc<Runtime>) -> Action {
@@ -231,6 +311,9 @@ pub struct Options {
 }
 
 /// Run until the watch stream ends or the process receives a shutdown signal.
+///
+/// The watch starts with a full list, so every labelled Secret is synced once
+/// at startup, not only when it next changes.
 pub async fn run(client: Client, ctx: Context, options: Options) {
     let api: Api<Secret> = options.namespace.as_ref().map_or_else(
         || Api::all(client.clone()),
@@ -272,10 +355,14 @@ mod tests {
     /// Workspace, provider and values of one update.
     type UpdateCall = (String, String, BTreeMap<String, String>);
 
+    /// Fails updates for the named provider, or for every provider when the
+    /// name is `None`.
+    type FailRule = (Option<&'static str>, fn() -> UpdateError);
+
     #[derive(Default)]
     struct FakeUpdater {
         calls: StdMutex<Vec<UpdateCall>>,
-        fail_with: StdMutex<Option<fn() -> UpdateError>>,
+        fail_with: StdMutex<Option<FailRule>>,
     }
 
     #[async_trait::async_trait]
@@ -287,7 +374,9 @@ mod tests {
             values: &CredentialValues,
         ) -> Result<String, UpdateError> {
             let fail_with = *self.fail_with.lock().unwrap();
-            if let Some(fail) = fail_with {
+            if let Some((only, fail)) = fail_with
+                && only.is_none_or(|only| only == provider)
+            {
                 return Err(fail());
             }
             self.calls.lock().unwrap().push((
@@ -338,18 +427,45 @@ mod tests {
         )
     }
 
+    /// An agent Secret feeding three providers, with two alternative Claude
+    /// credentials of which only one is set.
+    fn agent(data: &[(&str, &str)]) -> (SecretRef, Secret) {
+        secret(
+            "pm",
+            &[
+                (WORKSPACE_ANNOTATION, "pm"),
+                (
+                    CREDENTIALS_ANNOTATION,
+                    "slack-pm:SLACK_BOT_TOKEN, slack-pm:SLACK_APP_TOKEN, linear:LINEAR_API_KEY,\
+                     claude-code-apikey:ANTHROPIC_API_KEY, claude-code-oauth:CLAUDE_CODE_OAUTH_TOKEN",
+                ),
+            ],
+            data,
+        )
+    }
+
+    fn outcome<'a>(report: &'a SyncReport, provider: &str) -> &'a Result<Outcome, SyncError> {
+        &report
+            .providers
+            .iter()
+            .find(|(name, _)| name == provider)
+            .unwrap()
+            .1
+    }
+
     #[tokio::test]
     async fn pushes_on_first_sight_and_on_change_only() {
         let updater = Arc::new(FakeUpdater::default());
         let ctx = Context::new(updater.clone(), "default");
 
         let (r, s) = github("v1");
-        let outcome = ctx.sync(&r, &s, |_| true).await.unwrap();
-        assert!(matches!(outcome, Outcome::Updated { ref keys, .. } if keys == &["GITHUB_TOKEN"]));
-        assert_eq!(
-            ctx.sync(&r, &s, |_| true).await.unwrap(),
-            Outcome::Unchanged
+        let report = ctx.sync(&r, &s, |_| true).await.unwrap();
+        assert!(
+            matches!(outcome(&report, "github"), Ok(Outcome::Updated { keys, .. }) if keys == &["GITHUB_TOKEN"])
         );
+        let report = ctx.sync(&r, &s, |_| true).await.unwrap();
+        assert!(matches!(outcome(&report, "github"), Ok(Outcome::Unchanged)));
+        assert_eq!(report.retry_after(), None);
 
         let (r, s) = github("v2");
         ctx.sync(&r, &s, |_| true).await.unwrap();
@@ -365,20 +481,150 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn one_secret_updates_each_provider_with_its_own_keys() {
+        let updater = Arc::new(FakeUpdater::default());
+        let ctx = Context::new(updater.clone(), "default");
+        let (r, s) = agent(&[
+            ("SLACK_BOT_TOKEN", "bot"),
+            ("SLACK_APP_TOKEN", "app"),
+            ("LINEAR_API_KEY", "lin"),
+            ("ANTHROPIC_API_KEY", "ant"),
+            // Unused keys are written empty, which counts as absent.
+            ("CLAUDE_CODE_OAUTH_TOKEN", ""),
+        ]);
+        let report = ctx.sync(&r, &s, |_| true).await.unwrap();
+        assert_eq!(report.workspace, "pm");
+        assert!(matches!(
+            outcome(&report, "claude-code-oauth"),
+            Ok(Outcome::Absent { .. })
+        ));
+        assert_eq!(report.retry_after(), None);
+
+        let mut calls = updater.calls.lock().unwrap().clone();
+        calls.sort();
+        let providers: Vec<(&str, Vec<&str>)> = calls
+            .iter()
+            .map(|(_, provider, values)| {
+                (
+                    provider.as_str(),
+                    values.keys().map(String::as_str).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            providers,
+            [
+                ("claude-code-apikey", vec!["ANTHROPIC_API_KEY"]),
+                ("linear", vec!["LINEAR_API_KEY"]),
+                ("slack-pm", vec!["SLACK_APP_TOKEN", "SLACK_BOT_TOKEN"]),
+            ]
+        );
+        assert!(calls.iter().all(|(workspace, _, _)| workspace == "pm"));
+    }
+
+    #[tokio::test]
+    async fn rotating_one_key_touches_only_its_provider() {
+        let updater = Arc::new(FakeUpdater::default());
+        let ctx = Context::new(updater.clone(), "default");
+        let base = [
+            ("SLACK_BOT_TOKEN", "bot"),
+            ("SLACK_APP_TOKEN", "app"),
+            ("LINEAR_API_KEY", "lin"),
+            ("ANTHROPIC_API_KEY", "ant"),
+        ];
+        let (r, s) = agent(&base);
+        ctx.sync(&r, &s, |_| true).await.unwrap();
+        updater.calls.lock().unwrap().clear();
+
+        let mut rotated = base;
+        rotated[0] = ("SLACK_BOT_TOKEN", "bot-2");
+        let (r, s) = agent(&rotated);
+        ctx.sync(&r, &s, |_| true).await.unwrap();
+        let calls = updater.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, "slack-pm");
+        assert_eq!(
+            calls[0].2,
+            BTreeMap::from([("SLACK_BOT_TOKEN".to_string(), "bot-2".to_string())])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_provider_does_not_hold_back_the_others() {
+        let updater = Arc::new(FakeUpdater::default());
+        let ctx = Context::new(updater.clone(), "default");
+        *updater.fail_with.lock().unwrap() =
+            Some((Some("linear"), || UpdateError::ProviderNotFound {
+                workspace: "pm".to_string(),
+                provider: "linear".to_string(),
+            }));
+        // Slack is half-written; Linear does not exist yet; Claude is fine.
+        let (r, s) = agent(&[
+            ("SLACK_BOT_TOKEN", "bot"),
+            ("LINEAR_API_KEY", "lin"),
+            ("ANTHROPIC_API_KEY", "ant"),
+        ]);
+        let report = ctx.sync(&r, &s, |_| true).await.unwrap();
+        assert!(matches!(
+            outcome(&report, "slack-pm"),
+            Err(SyncError::Mapping(MappingError::MissingSecretKey { .. }))
+        ));
+        assert!(matches!(
+            outcome(&report, "linear"),
+            Err(SyncError::Update(UpdateError::ProviderNotFound { .. }))
+        ));
+        assert!(matches!(
+            outcome(&report, "claude-code-apikey"),
+            Ok(Outcome::Updated { .. })
+        ));
+        assert_eq!(report.retry_after(), Some(PROVIDER_MISSING_RETRY));
+
+        let calls = updater.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, "claude-code-apikey");
+    }
+
+    #[tokio::test]
+    async fn switching_alternative_credentials_pushes_the_new_one() {
+        let updater = Arc::new(FakeUpdater::default());
+        let ctx = Context::new(updater.clone(), "default");
+        let (r, s) = agent(&[("ANTHROPIC_API_KEY", "ant")]);
+        ctx.sync(&r, &s, |_| true).await.unwrap();
+        let (r, s) = agent(&[("CLAUDE_CODE_OAUTH_TOKEN", "oauth")]);
+        let report = ctx.sync(&r, &s, |_| true).await.unwrap();
+        assert!(matches!(
+            outcome(&report, "claude-code-apikey"),
+            Ok(Outcome::Absent { .. })
+        ));
+        assert!(matches!(
+            outcome(&report, "claude-code-oauth"),
+            Ok(Outcome::Updated { .. })
+        ));
+        // Switching back resends the API key, even with the same value.
+        let (r, s) = agent(&[("ANTHROPIC_API_KEY", "ant")]);
+        let report = ctx.sync(&r, &s, |_| true).await.unwrap();
+        assert!(matches!(
+            outcome(&report, "claude-code-apikey"),
+            Ok(Outcome::Updated { .. })
+        ));
+    }
+
+    #[tokio::test]
     async fn failed_update_is_retried_with_the_same_values() {
         let updater = Arc::new(FakeUpdater::default());
         let ctx = Context::new(updater.clone(), "default");
         let (r, s) = github("v1");
 
         *updater.fail_with.lock().unwrap() =
-            Some(|| UpdateError::Transient("unavailable".to_string()));
-        let err = ctx.sync(&r, &s, |_| true).await.unwrap_err();
-        assert_eq!(err.retry_after(), TRANSIENT_RETRY);
+            Some((None, || UpdateError::Transient("unavailable".to_string())));
+        let report = ctx.sync(&r, &s, |_| true).await.unwrap();
+        assert_eq!(report.retry_after(), Some(TRANSIENT_RETRY));
 
         *updater.fail_with.lock().unwrap() = None;
+        let report = ctx.sync(&r, &s, |_| true).await.unwrap();
         assert!(matches!(
-            ctx.sync(&r, &s, |_| true).await.unwrap(),
-            Outcome::Updated { .. }
+            outcome(&report, "github"),
+            Ok(Outcome::Updated { .. })
         ));
     }
 
@@ -386,17 +632,18 @@ mod tests {
     async fn missing_provider_retries_sooner_than_invalid_secret() {
         let updater = Arc::new(FakeUpdater::default());
         let ctx = Context::new(updater.clone(), "default");
-        *updater.fail_with.lock().unwrap() = Some(|| UpdateError::ProviderNotFound {
+        *updater.fail_with.lock().unwrap() = Some((None, || UpdateError::ProviderNotFound {
             workspace: "w".to_string(),
             provider: "p".to_string(),
-        });
+        }));
         let (r, s) = github("v1");
-        let err = ctx.sync(&r, &s, |_| true).await.unwrap_err();
+        let report = ctx.sync(&r, &s, |_| true).await.unwrap();
+        let err = outcome(&report, "github").as_ref().unwrap_err();
         assert_eq!(err.retry_after(), PROVIDER_MISSING_RETRY);
         assert_eq!(err.reason(), "ProviderNotFound");
 
         let (r, s) = secret("bad", &[(PROVIDER_ANNOTATION, "p")], &[]);
-        let err = ctx.sync(&r, &s, |_| true).await.unwrap_err();
+        let err = SyncError::from(ctx.sync(&r, &s, |_| true).await.unwrap_err());
         assert_eq!(err.retry_after(), INVALID_RETRY);
         assert_eq!(err.reason(), "InvalidProviderSync");
     }
@@ -413,10 +660,12 @@ mod tests {
             ],
             &[("a", "1")],
         );
+        let report = ctx.sync(&r, &s, |_| true).await.unwrap();
         assert!(matches!(
-            ctx.sync(&r, &s, |_| true).await,
+            outcome(&report, "p"),
             Err(SyncError::Mapping(MappingError::MissingSecretKey { .. }))
         ));
+        assert_eq!(report.retry_after(), Some(INVALID_RETRY));
         assert!(updater.calls.lock().unwrap().is_empty());
     }
 
@@ -433,8 +682,9 @@ mod tests {
             name: "github-creds-copy".to_string(),
             ..r2
         };
+        let report = ctx.sync(&r2, &s2, |_| true).await.unwrap();
         assert!(matches!(
-            ctx.sync(&r2, &s2, |_| true).await,
+            outcome(&report, "github"),
             Err(SyncError::Conflict(_))
         ));
         assert_eq!(updater.calls.lock().unwrap().len(), 1);
