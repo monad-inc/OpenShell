@@ -61,6 +61,12 @@ accident, and one Secret key may be listed only once.
   only when the sandbox is ready again. This holds with `--state-secret`;
   without it a restart in progress is lost when the controller restarts, which
   can leave an agent stopped, and the controller warns about it at startup.
+  At startup a state Secret that cannot be read is retried with backoff, never
+  replaced. One that does not parse is copied to
+  `<state-secret>-corrupt-<unix-time>` and reported with a `StateSecretCorrupt`
+  Warning; every restart entry that still parses is kept and the rest starts
+  over as a baseline. An agent whose restart entry was lost stays stopped,
+  because a stop by this controller cannot be told from one by a person.
 - **What a restart leaves to others.** A sandbox that is stopped, stopping,
   completed, in Error or being deleted when the restart begins is left alone,
   and so is one someone else stops after the restart started it. A sandbox that

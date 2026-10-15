@@ -7,12 +7,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
-use kube::runtime::events::Reporter;
+use kube::runtime::events::{Event, EventType, Recorder, Reporter};
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_provider_sync::controller::{self, Context, Options};
 use openshell_provider_sync::gateway::{GatewayRestarter, GatewayUpdater, TokenFile};
-use openshell_provider_sync::state::SyncState;
-use openshell_provider_sync::state_store::{SecretStateStore, StateStore};
+use openshell_provider_sync::state::{PersistedState, SyncState};
+use openshell_provider_sync::state_store::{LoadError, SecretStateStore};
 use openshell_sdk::{AuthConfig, ClientConfig, OpenShellClient};
 use tracing_subscriber::EnvFilter;
 
@@ -116,6 +116,10 @@ async fn main() -> Result<()> {
         .into_diagnostic()
         .wrap_err("build Kubernetes client")?;
 
+    let reporter = (!cli.no_events).then_some(Reporter {
+        controller: cli.reporter.clone(),
+        instance: cli.reporter_instance.clone(),
+    });
     let mut context = Context::new(
         Arc::new(GatewayUpdater::new(gateway.clone())),
         cli.default_workspace.clone(),
@@ -134,22 +138,10 @@ async fn main() -> Result<()> {
             miette::miette!("--state-secret needs --state-namespace or POD_NAMESPACE")
         })?;
         let store = SecretStateStore::new(kube_client.clone(), &namespace, name.clone());
-        // Refuse to start on state that exists but cannot be read: starting
-        // fresh would overwrite it with the next save and forget restarts in
-        // progress, which could leave an agent stopped. Crash-looping until it
-        // is readable is the safe failure.
-        let state = store
-            .load()
-            .await
-            .map_err(|err| miette::miette!("load provider sync state: {err}"))?
-            .map_or_else(SyncState::new, SyncState::from_persisted);
+        let state = load_state(&store, &kube_client, &namespace, reporter.as_ref()).await;
         context = context.with_state(state, Arc::new(store));
     }
 
-    let reporter = (!cli.no_events).then_some(Reporter {
-        controller: cli.reporter,
-        instance: cli.reporter_instance,
-    });
     tracing::info!(
         gateway = %cli.gateway,
         namespace = cli.namespace.as_deref().unwrap_or("<all>"),
@@ -168,6 +160,67 @@ async fn main() -> Result<()> {
     )
     .await;
     Ok(())
+}
+
+/// Load saved state, never starting over state that is only unreadable for
+/// now, and never stopping all syncing over state that is corrupt.
+async fn load_state(
+    store: &SecretStateStore,
+    client: &kube::Client,
+    namespace: &str,
+    reporter: Option<&Reporter>,
+) -> SyncState {
+    let mut backoff = std::time::Duration::from_secs(5);
+    loop {
+        match store.load_checked().await {
+            Ok(Some(persisted)) => return SyncState::from_persisted(persisted),
+            Ok(None) => return SyncState::new(),
+            Err(LoadError::Unavailable(err)) => {
+                // Starting fresh now would overwrite the saved state, and
+                // with it any restart in progress.
+                tracing::warn!(error = %err, retry_in_secs = backoff.as_secs(), "provider sync state unavailable; retrying");
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(std::time::Duration::from_mins(5));
+            }
+            Err(LoadError::Corrupt { raw, error }) => {
+                let (salvaged, recovered) = PersistedState::salvage(&raw);
+                let copy = store.quarantine(&raw).await;
+                let kept = match &copy {
+                    Ok(name) => format!("kept in Secret {name}"),
+                    Err(err) => format!("not kept ({err})"),
+                };
+                let note = format!(
+                    "State in Secret {} does not parse ({error}); {kept}. Starting over: the next values are a \
+                     baseline that restarts no agents. Recovered {recovered} restart(s) in progress; any \
+                     other agent this controller had stopped stays stopped, because a stop by this \
+                     controller cannot be told from one by a person",
+                    store.name()
+                );
+                tracing::warn!(note, "provider sync state is corrupt");
+                if let Some(reporter) = reporter {
+                    let recorder = Recorder::new(client.clone(), reporter.clone());
+                    let reference = k8s_openapi::api::core::v1::ObjectReference {
+                        api_version: Some("v1".to_string()),
+                        kind: Some("Secret".to_string()),
+                        namespace: Some(namespace.to_string()),
+                        name: Some(store.name().to_string()),
+                        ..Default::default()
+                    };
+                    let event = Event {
+                        type_: EventType::Warning,
+                        reason: "StateSecretCorrupt".to_string(),
+                        note: Some(note),
+                        action: "LoadState".to_string(),
+                        secondary: None,
+                    };
+                    if let Err(err) = recorder.publish(&event, &reference).await {
+                        tracing::debug!(error = %err, "failed to publish Kubernetes event");
+                    }
+                }
+                return SyncState::from_persisted(salvaged);
+            }
+        }
+    }
 }
 
 fn init_tracing(json: bool) {

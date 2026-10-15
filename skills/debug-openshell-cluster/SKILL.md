@@ -979,8 +979,12 @@ baseline (the first values the controller saw, or the first sync after it
 restarted without `--state-secret`), restarts are off (`--no-restart`), or no
 sandbox was attached to the provider. Agents restarting right after a
 provider-sync restart mean values changed while it was down, or restarts it had
-in progress being resumed; a missing state Secret restarts nothing. provider-sync
-refuses to start on a state Secret it cannot parse rather than overwrite it.
+in progress being resumed; a missing state Secret restarts nothing. If the state Secret
+cannot be read, provider-sync waits and retries rather than starting over. If it
+does not parse, provider-sync copies it to `<state-secret>-corrupt-<unix-time>`,
+records a `StateSecretCorrupt` Warning on it, keeps every restart in progress it
+can still parse, and starts over; an agent it had stopped whose restart entry
+was lost stays stopped and must be started by hand, as the Event says.
 Restarts in progress are in that Secret (`state.json`, `restarts`). One ends
 when its sandbox is ready again or is deleted. Starting the sandbox by hand does
 not cancel it: provider-sync stops and starts it once more, so the agent still

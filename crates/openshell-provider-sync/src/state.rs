@@ -129,6 +129,32 @@ struct PersistedApplied {
     fingerprints: BTreeMap<String, String>,
 }
 
+impl PersistedState {
+    /// Recover what can be recovered from state that does not parse: every
+    /// restart entry that still parses on its own. Fingerprints are dropped,
+    /// which only makes the next values a baseline; restarts are kept because
+    /// losing one could leave an agent stopped. Returns the state and how
+    /// many restarts were recovered.
+    pub fn salvage(raw: &[u8]) -> (Self, usize) {
+        let restarts: Vec<PendingRestart> = serde_json::from_slice::<serde_json::Value>(raw)
+            .ok()
+            .and_then(|value| value.get("restarts").cloned())
+            .and_then(|restarts| restarts.as_array().cloned())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|entry| serde_json::from_value(entry).ok())
+            .collect();
+        let recovered = restarts.len();
+        (
+            Self {
+                restarts,
+                ..Self::default()
+            },
+            recovered,
+        )
+    }
+}
+
 fn to_hex(bytes: &[u8; 32]) -> String {
     use std::fmt::Write as _;
     bytes
@@ -740,6 +766,38 @@ mod tests {
         assert!(state.has_applied(&secret("kept"), "w", "p"));
         assert!(!state.has_applied(&secret("gone"), "w", "p"));
         assert!(!state.prune_applied(|_| true));
+    }
+
+    #[test]
+    fn corrupt_state_keeps_every_restart_that_still_parses() {
+        let mut state = SyncState::new();
+        state.commit(&secret("a"), "w", "p", &values(&[("A", "1")]));
+        assert!(state.request_restart(&secret("a"), "w", "pm"));
+        state.set_restart_stage("w", "pm", RestartStage::Stopping);
+        let mut raw = serde_json::to_value(state.to_persisted()).unwrap();
+        // Corrupt everything but the one restart.
+        raw["salt"] = serde_json::json!(42);
+        raw["applied"] = serde_json::json!("garbage");
+        raw["restarts"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"workspace": "w"}));
+        let raw = serde_json::to_vec(&raw).unwrap();
+        assert!(serde_json::from_slice::<PersistedState>(&raw).is_err());
+
+        let (salvaged, recovered) = PersistedState::salvage(&raw);
+        assert_eq!(recovered, 1);
+        let restored = SyncState::from_persisted(salvaged);
+        assert_eq!(
+            restored.restart_stage("w", "pm"),
+            Some(RestartStage::Stopping)
+        );
+        assert!(
+            !restored.has_applied(&secret("a"), "w", "p"),
+            "fingerprints become a baseline"
+        );
+
+        assert_eq!(PersistedState::salvage(b"not json").1, 0);
     }
 
     #[test]
