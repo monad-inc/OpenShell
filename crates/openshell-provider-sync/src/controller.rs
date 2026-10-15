@@ -16,9 +16,11 @@ use kube::{Api, Client, Resource, ResourceExt};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
-use crate::gateway::{ProviderUpdater, UpdateError};
+use crate::gateway::{ProviderUpdater, SandboxRestarter, UpdateError};
 use crate::mapping::{self, Extracted, MappingError};
 use crate::state::{Conflict, SecretRef, SyncState};
+use crate::state::{PendingRestart, RestartStage};
+use crate::state_store::StateStore;
 
 /// How long to wait before retrying a provider that does not exist yet.
 const PROVIDER_MISSING_RETRY: Duration = Duration::from_secs(30);
@@ -27,7 +29,8 @@ const TRANSIENT_RETRY: Duration = Duration::from_secs(10);
 /// How long to wait before retrying a Secret that can only succeed once it,
 /// the provider or the gateway's configuration changes.
 const INVALID_RETRY: Duration = Duration::from_mins(5);
-
+/// How often applied fingerprints of deleted Secrets are dropped.
+const PRUNE_INTERVAL: Duration = Duration::from_mins(10);
 /// The result of syncing one provider.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
@@ -35,6 +38,11 @@ pub enum Outcome {
     Updated {
         keys: Vec<String>,
         mutation_id: String,
+        /// Sandboxes attached to the provider whose restart this rotation
+        /// requested. Empty for a baseline: values this controller had not
+        /// applied before, such as at first sight. A sandbox already
+        /// restarting is marked to restart once more instead.
+        restart: Vec<String>,
     },
     /// Nothing changed since the last push.
     Unchanged,
@@ -92,10 +100,31 @@ impl SyncReport {
     }
 }
 
+impl SyncReport {
+    /// Every sandbox to restart, once each even when several of its
+    /// providers rotated.
+    pub fn sandboxes_to_restart(&self) -> Vec<String> {
+        let mut sandboxes: Vec<String> = self
+            .providers
+            .iter()
+            .filter_map(|(_, result)| match result {
+                Ok(Outcome::Updated { restart, .. }) => Some(restart.iter().cloned()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        sandboxes.sort();
+        sandboxes.dedup();
+        sandboxes
+    }
+}
+
 /// Shared by every reconcile.
 pub struct Context {
     updater: Arc<dyn ProviderUpdater>,
+    restarter: Option<Arc<dyn SandboxRestarter>>,
     state: Mutex<SyncState>,
+    store: Option<Arc<dyn StateStore>>,
     default_workspace: String,
 }
 
@@ -103,9 +132,27 @@ impl Context {
     pub fn new(updater: Arc<dyn ProviderUpdater>, default_workspace: impl Into<String>) -> Self {
         Self {
             updater,
+            restarter: None,
             state: Mutex::new(SyncState::new()),
+            store: None,
             default_workspace: default_workspace.into(),
         }
+    }
+
+    /// Restart the agents attached to a provider whose values rotated.
+    #[must_use]
+    pub fn with_restarter(mut self, restarter: Arc<dyn SandboxRestarter>) -> Self {
+        self.restarter = Some(restarter);
+        self
+    }
+
+    /// Resume from persisted state and keep it current, so a restart of this
+    /// controller does not mistake values it already applied for rotations.
+    #[must_use]
+    pub fn with_state(mut self, state: SyncState, store: Arc<dyn StateStore>) -> Self {
+        self.state = Mutex::new(state);
+        self.store = Some(store);
+        self
     }
 
     /// Sync one Secret: parse its annotations, then for each provider read
@@ -153,18 +200,44 @@ impl Context {
                 if changed.is_empty() {
                     return Ok(Outcome::Unchanged);
                 }
-                let mutation_id = self
+                let rotation = state.has_applied(secret_ref, &target.workspace, provider);
+                let updated = self
                     .updater
                     .update_credentials(&target.workspace, provider, &changed)
                     .await?;
                 state.commit(secret_ref, &target.workspace, provider, &values);
+                // Requested in the same state as the commit, so one save
+                // records both: a controller restart can never see the
+                // rotation as applied and its restarts as never asked for.
+                let restart = if rotation && self.restarter.is_some() {
+                    updated
+                        .sandboxes
+                        .into_iter()
+                        .filter(|sandbox| {
+                            state.request_restart(secret_ref, &target.workspace, sandbox)
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 Ok(Outcome::Updated {
                     keys: changed.keys().cloned().collect(),
-                    mutation_id,
+                    mutation_id: updated.mutation_id,
+                    restart,
                 })
             }
             .await;
             providers.push((provider.clone(), result));
+        }
+        if providers
+            .iter()
+            .any(|(_, result)| matches!(result, Ok(Outcome::Updated { .. })))
+            && let Err(err) = self.persist(&state).await
+        {
+            // In-memory state is still right. If this controller restarts
+            // before a later save, the rotation is seen again and requested
+            // again; a restart never stops anything before it is saved.
+            warn!(error = %err, "failed to persist provider sync state");
         }
         Ok(SyncReport {
             workspace: target.workspace,
@@ -175,12 +248,84 @@ impl Context {
     async fn forget(&self, secret_ref: &SecretRef) {
         self.state.lock().await.forget(secret_ref);
     }
+
+    async fn persist(&self, state: &SyncState) -> Result<(), String> {
+        match &self.store {
+            Some(store) => store.save(&state.to_persisted()).await,
+            None => Ok(()),
+        }
+    }
+
+    pub(crate) async fn restart_stage(
+        &self,
+        workspace: &str,
+        sandbox: &str,
+    ) -> Option<RestartStage> {
+        self.state.lock().await.restart_stage(workspace, sandbox)
+    }
+
+    /// Move a restart to `stage` and save it. Fails when the save fails, so
+    /// a caller never acts on a stage a controller restart would not see.
+    pub(crate) async fn set_restart_stage(
+        &self,
+        workspace: &str,
+        sandbox: &str,
+        next: RestartStage,
+    ) -> Result<(), String> {
+        let mut state = self.state.lock().await;
+        let previous = state.restart_stage(workspace, sandbox);
+        state.set_restart_stage(workspace, sandbox, next);
+        if let Err(err) = self.persist(&state).await {
+            if let Some(previous) = previous {
+                state.set_restart_stage(workspace, sandbox, previous);
+            }
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    /// The sandbox runs again; true when it must restart once more.
+    pub(crate) async fn finish_restart(&self, workspace: &str, sandbox: &str) -> bool {
+        let mut state = self.state.lock().await;
+        let again = state.finish_restart(workspace, sandbox);
+        if let Err(err) = self.persist(&state).await {
+            // A lost save leaves a finished restart recorded: after a
+            // controller restart it sees the sandbox ready and finishes again.
+            warn!(error = %err, "failed to persist provider sync state");
+        }
+        again
+    }
+
+    pub(crate) async fn abandon_restart(&self, workspace: &str, sandbox: &str) {
+        let mut state = self.state.lock().await;
+        state.abandon_restart(workspace, sandbox);
+        if let Err(err) = self.persist(&state).await {
+            warn!(error = %err, "failed to persist provider sync state");
+        }
+    }
+
+    /// Restarts a previous run left in progress.
+    pub async fn pending_restarts(&self) -> Vec<PendingRestart> {
+        self.state.lock().await.pending_restarts()
+    }
+
+    async fn prune(&self, exists: impl Fn(&SecretRef) -> bool) {
+        let mut state = self.state.lock().await;
+        if state.prune_applied(exists)
+            && let Err(err) = self.persist(&state).await
+        {
+            warn!(error = %err, "failed to persist provider sync state");
+        }
+    }
 }
 
-struct Runtime {
-    ctx: Context,
+pub(crate) struct Runtime {
+    pub(crate) ctx: Context,
     store: Store<Secret>,
     recorder: Option<Recorder>,
+    /// Event reasons published, kept only by tests.
+    #[cfg(test)]
+    events: std::sync::Mutex<Vec<String>>,
 }
 
 fn secret_ref(secret: &Secret) -> SecretRef {
@@ -213,7 +358,7 @@ async fn reconcile(secret: Arc<Secret>, runtime: Arc<Runtime>) -> Result<Action,
             warn!(secret = %secret_ref, error = %err, "provider sync failed");
             publish(
                 &runtime,
-                &secret,
+                &secret_ref,
                 EventType::Warning,
                 err.reason(),
                 err.to_string(),
@@ -225,20 +370,32 @@ async fn reconcile(secret: Arc<Secret>, runtime: Arc<Runtime>) -> Result<Action,
     let workspace = &report.workspace;
     for (provider, result) in &report.providers {
         match result {
-            Ok(Outcome::Updated { keys, mutation_id }) => {
+            Ok(Outcome::Updated {
+                keys,
+                mutation_id,
+                restart,
+            }) => {
                 info!(
                     secret = %secret_ref,
                     workspace,
                     provider,
                     keys = ?keys,
                     mutation_id,
+                    restart = ?restart,
                     "provider credentials updated from Secret"
                 );
                 let note = format!(
                     "Updated {} on provider {workspace}/{provider}",
                     keys.join(", ")
                 );
-                publish(&runtime, &secret, EventType::Normal, "ProviderSynced", note).await;
+                publish(
+                    &runtime,
+                    &secret_ref,
+                    EventType::Normal,
+                    "ProviderSynced",
+                    note,
+                )
+                .await;
             }
             Ok(Outcome::Unchanged) => {
                 debug!(secret = %secret_ref, workspace, provider, "provider credentials unchanged");
@@ -257,7 +414,7 @@ async fn reconcile(secret: Arc<Secret>, runtime: Arc<Runtime>) -> Result<Action,
                 );
                 publish(
                     &runtime,
-                    &secret,
+                    &secret_ref,
                     EventType::Normal,
                     "ProviderSyncSkipped",
                     note,
@@ -273,8 +430,26 @@ async fn reconcile(secret: Arc<Secret>, runtime: Arc<Runtime>) -> Result<Action,
                     "provider sync failed"
                 );
                 let note = format!("Provider {workspace}/{provider}: {err}");
-                publish(&runtime, &secret, EventType::Warning, err.reason(), note).await;
+                publish(
+                    &runtime,
+                    &secret_ref,
+                    EventType::Warning,
+                    err.reason(),
+                    note,
+                )
+                .await;
             }
+        }
+    }
+    if let Some(restarter) = &runtime.ctx.restarter {
+        for sandbox in report.sandboxes_to_restart() {
+            tokio::spawn(crate::restart::drive(
+                Arc::clone(restarter),
+                Arc::clone(&runtime),
+                secret_ref.clone(),
+                report.workspace.clone(),
+                sandbox,
+            ));
         }
     }
     Ok(report
@@ -286,7 +461,15 @@ fn error_policy(_secret: Arc<Secret>, err: &SyncError, _runtime: Arc<Runtime>) -
     Action::requeue(err.retry_after())
 }
 
-async fn publish(runtime: &Runtime, secret: &Secret, type_: EventType, reason: &str, note: String) {
+pub(crate) async fn publish(
+    runtime: &Runtime,
+    secret: &SecretRef,
+    type_: EventType,
+    reason: &str,
+    note: String,
+) {
+    #[cfg(test)]
+    runtime.events.lock().unwrap().push(reason.to_string());
     let Some(recorder) = &runtime.recorder else {
         return;
     };
@@ -297,7 +480,14 @@ async fn publish(runtime: &Runtime, secret: &Secret, type_: EventType, reason: &
         action: "UpdateProviderCredentials".to_string(),
         secondary: None,
     };
-    if let Err(err) = recorder.publish(&event, &secret.object_ref(&())).await {
+    let reference = k8s_openapi::api::core::v1::ObjectReference {
+        api_version: Some("v1".to_string()),
+        kind: Some("Secret".to_string()),
+        namespace: Some(secret.namespace.clone()),
+        name: Some(secret.name.clone()),
+        ..Default::default()
+    };
+    if let Err(err) = recorder.publish(&event, &reference).await {
         debug!(error = %err, "failed to publish Kubernetes event");
     }
 }
@@ -329,6 +519,42 @@ pub async fn run(client: Client, ctx: Context, options: Options) {
         recorder: options
             .reporter
             .map(|reporter| Recorder::new(client, reporter)),
+        #[cfg(test)]
+        events: std::sync::Mutex::default(),
+    });
+    // An earlier run may have left restarts in progress, including agents
+    // it stopped and had not started yet.
+    if let Some(restarter) = &runtime.ctx.restarter {
+        for pending in runtime.ctx.pending_restarts().await {
+            info!(
+                workspace = pending.workspace,
+                sandbox = pending.sandbox,
+                stage = ?pending.stage,
+                "resuming an agent restart"
+            );
+            tokio::spawn(crate::restart::drive(
+                Arc::clone(restarter),
+                Arc::clone(&runtime),
+                pending.secret,
+                pending.workspace,
+                pending.sandbox,
+            ));
+        }
+    }
+    // Fingerprints of deleted Secrets would otherwise be kept forever: the
+    // watch does not see a Secret that is gone or no longer labelled.
+    let pruner = Arc::clone(&runtime);
+    tokio::spawn(async move {
+        if pruner.store.wait_until_ready().await.is_err() {
+            return;
+        }
+        loop {
+            pruner
+                .ctx
+                .prune(|secret| is_live(&pruner.store, secret))
+                .await;
+            tokio::time::sleep(PRUNE_INTERVAL).await;
+        }
     });
     controller
         .shutdown_on_signal()
@@ -349,6 +575,7 @@ mod tests {
     };
     use k8s_openapi::ByteString;
     use kube::api::ObjectMeta;
+    use openshell_core::proto::SandboxPhase;
     use std::collections::BTreeMap;
     use std::sync::Mutex as StdMutex;
 
@@ -363,6 +590,24 @@ mod tests {
     struct FakeUpdater {
         calls: StdMutex<Vec<UpdateCall>>,
         fail_with: StdMutex<Option<FailRule>>,
+        /// Sandboxes every provider reports attached; `<provider>-agent`
+        /// when unset.
+        attached: StdMutex<Option<Vec<String>>>,
+    }
+
+    /// Keeps every save, newest last.
+    #[derive(Default)]
+    struct MemoryStore(StdMutex<Vec<crate::state::PersistedState>>);
+
+    #[async_trait::async_trait]
+    impl StateStore for MemoryStore {
+        async fn load(&self) -> Result<Option<crate::state::PersistedState>, String> {
+            Ok(self.0.lock().unwrap().last().cloned())
+        }
+        async fn save(&self, state: &crate::state::PersistedState) -> Result<(), String> {
+            self.0.lock().unwrap().push(state.clone());
+            Ok(())
+        }
     }
 
     #[async_trait::async_trait]
@@ -372,7 +617,7 @@ mod tests {
             workspace: &str,
             provider: &str,
             values: &CredentialValues,
-        ) -> Result<String, UpdateError> {
+        ) -> Result<crate::gateway::Updated, UpdateError> {
             let fail_with = *self.fail_with.lock().unwrap();
             if let Some((only, fail)) = fail_with
                 && only.is_none_or(|only| only == provider)
@@ -384,7 +629,16 @@ mod tests {
                 provider.to_string(),
                 values.0.clone(),
             ));
-            Ok("mutation-1".to_string())
+            let sandboxes = self
+                .attached
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| vec![format!("{provider}-agent")]);
+            Ok(crate::gateway::Updated {
+                mutation_id: "mutation-1".to_string(),
+                sandboxes,
+            })
         }
     }
 
@@ -547,6 +801,462 @@ mod tests {
             calls[0].2,
             BTreeMap::from([("SLACK_BOT_TOKEN".to_string(), "bot-2".to_string())])
         );
+    }
+
+    const PM_CREDENTIALS: [(&str, &str); 4] = [
+        ("SLACK_BOT_TOKEN", "bot"),
+        ("SLACK_APP_TOKEN", "app"),
+        ("LINEAR_API_KEY", "lin"),
+        ("ANTHROPIC_API_KEY", "ant"),
+    ];
+
+    fn with(
+        base: [(&'static str, &'static str); 4],
+        key: &str,
+        value: &'static str,
+    ) -> [(&'static str, &'static str); 4] {
+        base.map(|(name, current)| {
+            if name == key {
+                (name, value)
+            } else {
+                (name, current)
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn a_rotation_restarts_only_the_agents_attached_to_its_provider() {
+        let updater = Arc::new(FakeUpdater::default());
+        let ctx = Context::new(updater.clone(), "default")
+            .with_restarter(FakeSandbox::new(SandboxPhase::Ready));
+        let (r, s) = agent(&PM_CREDENTIALS);
+        let report = ctx.sync(&r, &s, |_| true).await.unwrap();
+        assert!(
+            report.sandboxes_to_restart().is_empty(),
+            "first sight is a baseline, not a rotation"
+        );
+
+        let (r, s) = agent(&with(PM_CREDENTIALS, "SLACK_BOT_TOKEN", "bot-2"));
+        let report = ctx.sync(&r, &s, |_| true).await.unwrap();
+        assert_eq!(report.sandboxes_to_restart(), ["slack-pm-agent"]);
+        assert!(matches!(
+            outcome(&report, "slack-pm"),
+            Ok(Outcome::Updated { restart, .. }) if restart == &["slack-pm-agent"]
+        ));
+        assert!(matches!(outcome(&report, "linear"), Ok(Outcome::Unchanged)));
+
+        // Unchanged values restart nothing.
+        let report = ctx.sync(&r, &s, |_| true).await.unwrap();
+        assert!(report.sandboxes_to_restart().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_agent_restarts_once_when_several_of_its_providers_rotate() {
+        let updater = Arc::new(FakeUpdater::default());
+        *updater.attached.lock().unwrap() = Some(vec!["pm".to_string()]);
+        let ctx = Context::new(updater.clone(), "default")
+            .with_restarter(FakeSandbox::new(SandboxPhase::Ready));
+        let (r, s) = agent(&PM_CREDENTIALS);
+        ctx.sync(&r, &s, |_| true).await.unwrap();
+
+        let rotated = with(
+            with(PM_CREDENTIALS, "SLACK_BOT_TOKEN", "bot-2"),
+            "LINEAR_API_KEY",
+            "lin-2",
+        );
+        let (r, s) = agent(&rotated);
+        let report = ctx.sync(&r, &s, |_| true).await.unwrap();
+        assert_eq!(report.sandboxes_to_restart(), ["pm"]);
+    }
+
+    #[tokio::test]
+    async fn persisted_state_keeps_a_controller_restart_from_restarting_agents() {
+        let store = Arc::new(MemoryStore::default());
+        let updater = Arc::new(FakeUpdater::default());
+        let first = Context::new(updater.clone(), "default")
+            .with_restarter(FakeSandbox::new(SandboxPhase::Ready))
+            .with_state(SyncState::new(), store.clone());
+        let (r, s) = agent(&PM_CREDENTIALS);
+        first.sync(&r, &s, |_| true).await.unwrap();
+        updater.calls.lock().unwrap().clear();
+
+        // A new controller process resumes from the saved fingerprints.
+        let persisted = store.load().await.unwrap().expect("state saved");
+        let second = Context::new(updater.clone(), "default")
+            .with_restarter(FakeSandbox::new(SandboxPhase::Ready))
+            .with_state(SyncState::from_persisted(persisted), store.clone());
+        let report = second.sync(&r, &s, |_| true).await.unwrap();
+        assert!(report.sandboxes_to_restart().is_empty());
+        assert!(
+            updater.calls.lock().unwrap().is_empty(),
+            "nothing re-pushed"
+        );
+
+        let (r, s) = agent(&with(PM_CREDENTIALS, "LINEAR_API_KEY", "lin-2"));
+        let report = second.sync(&r, &s, |_| true).await.unwrap();
+        assert_eq!(report.sandboxes_to_restart(), ["linear-agent"]);
+    }
+
+    /// A sandbox whose phase moves like the gateway's: a stop goes through
+    /// Stopping to Stopped, a start through Starting to `after_start`.
+    struct FakeSandbox {
+        phase: StdMutex<Option<SandboxPhase>>,
+        after_start: StdMutex<SandboxPhase>,
+        phase_failures: StdMutex<u32>,
+        stop_failures: StdMutex<u32>,
+        start_failures: StdMutex<u32>,
+        stops: StdMutex<u32>,
+        starts: StdMutex<u32>,
+    }
+
+    impl FakeSandbox {
+        fn new(phase: SandboxPhase) -> Arc<Self> {
+            Arc::new(Self {
+                phase: StdMutex::new(Some(phase)),
+                after_start: StdMutex::new(SandboxPhase::Ready),
+                phase_failures: StdMutex::new(0),
+                stop_failures: StdMutex::new(0),
+                start_failures: StdMutex::new(0),
+                stops: StdMutex::new(0),
+                starts: StdMutex::new(0),
+            })
+        }
+        fn counts(&self) -> (u32, u32) {
+            (*self.stops.lock().unwrap(), *self.starts.lock().unwrap())
+        }
+    }
+
+    fn fail_once(counter: &StdMutex<u32>) -> bool {
+        let mut remaining = counter.lock().unwrap();
+        if *remaining > 0 {
+            *remaining -= 1;
+            return true;
+        }
+        false
+    }
+
+    #[async_trait::async_trait]
+    impl SandboxRestarter for FakeSandbox {
+        async fn phase(&self, _: &str, _: &str) -> Result<Option<SandboxPhase>, UpdateError> {
+            if fail_once(&self.phase_failures) {
+                return Err(UpdateError::Transient(
+                    "Unavailable: gateway down".to_string(),
+                ));
+            }
+            let mut phase = self.phase.lock().unwrap();
+            let current = *phase;
+            *phase = match current {
+                Some(SandboxPhase::Stopping) => Some(SandboxPhase::Stopped),
+                Some(SandboxPhase::Starting) => Some(*self.after_start.lock().unwrap()),
+                other => other,
+            };
+            Ok(current)
+        }
+        async fn stop(&self, _: &str, _: &str) -> Result<(), UpdateError> {
+            if fail_once(&self.stop_failures) {
+                return Err(UpdateError::Transient(
+                    "Unavailable: gateway down".to_string(),
+                ));
+            }
+            *self.stops.lock().unwrap() += 1;
+            *self.phase.lock().unwrap() = Some(SandboxPhase::Stopping);
+            Ok(())
+        }
+        async fn start(&self, _: &str, _: &str) -> Result<(), UpdateError> {
+            if fail_once(&self.start_failures) {
+                return Err(UpdateError::Transient(
+                    "Unavailable: gateway down".to_string(),
+                ));
+            }
+            *self.starts.lock().unwrap() += 1;
+            *self.phase.lock().unwrap() = Some(SandboxPhase::Starting);
+            Ok(())
+        }
+    }
+
+    /// A store whose saves can be made to fail.
+    #[derive(Default)]
+    struct FlakyStore {
+        inner: MemoryStore,
+        failing: StdMutex<bool>,
+    }
+
+    #[async_trait::async_trait]
+    impl StateStore for FlakyStore {
+        async fn load(&self) -> Result<Option<crate::state::PersistedState>, String> {
+            self.inner.load().await
+        }
+        async fn save(&self, state: &crate::state::PersistedState) -> Result<(), String> {
+            if *self.failing.lock().unwrap() {
+                return Err("apiserver unavailable".to_string());
+            }
+            self.inner.save(state).await
+        }
+    }
+
+    fn runtime(ctx: Context) -> Arc<Runtime> {
+        let (store, _writer) = kube::runtime::reflector::store();
+        Arc::new(Runtime {
+            ctx,
+            store,
+            recorder: None,
+            events: StdMutex::default(),
+        })
+    }
+
+    fn restarting_runtime(
+        sandbox: &Arc<FakeSandbox>,
+        store: Arc<dyn StateStore>,
+        state: SyncState,
+    ) -> Arc<Runtime> {
+        runtime(
+            Context::new(Arc::new(FakeUpdater::default()), "default")
+                .with_restarter(sandbox.clone())
+                .with_state(state, store),
+        )
+    }
+
+    fn events(runtime: &Runtime) -> Vec<String> {
+        runtime.events.lock().unwrap().clone()
+    }
+
+    async fn drive(sandbox: &Arc<FakeSandbox>, runtime: &Arc<Runtime>) {
+        let (secret, _) = github("v1");
+        crate::restart::drive(
+            sandbox.clone(),
+            Arc::clone(runtime),
+            secret,
+            "oncall".to_string(),
+            "triage".to_string(),
+        )
+        .await;
+    }
+
+    fn requested(at: RestartStage) -> SyncState {
+        let mut state = SyncState::new();
+        let (secret, _) = github("v1");
+        assert!(state.request_restart(&secret, "oncall", "triage"));
+        state.set_restart_stage("oncall", "triage", at);
+        state
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_rotation_records_its_restart_in_the_same_save_and_restarts_the_agent() {
+        let store = Arc::new(MemoryStore::default());
+        let updater = Arc::new(FakeUpdater::default());
+        *updater.attached.lock().unwrap() = Some(vec!["triage".to_string()]);
+        let sandbox = FakeSandbox::new(SandboxPhase::Ready);
+        let ctx = Context::new(updater, "default")
+            .with_restarter(sandbox.clone())
+            .with_state(SyncState::new(), store.clone());
+        let (r, s) = github("v1");
+        ctx.sync(&r, &s, |_| true).await.unwrap();
+        let (r, s) = github("v2");
+        let report = ctx.sync(&r, &s, |_| true).await.unwrap();
+        assert_eq!(report.sandboxes_to_restart(), ["triage"]);
+
+        // The save that records the new fingerprint also records the
+        // restart, so no crash can apply the rotation and forget the restart.
+        let saved = SyncState::from_persisted(store.load().await.unwrap().unwrap());
+        assert_eq!(
+            saved.restart_stage("oncall", "triage"),
+            Some(RestartStage::Requested)
+        );
+        assert!(saved.has_applied(&r, "oncall", "github"));
+        assert!(
+            saved
+                .changed(
+                    &r,
+                    "oncall",
+                    "github",
+                    &CredentialValues(BTreeMap::from([(
+                        "GITHUB_TOKEN".to_string(),
+                        "v2".to_string()
+                    )]))
+                )
+                .0
+                .is_empty()
+        );
+
+        let runtime = runtime(ctx);
+        drive(&sandbox, &runtime).await;
+        assert_eq!(sandbox.counts(), (1, 1));
+        assert_eq!(*sandbox.phase.lock().unwrap(), Some(SandboxPhase::Ready));
+        assert!(runtime.ctx.pending_restarts().await.is_empty());
+        assert_eq!(events(&runtime), ["AgentRestarted"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_long_gateway_outage_delays_the_restart_but_never_leaves_the_agent_stopped() {
+        let sandbox = FakeSandbox::new(SandboxPhase::Ready);
+        *sandbox.stop_failures.lock().unwrap() = 3;
+        *sandbox.start_failures.lock().unwrap() = 30;
+        *sandbox.phase_failures.lock().unwrap() = 2;
+        let runtime = restarting_runtime(
+            &sandbox,
+            Arc::new(MemoryStore::default()),
+            requested(RestartStage::Requested),
+        );
+        drive(&sandbox, &runtime).await;
+        assert_eq!(sandbox.counts(), (1, 1));
+        assert_eq!(*sandbox.phase.lock().unwrap(), Some(SandboxPhase::Ready));
+        assert!(runtime.ctx.pending_restarts().await.is_empty());
+        let events = events(&runtime);
+        assert_eq!(events.last().map(String::as_str), Some("AgentRestarted"));
+        assert!(
+            events
+                .iter()
+                .filter(|reason| *reason == "AgentRestartPending")
+                .count()
+                >= 35
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_requested_restart_resumed_after_a_crash_still_stops_and_starts() {
+        // Crash after the request was saved but before the stop reached the
+        // gateway: the agent still runs on old connections.
+        let sandbox = FakeSandbox::new(SandboxPhase::Ready);
+        let runtime = restarting_runtime(
+            &sandbox,
+            Arc::new(MemoryStore::default()),
+            requested(RestartStage::Requested),
+        );
+        drive(&sandbox, &runtime).await;
+        assert_eq!(
+            sandbox.counts(),
+            (1, 1),
+            "a ready sandbox is not mistaken for restarted"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_resumed_stop_starts_the_sandbox_without_stopping_it_again() {
+        let sandbox = FakeSandbox::new(SandboxPhase::Stopped);
+        let runtime = restarting_runtime(
+            &sandbox,
+            Arc::new(MemoryStore::default()),
+            requested(RestartStage::Stopping),
+        );
+        drive(&sandbox, &runtime).await;
+        assert_eq!(sandbox.counts(), (0, 1));
+        assert_eq!(events(&runtime), ["AgentRestarted"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn nothing_is_stopped_until_the_restart_is_saved() {
+        let sandbox = FakeSandbox::new(SandboxPhase::Ready);
+        let store = Arc::new(FlakyStore::default());
+        *store.failing.lock().unwrap() = true;
+        let runtime =
+            restarting_runtime(&sandbox, store.clone(), requested(RestartStage::Requested));
+        let task = tokio::spawn({
+            let sandbox = sandbox.clone();
+            let runtime = runtime.clone();
+            async move { drive(&sandbox, &runtime).await }
+        });
+        tokio::time::sleep(Duration::from_mins(30)).await;
+        assert_eq!(sandbox.counts(), (0, 0), "no stop while the save fails");
+        assert_eq!(
+            runtime.ctx.restart_stage("oncall", "triage").await,
+            Some(RestartStage::Requested)
+        );
+
+        *store.failing.lock().unwrap() = false;
+        task.await.unwrap();
+        assert_eq!(sandbox.counts(), (1, 1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_agent_in_error_after_its_start_is_not_reported_restarted() {
+        let sandbox = FakeSandbox::new(SandboxPhase::Ready);
+        *sandbox.after_start.lock().unwrap() = SandboxPhase::Error;
+        let runtime = restarting_runtime(
+            &sandbox,
+            Arc::new(MemoryStore::default()),
+            requested(RestartStage::Requested),
+        );
+        drive(&sandbox, &runtime).await;
+        assert_eq!(sandbox.counts(), (1, 1));
+        assert_eq!(events(&runtime), ["AgentRestartFailed"]);
+        assert!(runtime.ctx.pending_restarts().await.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_starting_agent_is_restarted_once_it_runs() {
+        let sandbox = FakeSandbox::new(SandboxPhase::Starting);
+        let runtime = restarting_runtime(
+            &sandbox,
+            Arc::new(MemoryStore::default()),
+            requested(RestartStage::Requested),
+        );
+        drive(&sandbox, &runtime).await;
+        assert_eq!(sandbox.counts(), (1, 1));
+        assert_eq!(events(&runtime), ["AgentRestarted"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn agents_someone_else_stopped_or_failed_are_left_alone() {
+        for phase in [
+            SandboxPhase::Stopped,
+            SandboxPhase::Stopping,
+            SandboxPhase::Completed,
+            SandboxPhase::Error,
+            SandboxPhase::Deleting,
+        ] {
+            let sandbox = FakeSandbox::new(phase);
+            let runtime = restarting_runtime(
+                &sandbox,
+                Arc::new(MemoryStore::default()),
+                requested(RestartStage::Requested),
+            );
+            drive(&sandbox, &runtime).await;
+            assert_eq!(sandbox.counts(), (0, 0), "{phase:?}");
+            assert_eq!(events(&runtime), ["AgentRestartSkipped"], "{phase:?}");
+        }
+        // Stopped by someone else after this controller started it.
+        let sandbox = FakeSandbox::new(SandboxPhase::Stopped);
+        let runtime = restarting_runtime(
+            &sandbox,
+            Arc::new(MemoryStore::default()),
+            requested(RestartStage::AwaitingRunning),
+        );
+        drive(&sandbox, &runtime).await;
+        assert_eq!(sandbox.counts(), (0, 0));
+        assert_eq!(events(&runtime), ["AgentRestartSkipped"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_rotation_during_a_restart_restarts_the_agent_once_more() {
+        let sandbox = FakeSandbox::new(SandboxPhase::Ready);
+        let mut state = requested(RestartStage::Requested);
+        let (secret, _) = github("v1");
+        assert!(!state.request_restart(&secret, "oncall", "triage"));
+        let runtime = restarting_runtime(&sandbox, Arc::new(MemoryStore::default()), state);
+        drive(&sandbox, &runtime).await;
+        assert_eq!(sandbox.counts(), (2, 2));
+        assert_eq!(events(&runtime), ["AgentRestarted", "AgentRestarted"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_controller_restart_resumes_restarts_from_saved_state() {
+        let store = Arc::new(MemoryStore::default());
+        store
+            .save(&requested(RestartStage::Stopping).to_persisted())
+            .await
+            .unwrap();
+        let persisted = store.load().await.unwrap().unwrap();
+        let sandbox = FakeSandbox::new(SandboxPhase::Stopped);
+        let runtime = restarting_runtime(
+            &sandbox,
+            store.clone(),
+            SyncState::from_persisted(persisted),
+        );
+        assert_eq!(runtime.ctx.pending_restarts().await.len(), 1);
+        drive(&sandbox, &runtime).await;
+        assert_eq!(sandbox.counts(), (0, 1));
+        let saved = SyncState::from_persisted(store.load().await.unwrap().unwrap());
+        assert!(saved.pending_restarts().is_empty());
     }
 
     #[tokio::test]

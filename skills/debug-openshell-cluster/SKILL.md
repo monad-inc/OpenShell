@@ -966,13 +966,30 @@ kubectl -n <sync-namespace> logs deployment/<provider-sync> --tail=200
 | `ProviderSyncConflict` | Another live Secret already feeds the same workspace, provider and key |
 | `InvalidProviderSync` | Bad annotations, or only some of a provider's keys are set, or a value is not UTF-8 |
 | `ProviderSyncFailed` | The gateway rejected the update or was unreachable |
+| `AgentRestarted` | A rotation restarted a sandbox attached to that provider, and it is ready again |
+| `AgentRestartSkipped` | The sandbox was stopped, stopping, completed, in Error or deleted, or someone else stopped it after the restart started it; left alone |
+| `AgentRestartPending` | A stop, start, phase read or state save failed and is being retried (backing off to every 5 minutes), or the sandbox is taking over 2 minutes to stop or start. Retried until it succeeds, and resumed after a provider-sync restart |
+| `AgentRestartFailed` | The sandbox was deleted while stopped for the restart, or ended in Error; the gateway's own recovery owns it |
 
 No Events at all means the controller is not watching the Secret: check the
 label, its `OPENSHELL_PROVIDER_SYNC_NAMESPACE`, and its RBAC (`get`, `list` and
 `watch` on Secrets, `create` and `patch` on `events.k8s.io` Events). A
-`ProviderSynced` event without the change reaching a running process usually
-means the credential's profile lacks `stable_placeholder: true`; only processes
-started after the update see the new value. Avoid rotating while gateways are
+`ProviderSynced` event with no `AgentRestarted` after it means the values were a
+baseline (the first values the controller saw, or the first sync after it
+restarted without `--state-secret`), restarts are off (`--no-restart`), or no
+sandbox was attached to the provider. Agents restarting right after a
+provider-sync restart mean values changed while it was down, or restarts it had
+in progress being resumed; a missing state Secret restarts nothing. If the state Secret
+cannot be read, provider-sync waits and retries rather than starting over. If it
+does not parse, provider-sync copies it to `<state-secret>-corrupt-<unix-time>`,
+records a `StateSecretCorrupt` Warning on it, keeps every restart in progress it
+can still parse, and starts over; an agent it had stopped whose restart entry
+was lost stays stopped and must be started by hand, as the Event says.
+Restarts in progress are in that Secret (`state.json`, `restarts`). One ends
+when its sandbox is ready again or is deleted. Starting the sandbox by hand does
+not cancel it: provider-sync stops and starts it once more, so the agent still
+ends up running.
+Avoid rotating while gateways are
 rolling: a supervisor whose provider refetch fails revokes its static
 credentials.
 
