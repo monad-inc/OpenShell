@@ -1,0 +1,24 @@
+# syntax=docker/dockerfile:1.4
+
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Monad fork: the provider sync controller, which keeps provider credentials
+# current with labelled Kubernetes Secrets. See
+# crates/openshell-provider-sync/README.md.
+#
+# The GNU-linked binary is staged at:
+#   deploy/docker/.build/prebuilt-binaries/<arch>/openshell-provider-sync
+#
+# Distroless Debian provides the glibc runtime required by the binary.
+
+ARG PROVIDER_SYNC_BASE_IMAGE=gcr.io/distroless/cc-debian13:nonroot@sha256:e792ab3d241a468a4fd7519ddbbebe66b49b5f365771716ea688ad40b6c6f1c2
+FROM ${PROVIDER_SYNC_BASE_IMAGE} AS provider-sync
+
+ARG TARGETARCH
+
+COPY --chmod=0555 deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell-provider-sync /usr/local/bin/openshell-provider-sync
+
+USER 65532:65532
+
+ENTRYPOINT ["/usr/local/bin/openshell-provider-sync"]
