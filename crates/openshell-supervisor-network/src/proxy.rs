@@ -6363,6 +6363,13 @@ async fn handle_forward_proxy(
             return Ok(());
         }
     };
+    // Subscribe before credentials are resolved, so a rotation that lands
+    // while this request is relayed still closes it, including after an
+    // upgrade that authenticated with the old value.
+    let credential_rotation = l7_ctx
+        .provider_credentials
+        .as_ref()
+        .map(|credentials| credentials.rotation_watch(&host_lc, port));
     // Static credentials are intentionally acquired only after every
     // asynchronous admission step. Holding an endpoint-scoped resolver across
     // middleware or token-grant awaits would let a revoked generation reach
@@ -6610,7 +6617,7 @@ async fn handle_forward_proxy(
     let signing_region = forward_upgrade_config
         .as_ref()
         .map_or("", |config| config.signing_region.as_str());
-    let outcome_result = relay_rewritten_forward_request(
+    let forward_relay = relay_rewritten_forward_request(
         method,
         &upstream_target,
         rewritten,
@@ -6638,8 +6645,19 @@ async fn handle_forward_proxy(
             }),
             endpoint_observer: endpoint_observer.as_ref(),
         },
-    )
-    .await;
+    );
+    let outcome_result = tokio::select! {
+        outcome = forward_relay => outcome,
+        rotated = relay::credential_rotated(credential_rotation.as_ref()) => {
+            relay::emit_rotated_relay_close(&l7_ctx, &rotated);
+            if let Some(session) = middleware_session.take() {
+                session
+                    .end(openshell_core::proto::MiddlewareSessionEndReason::Cancellation)
+                    .await;
+            }
+            return Ok(());
+        }
+    };
     let outcome_result = match outcome_result {
         Err(report) => {
             if let Some(error) = report.downcast_ref::<secrets::body::BodyCredentialError>() {
@@ -6754,15 +6772,19 @@ async fn handle_forward_proxy(
             upgrade_options.websocket.permessage_deflate = websocket_permessage_deflate;
             upgrade_options.middleware_session = middleware_session.take();
             upgrade_options.selected_subprotocol = websocket_subprotocol;
-            crate::l7::relay::handle_upgrade(
-                client,
-                &mut upstream,
-                overflow,
-                &host_lc,
-                port,
-                upgrade_options,
-            )
-            .await?;
+            tokio::select! {
+                result = crate::l7::relay::handle_upgrade(
+                    client,
+                    &mut upstream,
+                    overflow,
+                    &host_lc,
+                    port,
+                    upgrade_options,
+                ) => result?,
+                rotated = relay::credential_rotated(credential_rotation.as_ref()) => {
+                    relay::emit_rotated_relay_close(&l7_ctx, &rotated);
+                }
+            }
         }
     }
 
@@ -9492,6 +9514,192 @@ network_policies:
             let _ = handler.await;
         }
         scenario.expect("compressed plaintext WebSocket scenario should complete");
+    }
+
+    #[tokio::test]
+    async fn forward_websocket_closes_when_its_credential_rotates() {
+        if !cfg!(target_os = "linux") {
+            eprintln!("skipping: handler identity binding requires /proc (Linux)");
+            return;
+        }
+        let Some(upstream_ip) = non_loopback_test_ipv4() else {
+            eprintln!("skipping: no routable non-loopback IPv4 test address");
+            return;
+        };
+
+        let upstream_listener = TcpListener::bind((upstream_ip, 0))
+            .await
+            .expect("bind upstream listener");
+        let upstream_port = upstream_listener.local_addr().unwrap().port();
+        let executable = std::env::current_exe().expect("current executable");
+        let data = format!(
+            r#"
+network_policies:
+  allow-upstream:
+    name: allow-upstream
+    endpoints:
+      - host: "{upstream_ip}"
+        port: {upstream_port}
+    binaries:
+      - {{ path: "{executable}" }}
+"#,
+            executable = executable.display(),
+        );
+        let engine = Arc::new(
+            OpaEngine::from_strings(include_str!("../data/sandbox-policy.rego"), &data)
+                .expect("load policy"),
+        );
+        let credentials = |revision: u64, value: &str, other: &str| {
+            use openshell_core::proto::{StaticCredentialBinding, StaticCredentialEndpointBinding};
+            let binding = |host: String, port: u32, handle: char| StaticCredentialBinding {
+                endpoints: vec![StaticCredentialEndpointBinding {
+                    host,
+                    port,
+                    path: "/**".into(),
+                }],
+                credential_identity: format!("refresh:{}", handle.to_string().repeat(64)),
+                workload_credential_handle: handle.to_string().repeat(64),
+            };
+            ProviderCredentialState::from_bound_environment_with_stable_placeholders(
+                revision,
+                std::collections::HashMap::from([
+                    ("WS_TOKEN".to_string(), value.to_string()),
+                    ("OTHER_TOKEN".to_string(), other.to_string()),
+                ]),
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+                std::collections::HashMap::from([
+                    (
+                        "WS_TOKEN".to_string(),
+                        binding(upstream_ip.to_string(), u32::from(upstream_port), 'a'),
+                    ),
+                    (
+                        "OTHER_TOKEN".to_string(),
+                        binding("other.example.com".to_string(), 443, 'b'),
+                    ),
+                ]),
+                Vec::new(),
+                vec!["WS_TOKEN".to_string(), "OTHER_TOKEN".to_string()],
+            )
+            .expect("valid bindings")
+        };
+        let live = credentials(1, "first", "other-1");
+        let placeholder = live.snapshot().child_env["WS_TOKEN"].clone();
+
+        let upstream = tokio::spawn(async move {
+            let (mut socket, _) = upstream_listener.accept().await.unwrap();
+            let request = read_http_headers_unbounded(&mut socket).await;
+            let request = String::from_utf8_lossy(&request).into_owned();
+            socket
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let mut rest = [0u8; 64];
+            let closed = socket.read(&mut rest).await.unwrap() == 0;
+            (request, closed)
+        });
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind proxy listener");
+        let proxy_address = proxy_listener.local_addr().unwrap();
+        let target = format!("http://{upstream_ip}:{upstream_port}/ws");
+        let request = format!(
+            "GET {target} HTTP/1.1\r\nHost: {upstream_ip}:{upstream_port}\r\nAuthorization: Bearer {placeholder}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+        );
+        let (upgraded_tx, upgraded) = tokio::sync::oneshot::channel();
+        let client = tokio::spawn(async move {
+            let mut socket = TcpStream::connect(proxy_address)
+                .await
+                .expect("connect proxy");
+            let response = read_http_headers_unbounded(&mut socket).await;
+            assert!(String::from_utf8_lossy(&response).contains("101 Switching Protocols"));
+            let _ = upgraded_tx.send(());
+            let mut rest = [0u8; 64];
+            socket.read(&mut rest).await.unwrap_or(0)
+        });
+        let (proxy_connection, _) = proxy_listener.accept().await.unwrap();
+        let socket_addrs = proxy_connection
+            .peer_addr()
+            .ok()
+            .zip(proxy_connection.local_addr().ok());
+        let stream: BoundaryDuplexStream = Box::new(proxy_connection);
+        let mut proxy_connection = tokio::io::BufReader::new(stream);
+        let handler_credentials = live.clone();
+        let handler = tokio::spawn(async move {
+            Box::pin(handle_forward_proxy(
+                "GET",
+                &target,
+                request.as_bytes(),
+                request.len(),
+                &mut proxy_connection,
+                None,
+                socket_addrs,
+                engine,
+                Arc::new(BinaryIdentityCache::new()),
+                Arc::new(AtomicU32::new(std::process::id())),
+                None,
+                AgentProposals::default(),
+                Arc::new(None),
+                Arc::new(None),
+                Some(handler_credentials),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ))
+            .await
+        });
+
+        let within = std::time::Duration::from_secs(10);
+        tokio::time::timeout(within, upgraded)
+            .await
+            .expect("upgrade established")
+            .expect("client reports the upgrade");
+
+        // Rotating another provider's credential leaves the WebSocket open.
+        let other = credentials(2, "first", "other-2");
+        let keys = live
+            .value_only_rotation(&other)
+            .expect("only OTHER_TOKEN changed");
+        assert_eq!(keys, ["OTHER_TOKEN"]);
+        live.install_prepared(&other);
+        assert_eq!(live.announce_rotation(&keys).tunnels, 0);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !handler.is_finished(),
+            "unrelated rotation keeps the WebSocket open"
+        );
+
+        // Rotating its own credential closes it.
+        let rotated = credentials(3, "second", "other-2");
+        let keys = live
+            .value_only_rotation(&rotated)
+            .expect("WS_TOKEN changed");
+        live.install_prepared(&rotated);
+        assert_eq!(live.announce_rotation(&keys).tunnels, 1);
+
+        tokio::time::timeout(within, handler)
+            .await
+            .expect("rotation closes the upgraded forward connection")
+            .expect("join handler")
+            .expect("rotation closure is clean");
+        let (seen, upstream_closed) = tokio::time::timeout(within, upstream)
+            .await
+            .expect("upstream observes the close")
+            .expect("join upstream");
+        assert!(seen.contains("Authorization: Bearer first\r\n"), "{seen}");
+        assert!(upstream_closed, "upstream sees EOF, not further frames");
+        assert_eq!(
+            tokio::time::timeout(within, client)
+                .await
+                .expect("client observes the close")
+                .expect("join client"),
+            0
+        );
     }
 
     #[tokio::test]

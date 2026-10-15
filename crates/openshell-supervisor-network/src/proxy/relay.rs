@@ -8,9 +8,14 @@ use crate::l7::relay::L7EvalContext;
 use crate::opa::{NetworkAction, OpaEngine, PolicyGenerationGuard, TunnelPolicyEngine};
 use miette::{IntoDiagnostic, Result};
 use openshell_core::activity::ActivitySender;
+use openshell_core::credential_rotation::{CredentialRotationWatch, RotatedCredential};
 use openshell_core::endpoint_status::EndpointObservationSender;
 use openshell_core::proto::ProviderProfileCredential;
 use openshell_core::secrets::SecretResolver;
+use openshell_ocsf::{
+    ActionId, ActivityId, DispositionId, Endpoint, NetworkActivityBuilder, SeverityId, StatusId,
+    ocsf_emit,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -244,6 +249,13 @@ where
     C: AsyncRead + AsyncWrite + Unpin + Send,
     U: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    // Subscribe before any request can carry credential material, so a
+    // rotation that lands while the relay starts still closes it.
+    let rotation = context
+        .request
+        .provider_credentials
+        .as_ref()
+        .map(|credentials| credentials.rotation_watch(&context.request.host, context.request.port));
     match context.policy {
         PreparedHttpPolicy::Inspect { configs, evaluator } if configs.len() == 1 => {
             let generation_guard = evaluator.generation_guard().clone();
@@ -257,6 +269,10 @@ where
                 ) => result,
                 () = generation_guard.wait_until_stale() => {
                     emit_stale_relay_close(context.request, &generation_guard);
+                    Ok(())
+                }
+                rotated = credential_rotated(rotation.as_ref()) => {
+                    emit_rotated_relay_close(context.request, &rotated);
                     Ok(())
                 }
             }
@@ -275,6 +291,10 @@ where
                     emit_stale_relay_close(context.request, &generation_guard);
                     Ok(())
                 }
+                rotated = credential_rotated(rotation.as_ref()) => {
+                    emit_rotated_relay_close(context.request, &rotated);
+                    Ok(())
+                }
             }
         }
         PreparedHttpPolicy::Passthrough { generation_guard } => {
@@ -288,6 +308,10 @@ where
                 ) => result,
                 () = generation_guard.wait_until_stale() => {
                     emit_stale_relay_close(context.request, &generation_guard);
+                    Ok(())
+                }
+                rotated = credential_rotated(rotation.as_ref()) => {
+                    emit_rotated_relay_close(context.request, &rotated);
                     Ok(())
                 }
             }
@@ -346,16 +370,88 @@ where
     Ok(())
 }
 
+/// Resolve when a credential bound to this relay's destination rotates.
+/// Relays without provider credentials never close for rotation.
+pub(super) async fn credential_rotated(
+    rotation: Option<&CredentialRotationWatch>,
+) -> RotatedCredential {
+    match rotation {
+        Some(rotation) => rotation.rotated().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Why an established relay was closed by the supervisor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayCloseReason {
+    /// A static credential bound to the destination got a new value.
+    CredentialRotated,
+    /// The policy generation advanced: a policy, provider binding,
+    /// attachment or credential revocation change.
+    PolicyChanged,
+}
+
+impl RelayCloseReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CredentialRotated => "credential_rotated",
+            Self::PolicyChanged => "policy_changed",
+        }
+    }
+}
+
 fn emit_stale_relay_close(request: &L7EvalContext, guard: &PolicyGenerationGuard) {
-    emit_l7_tunnel_close_after_policy_change(
-        &request.host,
-        request.port,
-        miette::miette!(
-            "policy generation is stale [captured_generation:{} current_generation:{}]",
+    emit_relay_close(
+        request,
+        RelayCloseReason::PolicyChanged,
+        &[],
+        &format!(
+            "captured_generation:{} current_generation:{}",
             guard.captured_generation(),
             guard.current_generation(),
         ),
     );
+}
+
+pub(super) fn emit_rotated_relay_close(request: &L7EvalContext, rotated: &RotatedCredential) {
+    let detail = if rotated.keys.is_empty() {
+        "rotation history overrun; closed conservatively".to_string()
+    } else {
+        format!("keys:{}", rotated.keys.join(","))
+    };
+    emit_relay_close(
+        request,
+        RelayCloseReason::CredentialRotated,
+        &rotated.keys,
+        &detail,
+    );
+}
+
+/// One Close event per supervisor-closed relay. Keys are environment key
+/// names, never values.
+fn emit_relay_close(
+    request: &L7EvalContext,
+    reason: RelayCloseReason,
+    credential_keys: &[String],
+    detail: &str,
+) {
+    let severity = match reason {
+        RelayCloseReason::CredentialRotated => SeverityId::Low,
+        RelayCloseReason::PolicyChanged => SeverityId::Medium,
+    };
+    let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Close)
+        .action(ActionId::Denied)
+        .disposition(DispositionId::Blocked)
+        .severity(severity)
+        .status(StatusId::Success)
+        .dst_endpoint(Endpoint::from_domain(&request.host, request.port))
+        .firewall_rule(&request.policy_name, "relay")
+        .unmapped("close_reason", reason.as_str())
+        .unmapped("credential_keys", credential_keys.to_vec())
+        .message(format!("Tunnel closed: {} [{detail}]", reason.as_str()))
+        .build();
+    ocsf_emit!(event);
 }
 
 #[cfg(test)]
@@ -598,6 +694,152 @@ mod tests {
             prepare_http_relay(None, &engine, &decision, &request).is_none(),
             "policy reload must prevent a stale relay from starting"
         );
+    }
+
+    fn two_provider_credentials(
+        a_value: &str,
+    ) -> openshell_core::provider_credentials::ProviderCredentialState {
+        use openshell_core::proto::{StaticCredentialBinding, StaticCredentialEndpointBinding};
+        let binding = |host: &str, handle: char| StaticCredentialBinding {
+            endpoints: vec![StaticCredentialEndpointBinding {
+                host: host.into(),
+                port: 80,
+                path: "/**".into(),
+            }],
+            // Stable credentials carry their handle in the identity, as
+            // the gateway issues them.
+            credential_identity: format!("refresh:{}", handle.to_string().repeat(64)),
+            workload_credential_handle: handle.to_string().repeat(64),
+        };
+        openshell_core::provider_credentials::ProviderCredentialState::from_bound_environment_with_stable_placeholders(
+            7,
+            HashMap::from([
+                ("A_TOKEN".to_string(), a_value.to_string()),
+                ("B_TOKEN".to_string(), "b-value".to_string()),
+            ]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([
+                ("A_TOKEN".to_string(), binding("a.example.com", 'a')),
+                ("B_TOKEN".to_string(), binding("b.example.com", 'b')),
+            ]),
+            Vec::new(),
+            vec!["A_TOKEN".to_string(), "B_TOKEN".to_string()],
+        )
+        .expect("valid bindings")
+    }
+
+    /// A credential-bearing relay to `host`, with the sandbox side, the
+    /// upstream side and the relay task.
+    fn spawn_credential_relay(
+        engine: &Arc<OpaEngine>,
+        credentials: &openshell_core::provider_credentials::ProviderCredentialState,
+        host: &str,
+    ) -> (
+        tokio::io::DuplexStream,
+        tokio::io::DuplexStream,
+        tokio::task::JoinHandle<Result<()>>,
+    ) {
+        let (caller, mut client) = tokio::io::duplex(4096);
+        let (mut upstream, server) = tokio::io::duplex(4096);
+        let engine = Arc::clone(engine);
+        let mut request = request_context();
+        request.host = host.to_string();
+        request.provider_credentials = Some(credentials.clone());
+        let relay = tokio::spawn(async move {
+            let decision = decision(engine.current_generation());
+            let context = prepare_http_relay(None, &engine, &decision, &request)
+                .expect("current generation prepares a relay");
+            relay_http_stream(&mut client, &mut upstream, context).await
+        });
+        (caller, server, relay)
+    }
+
+    /// Send one request carrying `placeholder` and return what upstream saw.
+    async fn exchange(
+        caller: &mut tokio::io::DuplexStream,
+        server: &mut tokio::io::DuplexStream,
+        host: &str,
+        placeholder: &str,
+    ) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let request = format!(
+            "GET /v1 HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer {placeholder}\r\n\r\n"
+        );
+        caller.write_all(request.as_bytes()).await.unwrap();
+        let mut received = Vec::new();
+        while !received.ends_with(b"\r\n\r\n") {
+            received.push(server.read_u8().await.unwrap());
+        }
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        server.write_all(response).await.unwrap();
+        let mut reply = vec![0; response.len()];
+        caller.read_exact(&mut reply).await.unwrap();
+        String::from_utf8(received).unwrap()
+    }
+
+    #[tokio::test]
+    async fn credential_rotation_closes_only_the_rotated_providers_relays() {
+        let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, EMPTY_POLICY_DATA).unwrap());
+        let credentials = two_provider_credentials("a-initial");
+        let env = credentials.snapshot().child_env.clone();
+        let (a_placeholder, b_placeholder) = (&env["A_TOKEN"], &env["B_TOKEN"]);
+        let within = std::time::Duration::from_secs(5);
+
+        let (mut a_caller, mut a_server, a_relay) =
+            spawn_credential_relay(&engine, &credentials, "a.example.com");
+        let (mut b_caller, mut b_server, b_relay) =
+            spawn_credential_relay(&engine, &credentials, "b.example.com");
+        let seen = tokio::time::timeout(
+            within,
+            exchange(&mut a_caller, &mut a_server, "a.example.com", a_placeholder),
+        )
+        .await
+        .expect("provider A request relayed");
+        assert!(seen.contains("Bearer a-initial"), "{seen}");
+        let seen = tokio::time::timeout(
+            within,
+            exchange(&mut b_caller, &mut b_server, "b.example.com", b_placeholder),
+        )
+        .await
+        .expect("provider B request relayed");
+        assert!(seen.contains("Bearer b-value"), "{seen}");
+
+        let candidate = two_provider_credentials("a-rotated");
+        let rotated = credentials
+            .value_only_rotation(&candidate)
+            .expect("only A's value changed");
+        assert_eq!(rotated, ["A_TOKEN"]);
+        credentials.install_prepared(&candidate);
+        let announced = credentials.announce_rotation(&rotated);
+        assert_eq!(announced.tunnels, 1);
+        assert_eq!(announced.endpoints, ["a.example.com:80"]);
+
+        tokio::time::timeout(within, a_relay)
+            .await
+            .expect("provider A's relay closes on rotation")
+            .expect("relay task should not panic")
+            .expect("rotation closure is clean");
+        assert!(!b_relay.is_finished(), "provider B's relay stays open");
+        let seen = tokio::time::timeout(
+            within,
+            exchange(&mut b_caller, &mut b_server, "b.example.com", b_placeholder),
+        )
+        .await
+        .expect("provider B's relay still carries requests");
+        assert!(seen.contains("Bearer b-value"), "{seen}");
+
+        // The workload's placeholder is unchanged; a reconnect sends the new value.
+        let (mut a_caller, mut a_server, _a_relay) =
+            spawn_credential_relay(&engine, &credentials, "a.example.com");
+        let seen = tokio::time::timeout(
+            within,
+            exchange(&mut a_caller, &mut a_server, "a.example.com", a_placeholder),
+        )
+        .await
+        .expect("reconnected provider A request relayed");
+        assert!(seen.contains("Bearer a-rotated"), "{seen}");
+        b_relay.abort();
     }
 
     #[tokio::test]

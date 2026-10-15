@@ -22,6 +22,11 @@ enum EndpointPathPatternKind {
 }
 
 impl EndpointPathPattern {
+    /// The pattern this was compiled from.
+    pub(crate) fn source(&self) -> &str {
+        &self.source
+    }
+
     #[must_use]
     pub fn new(pattern: &str) -> Self {
         let kind = if pattern.is_empty() || pattern == "**" || pattern == "/**" {

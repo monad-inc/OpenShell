@@ -172,6 +172,22 @@ value. This lets a long-running process use each newly minted access token
 without restarting. OpenShell does not retain older values behind this stable
 placeholder.
 
+When a provider update changes only the values of static credentials that use
+stable placeholders, the supervisor installs the new values without reloading
+the sandbox policy. It closes only the open connections whose destination
+matches an endpoint bound to a rotated credential, so a connection that
+authenticated with the old value, such as a WebSocket, cannot keep using it.
+Connections to other providers stay open. The client reconnects and its next
+request carries the new value through the same placeholder. Each closed
+connection emits an OCSF network activity Close event with `close_reason`
+`credential_rotated` and the rotated `credential_keys`, and the supervisor
+logs one summary per rotation with the rotated endpoints and the number of
+connections it closed. A gateway-managed refresh is a rotation too, so each
+refresh closes the connections to that credential's endpoints. Any
+other provider change, including a new value for a credential with a
+revision-scoped placeholder, reloads the policy and closes every open
+connection with `close_reason` `policy_changed`.
+
 Explicitly configuring refresh again starts a new authorization epoch, even
 when the provider and credential key are unchanged. Reconfiguration, provider
 replacement or detachment, refresh deletion, and endpoint-boundary changes

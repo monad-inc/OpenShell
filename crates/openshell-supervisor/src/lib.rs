@@ -2814,6 +2814,36 @@ fn provider_environment_is_installable(reason: ProviderReadinessReason) -> bool 
     )
 }
 
+/// One summary per value-only rotation. The relays it closes each emit
+/// their own Close event.
+fn emit_credential_rotation(
+    keys: &[String],
+    announced: &openshell_core::credential_rotation::RotationAnnouncement,
+) {
+    info!(
+        credential_keys = ?keys,
+        endpoints = ?announced.endpoints,
+        tunnels_closed = announced.tunnels,
+        "Provider credentials rotated; closing tunnels to their endpoints"
+    );
+    ocsf_emit!(
+        ConfigStateChangeBuilder::new(ocsf_ctx())
+            .severity(SeverityId::Informational)
+            .status(StatusId::Success)
+            .state(StateId::Enabled, "credential_rotated")
+            .unmapped("credential_keys", serde_json::json!(keys))
+            .unmapped("endpoints", serde_json::json!(announced.endpoints))
+            .unmapped("tunnels_closed", serde_json::json!(announced.tunnels))
+            .message(format!(
+                "Provider credentials rotated without a policy reload [keys:{} endpoints:{} tunnels_closed:{}]",
+                keys.join(","),
+                announced.endpoints.join(","),
+                announced.tunnels
+            ))
+            .build()
+    );
+}
+
 fn prepare_provider_environment(
     provider: &openshell_core::grpc_client::ProviderEnvironmentResult,
 ) -> Result<ProviderCredentialState> {
@@ -4426,11 +4456,13 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
         let recovering_rejected_policy = reloads_gateway_policy
             && rejected_policy_generation.is_some()
             && result.configuration_admitted;
-        let policy_runtime_changed = (reloads_gateway_policy
-            && (provider_env_changed
-                || current_policy_generation
-                    .as_ref()
-                    .is_some_and(PolicyGenerationGuard::is_stale)))
+        // Everything except new provider credentials that forces a new
+        // policy generation. A provider change alone may turn out to be a
+        // value-only rotation, which closes only the relays it affects.
+        let policy_runtime_changed_by_configuration = (reloads_gateway_policy
+            && current_policy_generation
+                .as_ref()
+                .is_some_and(PolicyGenerationGuard::is_stale))
             || recovering_rejected_policy
             || extension_authentication_changed
             || gateway_policy_runtime_needs_reconciliation(
@@ -4441,6 +4473,8 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                 &result.supervisor_middleware_services,
                 middleware_registry_status,
             );
+        let policy_runtime_changed = policy_runtime_changed_by_configuration
+            || (reloads_gateway_policy && provider_env_changed);
         // Recovery already has its own acknowledgement path below. Giving it
         // precedence here prevents a restored last-known-good policy from
         // also being acknowledged as an ordinary same-hash revision.
@@ -4644,6 +4678,27 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
         } else {
             None
         };
+
+        // A value-only rotation installs without a policy reload, so tunnels
+        // to other providers stay open.
+        // A local policy override never reloads for provider changes, so a
+        // value-only rotation there closes its relays the same way.
+        let rotated_credential_keys = if provider_env_changed
+            && (!reloads_gateway_policy
+                || (!policy_runtime_changed_by_configuration && !policy_changed))
+        {
+            prepared_provider
+                .as_ref()
+                .and_then(|prepared| ctx.provider_credentials.value_only_rotation(prepared))
+        } else {
+            None
+        };
+        // A rotation replaces only the provider-driven reload; any other
+        // reason to reload still applies.
+        let policy_runtime_changed = policy_runtime_changed_by_configuration
+            || (reloads_gateway_policy
+                && provider_env_changed
+                && rotated_credential_keys.is_none());
 
         if policy_runtime_changed {
             let pid = ctx.entrypoint_pid.load(Ordering::Acquire);
@@ -4874,7 +4929,9 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
             report_runtime_configuration(&ctx, &result, false, "Effective configuration failed runtime preparation; prior credentials remain installed").await;
             continue;
         }
-        if !reloads_gateway_policy && let Some(prepared) = prepared_provider.as_ref() {
+        if (!reloads_gateway_policy || rotated_credential_keys.is_some())
+            && let Some(prepared) = prepared_provider.as_ref()
+        {
             ctx.provider_credentials.install_prepared(prepared);
             if let Some((identity, expires_at_ms)) = prepared_identity.as_ref() {
                 ctx.provider_readiness.credentials_installed(
@@ -4883,6 +4940,12 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                     *expires_at_ms,
                 );
             }
+        }
+        if let Some(keys) = rotated_credential_keys.as_ref() {
+            // Announce only after installing, so a relay that reconnects
+            // after closing resolves the new value.
+            let announced = ctx.provider_credentials.announce_rotation(keys);
+            emit_credential_rotation(keys, &announced);
         }
         if provider_env_changed || policy_runtime_reconciled {
             current_provider_env_revision = result.provider_env_revision;
@@ -8066,6 +8129,174 @@ network_policies:
                 assert!(state.resolver().is_none());
             }
         }
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn value_only_stable_rotation_closes_its_relays_without_a_policy_reload() {
+        let engine = Arc::new(OpaEngine::from_proto(&proto_policy_fixture()).unwrap());
+        let initial = settings_poll_result(
+            Some(proto_policy_fixture()),
+            1,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+        let ctx = policy_poll_test_context(
+            engine.clone(),
+            LoadedPolicyOrigin::Gateway {
+                revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
+                has_last_valid_policy: true,
+            },
+            default_middleware_connector(),
+        );
+        let state = ctx.provider_credentials.clone();
+        let tracker = ctx.provider_readiness.clone();
+        let (policy, polls, mut reports) = scripted_policy_gateway();
+        let (requests, mut received) = tokio::sync::mpsc::unbounded_channel();
+        polls.send(initial.clone()).unwrap();
+        let task = tokio::spawn(run_policy_poll_loop_with_client(
+            ctx,
+            ScriptedProviderGateway { policy, requests },
+        ));
+        expect_policy_report(&mut reports, 1).await;
+        let reference = format!("openshell:resolve:env:s{}_EXTERNAL_TOKEN", "a".repeat(64));
+        let resolved = |state: &ProviderCredentialState| {
+            state
+                .resolver_for_endpoint("tools.example.com", 443, "/v1/chat")
+                .and_then(|resolver| resolver.resolve_placeholder(&reference).map(str::to_owned))
+        };
+
+        // The first delivery changes the credential shape, so it reloads.
+        let mut poll = initial.clone();
+        poll.provider_env_revision = 1;
+        polls.send(poll).unwrap();
+        let (_, response) = timeout(Duration::from_secs(5), received.recv())
+            .await
+            .expect("provider refresh requested")
+            .expect("poll loop active");
+        assert!(
+            response
+                .send(Ok(stable_provider_environment(1, Some("initial"))))
+                .is_ok()
+        );
+        timeout(Duration::from_secs(5), async {
+            while resolved(&state).as_deref() != Some("initial") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("initial credentials installed");
+
+        let generation = engine.current_generation();
+        let bound = state.rotation_watch("tools.example.com", 443);
+        let unrelated = state.rotation_watch("other.example.com", 443);
+
+        let mut poll = initial.clone();
+        poll.provider_env_revision = 2;
+        polls.send(poll).unwrap();
+        let (_, response) = timeout(Duration::from_secs(5), received.recv())
+            .await
+            .expect("provider refresh requested")
+            .expect("poll loop active");
+        assert!(
+            response
+                .send(Ok(stable_provider_environment(2, Some("rotated"))))
+                .is_ok()
+        );
+
+        let rotated = timeout(Duration::from_secs(5), bound.rotated())
+            .await
+            .expect("relay bound to the rotated credential closes");
+        assert_eq!(&*rotated.keys, ["EXTERNAL_TOKEN".to_string()]);
+        // The workload keeps its placeholder, which now resolves the new value.
+        assert_eq!(state.snapshot().child_env["EXTERNAL_TOKEN"], reference);
+        assert_eq!(resolved(&state).as_deref(), Some("rotated"));
+        // No new policy generation, so other relays stay open.
+        assert_eq!(engine.current_generation(), generation);
+        assert!(
+            timeout(Duration::from_millis(50), unrelated.rotated())
+                .await
+                .is_err()
+        );
+        // The rotation establishes readiness, so the same revision is not
+        // fetched again.
+        timeout(Duration::from_secs(5), async {
+            while !tracker.observation(&state).credentials_installed {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("rotated credentials reported installed");
+        let mut poll = initial.clone();
+        poll.provider_env_revision = 2;
+        polls.send(poll).unwrap();
+        assert!(
+            timeout(Duration::from_millis(200), received.recv())
+                .await
+                .is_err(),
+            "an installed rotation must not be fetched again"
+        );
+
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn revision_scoped_rotation_still_reloads_policy() {
+        let engine = Arc::new(OpaEngine::from_proto(&proto_policy_fixture()).unwrap());
+        let initial = settings_poll_result(
+            Some(proto_policy_fixture()),
+            1,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+        let ctx = policy_poll_test_context(
+            engine.clone(),
+            LoadedPolicyOrigin::Gateway {
+                revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
+                has_last_valid_policy: true,
+            },
+            default_middleware_connector(),
+        );
+        let state = ctx.provider_credentials.clone();
+        let (policy, polls, mut reports) = scripted_policy_gateway();
+        let (requests, mut received) = tokio::sync::mpsc::unbounded_channel();
+        polls.send(initial.clone()).unwrap();
+        let task = tokio::spawn(run_policy_poll_loop_with_client(
+            ctx,
+            ScriptedProviderGateway { policy, requests },
+        ));
+        expect_policy_report(&mut reports, 1).await;
+
+        let mut generation = engine.current_generation();
+        for (revision, value) in [(1, "initial"), (2, "rotated")] {
+            let mut poll = initial.clone();
+            poll.provider_env_revision = revision;
+            polls.send(poll).unwrap();
+            let (_, response) = timeout(Duration::from_secs(5), received.recv())
+                .await
+                .expect("provider refresh requested")
+                .expect("poll loop active");
+            assert!(
+                response
+                    .send(Ok(static_provider_environment(revision, Some(value))))
+                    .is_ok()
+            );
+            timeout(Duration::from_secs(5), async {
+                while state.revision() != revision {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("credentials installed");
+            // A revision-scoped placeholder changes with every value, so the
+            // rotation is not value-only and keeps the generation reload.
+            assert!(
+                engine.current_generation() > generation,
+                "revision {revision}"
+            );
+            generation = engine.current_generation();
+        }
+
         task.abort();
         let _ = task.await;
     }

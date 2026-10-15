@@ -14,6 +14,7 @@ pub mod agent_output;
 pub mod auth;
 pub mod config;
 pub mod container_paths;
+pub mod credential_rotation;
 pub mod denial;
 pub mod driver_mounts;
 pub mod driver_utils;

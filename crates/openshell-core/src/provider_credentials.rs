@@ -3,6 +3,9 @@
 
 //! Runtime provider credential snapshots.
 
+use crate::credential_rotation::{
+    CredentialRotationWatch, CredentialRotations, RotatedEndpoint, RotationAnnouncement,
+};
 use crate::secrets::SecretResolver;
 use crate::{
     endpoint_path::EndpointPathPattern,
@@ -82,6 +85,9 @@ struct CompiledStaticCredentialEndpointBinding {
 #[derive(Debug, Clone)]
 pub struct ProviderCredentialState {
     inner: Arc<RwLock<ProviderCredentialStateInner>>,
+    // Shared by every clone, but never copied by `install_prepared`: relays
+    // watch the live state's history, not a candidate's.
+    rotations: Arc<CredentialRotations>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,6 +142,7 @@ impl ProviderCredentialState {
                 static_credential_identity_epochs: HashMap::new(),
                 requires_stable_placeholders: false,
             })),
+            rotations: Arc::new(CredentialRotations::new()),
         }
     }
 
@@ -220,6 +227,7 @@ impl ProviderCredentialState {
                 static_credential_identity_epochs,
                 requires_stable_placeholders: !stable_placeholder_environment_keys.is_empty(),
             })),
+            rotations: Arc::new(CredentialRotations::new()),
         })
     }
 
@@ -255,6 +263,7 @@ impl ProviderCredentialState {
                 static_credential_identity_epochs: HashMap::new(),
                 requires_stable_placeholders: false,
             })),
+            rotations: Arc::new(CredentialRotations::new()),
         }
     }
 
@@ -421,6 +430,116 @@ impl ProviderCredentialState {
             ))
         });
         (resolver, classifier, revision)
+    }
+
+    /// Watch for rotations of static credentials bound to a relay destination.
+    #[must_use]
+    pub fn rotation_watch(&self, host: &str, port: u16) -> CredentialRotationWatch {
+        self.rotations.watch(host, port)
+    }
+
+    /// Announce that the installed values of `keys` replaced earlier values
+    /// with no other change, closing the relays bound to their endpoints.
+    ///
+    /// Call after installing the new values. Keys without an installed static
+    /// binding cannot be carried by a relay and are ignored.
+    pub fn announce_rotation(&self, keys: &[String]) -> RotationAnnouncement {
+        let endpoints = {
+            let inner = self
+                .inner
+                .read()
+                .expect("provider credential state poisoned");
+            keys.iter()
+                .filter_map(|key| inner.static_credential_bindings.get(key))
+                .flat_map(|binding| binding.endpoints.iter())
+                .map(|endpoint| {
+                    RotatedEndpoint::from_compiled(endpoint.host.clone(), endpoint.port)
+                })
+                .collect()
+        };
+        self.rotations.announce(keys.to_vec(), endpoints)
+    }
+
+    /// The credentials a candidate rotates, when replacing the values of
+    /// stable-placeholder credentials is its only difference from the live
+    /// state.
+    ///
+    /// Equal stable handles imply the same provider, key, endpoints and
+    /// attachment epoch, and the workload keeps the same placeholder, so such
+    /// a rotation needs no policy reload: the relays bound to the rotated
+    /// endpoints close instead. Any other difference returns `None`,
+    /// including a new value for a credential without a stable placeholder,
+    /// whose workload placeholder is revision scoped.
+    #[must_use]
+    pub fn value_only_rotation(&self, candidate: &Self) -> Option<Vec<String>> {
+        // Release the candidate lock before taking the live lock, including
+        // when a caller passes another handle to the same state.
+        let (env, dynamic_credentials, bindings, non_secret_keys, files, stable, resolver) = {
+            let candidate = candidate
+                .inner
+                .read()
+                .expect("provider credential state poisoned");
+            (
+                candidate.current.child_env.clone(),
+                candidate.current.dynamic_credentials.clone(),
+                candidate.static_credential_bindings.clone(),
+                candidate.non_secret_environment_keys.clone(),
+                candidate.files.clone(),
+                candidate.requires_stable_placeholders,
+                candidate.current_resolver.clone(),
+            )
+        };
+        let live = self
+            .inner
+            .read()
+            .expect("provider credential state poisoned");
+        if !live.body_inventory_available
+            || live.requires_stable_placeholders != stable
+            || live.current.dynamic_credentials != dynamic_credentials
+            || live.non_secret_environment_keys != non_secret_keys
+            || live.files != files
+            || static_credential_identities(&live.static_credential_bindings)
+                != static_credential_identities(&bindings)
+            || static_credential_stable_handles(&live.static_credential_bindings)
+                != static_credential_stable_handles(&bindings)
+            || static_credential_endpoints(&live.static_credential_bindings)
+                != static_credential_endpoints(&bindings)
+        {
+            return None;
+        }
+        let env = env
+            .into_iter()
+            .filter(|(key, _)| !live.suppressed_keys.contains(key))
+            .collect::<HashMap<_, _>>();
+        if env.len() != live.current.child_env.len() {
+            return None;
+        }
+        let resolve = |resolver: Option<&Arc<SecretResolver>>, value: &str| {
+            resolver
+                .and_then(|resolver| resolver.resolve_placeholder(value))
+                .map_or_else(|| value.to_string(), str::to_string)
+        };
+        let mut rotated = Vec::new();
+        for (key, placeholder) in &env {
+            let live_placeholder = live.current.child_env.get(key)?;
+            let unchanged = resolve(live.current_resolver.as_ref(), live_placeholder)
+                == resolve(resolver.as_ref(), placeholder);
+            if unchanged {
+                continue;
+            }
+            let stable_handle = bindings
+                .get(key)
+                .is_some_and(|binding| !binding.workload_credential_handle.is_empty());
+            if !stable_handle || live_placeholder != placeholder {
+                return None;
+            }
+            rotated.push(key.clone());
+        }
+        if rotated.is_empty() {
+            return None;
+        }
+        rotated.sort();
+        Some(rotated)
     }
 
     #[must_use]
@@ -1083,6 +1202,28 @@ fn static_credential_identities(
         .collect()
 }
 
+fn static_credential_endpoints(
+    bindings: &HashMap<String, CompiledStaticCredentialBinding>,
+) -> HashMap<&str, Vec<(&str, u16, &str)>> {
+    bindings
+        .iter()
+        .map(|(key, binding)| {
+            let endpoints = binding
+                .endpoints
+                .iter()
+                .map(|endpoint| {
+                    (
+                        endpoint.host.source(),
+                        endpoint.port,
+                        endpoint.path.source(),
+                    )
+                })
+                .collect();
+            (key.as_str(), endpoints)
+        })
+        .collect()
+}
+
 fn static_credential_stable_handles(
     bindings: &HashMap<String, CompiledStaticCredentialBinding>,
 ) -> HashMap<String, String> {
@@ -1169,6 +1310,243 @@ fn merge_resolvers(
 mod tests {
     use super::*;
     use crate::google_cloud;
+
+    /// Raw provider delivery for value-only rotation tests: two stable
+    /// credentials, one revision-scoped credential and one non-secret value.
+    #[derive(Clone)]
+    struct RotationInput {
+        env: HashMap<String, String>,
+        expiries: HashMap<String, i64>,
+        dynamic: HashMap<String, crate::proto::ProviderProfileCredential>,
+        bindings: HashMap<String, StaticCredentialBinding>,
+        non_secret: Vec<String>,
+        stable: Vec<String>,
+        files: HashMap<String, String>,
+    }
+
+    fn rotation_binding(
+        host: &str,
+        port: u32,
+        path: &str,
+        handle: &str,
+    ) -> StaticCredentialBinding {
+        StaticCredentialBinding {
+            endpoints: vec![StaticCredentialEndpointBinding {
+                host: host.into(),
+                port,
+                path: path.into(),
+            }],
+            credential_identity: if handle.is_empty() {
+                format!("provider-{host}")
+            } else {
+                format!("refresh:{handle}")
+            },
+            workload_credential_handle: handle.into(),
+        }
+    }
+
+    fn rotation_input() -> RotationInput {
+        RotationInput {
+            env: HashMap::from([
+                ("A_TOKEN".into(), "a-1".into()),
+                ("B_TOKEN".into(), "b-1".into()),
+                ("C_TOKEN".into(), "c-1".into()),
+                ("REGION".into(), "us-east-1".into()),
+            ]),
+            expiries: HashMap::new(),
+            dynamic: HashMap::new(),
+            bindings: HashMap::from([
+                (
+                    "A_TOKEN".into(),
+                    rotation_binding("a.example.com", 443, "/v1/**", &"a".repeat(64)),
+                ),
+                (
+                    "B_TOKEN".into(),
+                    rotation_binding("b.example.com", 443, "/**", &"b".repeat(64)),
+                ),
+                (
+                    "C_TOKEN".into(),
+                    rotation_binding("c.example.com", 443, "/**", ""),
+                ),
+            ]),
+            non_secret: vec!["REGION".into()],
+            stable: vec!["A_TOKEN".into(), "B_TOKEN".into()],
+            files: HashMap::new(),
+        }
+    }
+
+    fn rotation_state(revision: u64, input: RotationInput) -> ProviderCredentialState {
+        let state = ProviderCredentialState::from_bound_environment_with_stable_placeholders(
+            revision,
+            input.env,
+            input.expiries,
+            input.dynamic,
+            input.bindings,
+            input.non_secret,
+            input.stable,
+        )
+        .expect("valid rotation input");
+        state.set_managed_files(input.files);
+        state
+    }
+
+    fn rotation_between(change: impl FnOnce(&mut RotationInput)) -> Option<Vec<String>> {
+        let live = rotation_state(1, rotation_input());
+        let mut candidate = rotation_input();
+        change(&mut candidate);
+        live.value_only_rotation(&rotation_state(2, candidate))
+    }
+
+    fn set(input: &mut RotationInput, key: &str, value: &str) {
+        input.env.insert(key.into(), value.into());
+    }
+
+    #[test]
+    fn value_only_rotation_names_the_rotated_stable_credentials() {
+        assert_eq!(
+            rotation_between(|input| set(input, "A_TOKEN", "a-2")),
+            Some(vec!["A_TOKEN".to_string()])
+        );
+        assert_eq!(
+            rotation_between(|input| {
+                set(input, "B_TOKEN", "b-2");
+                set(input, "A_TOKEN", "a-2");
+            }),
+            Some(vec!["A_TOKEN".to_string(), "B_TOKEN".to_string()])
+        );
+    }
+
+    #[test]
+    fn value_only_rotation_refuses_every_other_difference() {
+        type Change = fn(&mut RotationInput);
+        let rotate_a: Change = |input| set(input, "A_TOKEN", "a-2");
+        let cases: Vec<(&str, Change)> = vec![
+            ("nothing changed", |_| {}),
+            ("only an expiry changed", |input| {
+                input.expiries.insert("A_TOKEN".into(), 4_102_444_800_000);
+            }),
+            ("endpoint host changed", |input| {
+                set(input, "A_TOKEN", "a-2");
+                input.bindings.get_mut("A_TOKEN").unwrap().endpoints[0].host =
+                    "evil.example.com".into();
+            }),
+            ("endpoint port changed", |input| {
+                set(input, "A_TOKEN", "a-2");
+                input.bindings.get_mut("A_TOKEN").unwrap().endpoints[0].port = 8443;
+            }),
+            ("endpoint path changed", |input| {
+                set(input, "A_TOKEN", "a-2");
+                input.bindings.get_mut("A_TOKEN").unwrap().endpoints[0].path = "/**".into();
+            }),
+            ("endpoint added", |input| {
+                set(input, "A_TOKEN", "a-2");
+                input.bindings.get_mut("A_TOKEN").unwrap().endpoints.push(
+                    StaticCredentialEndpointBinding {
+                        host: "other.example.com".into(),
+                        port: 443,
+                        path: "/**".into(),
+                    },
+                );
+            }),
+            ("revision-scoped identity changed", |input| {
+                input
+                    .bindings
+                    .get_mut("C_TOKEN")
+                    .unwrap()
+                    .credential_identity = "provider-other".into();
+            }),
+            ("stable handle changed", |input| {
+                set(input, "A_TOKEN", "a-2");
+                let binding = input.bindings.get_mut("A_TOKEN").unwrap();
+                binding.workload_credential_handle = "c".repeat(64);
+                binding.credential_identity = format!("refresh:{}", "c".repeat(64));
+            }),
+            ("credential added", |input| {
+                set(input, "A_TOKEN", "a-2");
+                set(input, "D_TOKEN", "d-1");
+                input.bindings.insert(
+                    "D_TOKEN".into(),
+                    rotation_binding("d.example.com", 443, "/**", &"d".repeat(64)),
+                );
+                input.stable.push("D_TOKEN".into());
+            }),
+            ("credential removed", |input| {
+                set(input, "A_TOKEN", "a-2");
+                input.env.remove("B_TOKEN");
+                input.bindings.remove("B_TOKEN");
+                input.stable.retain(|key| key != "B_TOKEN");
+            }),
+            ("dynamic credential changed", |input| {
+                set(input, "A_TOKEN", "a-2");
+                input.dynamic.insert(
+                    "grant".into(),
+                    crate::proto::ProviderProfileCredential {
+                        name: "grant".into(),
+                        ..Default::default()
+                    },
+                );
+            }),
+            ("non-secret value changed", |input| {
+                set(input, "A_TOKEN", "a-2");
+                set(input, "REGION", "eu-west-1");
+            }),
+            ("managed files changed", |input| {
+                set(input, "A_TOKEN", "a-2");
+                input.files.insert("config.json".into(), "{}".into());
+            }),
+            ("revision-scoped value changed", |input| {
+                set(input, "C_TOKEN", "c-2");
+            }),
+            ("stable and revision-scoped values changed", |input| {
+                set(input, "A_TOKEN", "a-2");
+                set(input, "C_TOKEN", "c-2");
+            }),
+        ];
+        // The base case is a real rotation, so each refusal is meaningful.
+        assert!(rotation_between(rotate_a).is_some());
+        for (name, change) in cases {
+            assert_eq!(rotation_between(change), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn value_only_rotation_refuses_a_revoked_live_state() {
+        let live = rotation_state(1, rotation_input());
+        live.revoke_static_provider_environment(1);
+        let mut candidate = rotation_input();
+        set(&mut candidate, "A_TOKEN", "a-2");
+        assert_eq!(
+            live.value_only_rotation(&rotation_state(2, candidate)),
+            None
+        );
+    }
+
+    #[test]
+    fn value_only_rotation_ignores_suppressed_keys() {
+        let live = rotation_state(1, rotation_input());
+        live.remove_env_key("B_TOKEN");
+        let mut candidate = rotation_input();
+        set(&mut candidate, "A_TOKEN", "a-2");
+        set(&mut candidate, "B_TOKEN", "b-2");
+        assert_eq!(
+            live.value_only_rotation(&rotation_state(2, candidate)),
+            Some(vec!["A_TOKEN".to_string()])
+        );
+    }
+
+    #[test]
+    fn announced_rotation_describes_endpoints_without_placeholder_handles() {
+        let live = rotation_state(1, rotation_input());
+        let mut candidate = rotation_input();
+        set(&mut candidate, "A_TOKEN", "a-2");
+        let candidate = rotation_state(2, candidate);
+        let keys = live.value_only_rotation(&candidate).unwrap();
+        live.install_prepared(&candidate);
+        let announced = live.announce_rotation(&keys);
+        assert_eq!(announced.endpoints, ["a.example.com:443"]);
+        let described = format!("{announced:?}");
+        assert!(!described.contains(&"a".repeat(64)), "{described}");
+    }
 
     fn jwt_alias(placeholder: &str) -> String {
         // Claims are irrelevant to injection authority: retain the exact issued

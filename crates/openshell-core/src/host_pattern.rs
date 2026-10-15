@@ -127,6 +127,11 @@ impl HostPattern {
         Ok(Self { source, labels })
     }
 
+    /// The lowercase pattern this was compiled from.
+    pub(crate) fn source(&self) -> &str {
+        &self.source
+    }
+
     #[must_use]
     pub fn matches(&self, host: &str) -> bool {
         let host = host.to_ascii_lowercase();
