@@ -968,7 +968,8 @@ kubectl -n <sync-namespace> logs deployment/<provider-sync> --tail=200
 | `ProviderSyncFailed` | The gateway rejected the update or was unreachable |
 | `AgentRestarted` | A rotation restarted a sandbox attached to that provider |
 | `AgentRestartSkipped` | The attached sandbox was stopped, stopping, completed or deleting, so it was left alone |
-| `AgentRestartFailed` | Stopping or starting the sandbox failed; a sandbox stopped but not started stays down until started by hand |
+| `AgentStartPending` | provider-sync stopped the sandbox and its start keeps failing or it is still stopping; retried until it runs, backing off to every 5 minutes, and resumed after a provider-sync restart |
+| `AgentRestartFailed` | The stop failed, so the agent kept running on its old connections; or the sandbox was deleted before it could start again |
 
 No Events at all means the controller is not watching the Secret: check the
 label, its `OPENSHELL_PROVIDER_SYNC_NAMESPACE`, and its RBAC (`get`, `list` and

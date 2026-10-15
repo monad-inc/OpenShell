@@ -86,23 +86,6 @@ pub trait ProviderUpdater: Send + Sync + 'static {
     ) -> Result<Updated, UpdateError>;
 }
 
-/// What restarting one sandbox did.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Restart {
-    Restarted,
-    /// Stopped, stopping, completed or being deleted: someone or something
-    /// else decided it should not run, so it is left alone.
-    Skipped {
-        phase: String,
-    },
-}
-
-/// Restarts a sandbox so its agent starts fresh with current credentials.
-#[async_trait::async_trait]
-pub trait SandboxRestarter: Send + Sync + 'static {
-    async fn restart(&self, workspace: &str, sandbox: &str) -> Result<Restart, UpdateError>;
-}
-
 /// [`ProviderUpdater`] over the gateway's `UpdateProvider` RPC.
 pub struct GatewayUpdater {
     client: OpenShellClient,
@@ -178,10 +161,32 @@ impl ProviderUpdater for GatewayUpdater {
     }
 }
 
-/// How long a restart keeps trying to start a sandbox it stopped.
-const START_DEADLINE: std::time::Duration = std::time::Duration::from_mins(10);
-/// Pause between start attempts while the sandbox is still stopping.
-const START_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
+/// What stopping a sandbox for a restart did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Stop {
+    Stopped,
+    /// Stopped, stopping, completed, being deleted or gone: someone or
+    /// something else decided it should not run, so it is left alone.
+    Skipped {
+        phase: String,
+    },
+}
+
+/// Stops and starts sandboxes so their agents start fresh with current
+/// credentials. Retrying is the caller's job.
+#[async_trait::async_trait]
+pub trait SandboxRestarter: Send + Sync + 'static {
+    /// Stop the sandbox unless it is already meant to stay down.
+    async fn stop(&self, workspace: &str, sandbox: &str) -> Result<Stop, UpdateError>;
+    /// The sandbox's phase, or `None` when it no longer exists.
+    async fn phase(
+        &self,
+        workspace: &str,
+        sandbox: &str,
+    ) -> Result<Option<SandboxPhase>, UpdateError>;
+    /// One start attempt.
+    async fn start(&self, workspace: &str, sandbox: &str) -> Result<(), UpdateError>;
+}
 
 /// Call one gateway RPC, refreshing the bearer token once if it is rejected.
 macro_rules! call_refreshing {
@@ -211,7 +216,8 @@ macro_rules! call_refreshing {
     }};
 }
 
-/// [`SandboxRestarter`] over the gateway's `StopSandbox` and `StartSandbox`.
+/// [`SandboxRestarter`] over the gateway's `GetSandbox`, `StopSandbox` and
+/// `StartSandbox`.
 pub struct GatewayRestarter {
     client: OpenShellClient,
 }
@@ -220,24 +226,10 @@ impl GatewayRestarter {
     pub fn new(client: OpenShellClient) -> Self {
         Self { client }
     }
-
-    async fn phase(&self, workspace: &str, sandbox: &str) -> Result<SandboxPhase, UpdateError> {
-        let request = GetSandboxRequest {
-            workspace_scope: Some(workspace_selector(workspace)),
-            name: sandbox.to_string(),
-        };
-        let response = call_refreshing!(&self.client, get_sandbox, request)
-            .map_err(|status| UpdateError::from_status(&status, workspace, sandbox))?;
-        Ok(response
-            .into_inner()
-            .sandbox
-            .and_then(|sandbox| sandbox.status)
-            .map_or(SandboxPhase::Unspecified, |status| status.phase()))
-    }
 }
 
 /// A sandbox in one of these phases is meant to stay down.
-fn left_alone(phase: SandboxPhase) -> bool {
+pub(crate) fn left_alone(phase: SandboxPhase) -> bool {
     matches!(
         phase,
         SandboxPhase::Stopping
@@ -249,14 +241,18 @@ fn left_alone(phase: SandboxPhase) -> bool {
 
 #[async_trait::async_trait]
 impl SandboxRestarter for GatewayRestarter {
-    async fn restart(&self, workspace: &str, sandbox: &str) -> Result<Restart, UpdateError> {
-        let phase = self.phase(workspace, sandbox).await?;
+    async fn stop(&self, workspace: &str, sandbox: &str) -> Result<Stop, UpdateError> {
+        let Some(phase) = self.phase(workspace, sandbox).await? else {
+            return Ok(Stop::Skipped {
+                phase: "deleted".to_string(),
+            });
+        };
         if left_alone(phase) {
-            return Ok(Restart::Skipped {
+            return Ok(Stop::Skipped {
                 phase: phase.as_str_name().to_string(),
             });
         }
-        // Request ids make a retried stop or start a replay, not a repeat.
+        // A request id makes a retried stop a replay, not a repeat.
         let stop = StopSandboxRequest {
             workspace_scope: Some(workspace_selector(workspace)),
             name: sandbox.to_string(),
@@ -264,35 +260,40 @@ impl SandboxRestarter for GatewayRestarter {
         };
         call_refreshing!(&self.client, stop_sandbox, stop)
             .map_err(|status| UpdateError::from_status(&status, workspace, sandbox))?;
+        Ok(Stop::Stopped)
+    }
 
-        // A stopped agent must not stay down because this restart gave up:
-        // keep starting until the gateway accepts or the deadline passes.
+    async fn phase(
+        &self,
+        workspace: &str,
+        sandbox: &str,
+    ) -> Result<Option<SandboxPhase>, UpdateError> {
+        let request = GetSandboxRequest {
+            workspace_scope: Some(workspace_selector(workspace)),
+            name: sandbox.to_string(),
+        };
+        match call_refreshing!(&self.client, get_sandbox, request) {
+            Ok(response) => Ok(Some(
+                response
+                    .into_inner()
+                    .sandbox
+                    .and_then(|sandbox| sandbox.status)
+                    .map_or(SandboxPhase::Unspecified, |status| status.phase()),
+            )),
+            Err(status) if status.code() == Code::NotFound => Ok(None),
+            Err(status) => Err(UpdateError::from_status(&status, workspace, sandbox)),
+        }
+    }
+
+    async fn start(&self, workspace: &str, sandbox: &str) -> Result<(), UpdateError> {
         let start = StartSandboxRequest {
             workspace_scope: Some(workspace_selector(workspace)),
             name: sandbox.to_string(),
             request_id: uuid::Uuid::new_v4().to_string(),
         };
-        let deadline = tokio::time::Instant::now() + START_DEADLINE;
-        loop {
-            match call_refreshing!(&self.client, start_sandbox, start.clone()) {
-                Ok(_) => return Ok(Restart::Restarted),
-                Err(status)
-                    if matches!(
-                        status.code(),
-                        Code::FailedPrecondition | Code::Unavailable | Code::Aborted
-                    ) && tokio::time::Instant::now() < deadline =>
-                {
-                    tokio::time::sleep(START_RETRY).await;
-                }
-                Err(status) => {
-                    return Err(UpdateError::Transient(format!(
-                        "sandbox {workspace}/{sandbox} was stopped but did not start: {:?}: {}",
-                        status.code(),
-                        status.message()
-                    )));
-                }
-            }
-        }
+        call_refreshing!(&self.client, start_sandbox, start)
+            .map(|_| ())
+            .map_err(|status| UpdateError::from_status(&status, workspace, sandbox))
     }
 }
 

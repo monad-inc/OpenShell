@@ -18,7 +18,9 @@ use sha2::{Digest, Sha256};
 use crate::mapping::{CredentialValues, KeyMap, SyncTarget};
 
 /// `namespace/name` of a Secret.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct SecretRef {
     pub namespace: String,
     pub name: String,
@@ -69,6 +71,17 @@ pub struct SyncState {
     salt: [u8; 32],
     applied: HashMap<AppliedKey, Applied>,
     owners: HashMap<CredentialSlot, SecretRef>,
+    pending_starts: BTreeMap<(String, String), SecretRef>,
+}
+
+/// A sandbox this controller stopped for a restart and has not yet seen
+/// start again. Kept across restarts so a stopped agent is never forgotten.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PendingStart {
+    pub workspace: String,
+    pub sandbox: String,
+    /// The Secret whose rotation caused the restart, for its Events.
+    pub secret: SecretRef,
 }
 
 /// Fingerprints of applied values, kept across controller restarts.
@@ -79,6 +92,8 @@ pub struct SyncState {
 pub struct PersistedState {
     salt: String,
     applied: Vec<PersistedApplied>,
+    #[serde(default)]
+    pending_starts: Vec<PendingStart>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -133,6 +148,7 @@ impl SyncState {
             salt: rand::random(),
             applied: HashMap::new(),
             owners: HashMap::new(),
+            pending_starts: BTreeMap::new(),
         }
     }
 
@@ -166,10 +182,16 @@ impl SyncState {
                 ))
             })
             .collect();
+        let pending_starts = persisted
+            .pending_starts
+            .into_iter()
+            .map(|pending| ((pending.workspace, pending.sandbox), pending.secret))
+            .collect();
         Self {
             salt,
             applied,
             owners: HashMap::new(),
+            pending_starts,
         }
     }
 
@@ -200,7 +222,38 @@ impl SyncState {
         PersistedState {
             salt: to_hex(&self.salt),
             applied,
+            pending_starts: self.pending_starts(),
         }
+    }
+
+    /// Record that this controller is about to stop `sandbox` and must start
+    /// it again. Returns false when a start is already pending, so one restart
+    /// at a time owns the sandbox.
+    pub fn begin_restart(&mut self, secret: &SecretRef, workspace: &str, sandbox: &str) -> bool {
+        let key = (workspace.to_string(), sandbox.to_string());
+        if self.pending_starts.contains_key(&key) {
+            return false;
+        }
+        self.pending_starts.insert(key, secret.clone());
+        true
+    }
+
+    /// The sandbox runs again, or will never need starting.
+    pub fn end_restart(&mut self, workspace: &str, sandbox: &str) {
+        self.pending_starts
+            .remove(&(workspace.to_string(), sandbox.to_string()));
+    }
+
+    /// Sandboxes stopped for a restart and not yet seen running again.
+    pub fn pending_starts(&self) -> Vec<PendingStart> {
+        self.pending_starts
+            .iter()
+            .map(|((workspace, sandbox), secret)| PendingStart {
+                workspace: workspace.clone(),
+                sandbox: sandbox.clone(),
+                secret: secret.clone(),
+            })
+            .collect()
     }
 
     /// Whether `secret` has applied values to `provider` before, so a change
@@ -548,10 +601,31 @@ mod tests {
     }
 
     #[test]
+    fn a_pending_start_survives_a_restart_and_blocks_a_second_restart() {
+        let mut state = SyncState::new();
+        assert!(state.begin_restart(&secret("pm"), "pm", "pm"));
+        assert!(!state.begin_restart(&secret("pm"), "pm", "pm"));
+
+        let restarted = SyncState::from_persisted(state.to_persisted());
+        assert_eq!(
+            restarted.pending_starts(),
+            [PendingStart {
+                workspace: "pm".to_string(),
+                sandbox: "pm".to_string(),
+                secret: secret("pm"),
+            }]
+        );
+
+        state.end_restart("pm", "pm");
+        assert!(state.pending_starts().is_empty());
+        assert!(state.begin_restart(&secret("pm"), "pm", "pm"));
+    }
+
+    #[test]
     fn unreadable_persisted_state_starts_fresh() {
         let restarted = SyncState::from_persisted(PersistedState {
             salt: "not hex".to_string(),
-            applied: Vec::new(),
+            ..Default::default()
         });
         assert!(!restarted.has_applied(&secret("a"), "w", "p"));
     }

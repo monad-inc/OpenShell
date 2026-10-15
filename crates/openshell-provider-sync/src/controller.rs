@@ -16,10 +16,11 @@ use kube::{Api, Client, Resource, ResourceExt};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
-use crate::gateway::{ProviderUpdater, Restart, SandboxRestarter, UpdateError};
+use crate::gateway::{ProviderUpdater, SandboxRestarter, Stop, UpdateError};
 use crate::mapping::{self, Extracted, MappingError};
 use crate::state::{Conflict, SecretRef, SyncState};
 use crate::state_store::StateStore;
+use openshell_core::proto::SandboxPhase;
 
 /// How long to wait before retrying a provider that does not exist yet.
 const PROVIDER_MISSING_RETRY: Duration = Duration::from_secs(30);
@@ -28,6 +29,14 @@ const TRANSIENT_RETRY: Duration = Duration::from_secs(10);
 /// How long to wait before retrying a Secret that can only succeed once it,
 /// the provider or the gateway's configuration changes.
 const INVALID_RETRY: Duration = Duration::from_mins(5);
+/// First and longest wait between attempts to start a sandbox this
+/// controller stopped. Starting is retried until it succeeds.
+const START_BACKOFF_FIRST: Duration = Duration::from_secs(10);
+const START_BACKOFF_MAX: Duration = Duration::from_mins(5);
+/// How often to look again while a stopped sandbox finishes stopping, and
+/// how long that may take before each look is reported.
+const STOPPING_POLL: Duration = Duration::from_secs(5);
+const STOPPING_GRACE: Duration = Duration::from_mins(1);
 
 /// The result of syncing one provider.
 #[derive(Debug, PartialEq, Eq)]
@@ -216,15 +225,11 @@ impl Context {
             .await;
             providers.push((provider.clone(), result));
         }
-        if let Some(store) = &self.store
-            && providers
-                .iter()
-                .any(|(_, result)| matches!(result, Ok(Outcome::Updated { .. })))
-            && let Err(err) = store.save(&state.to_persisted()).await
+        if providers
+            .iter()
+            .any(|(_, result)| matches!(result, Ok(Outcome::Updated { .. })))
         {
-            // In-memory state is still right. The cost of a lost save is one
-            // extra restart of these agents after this controller restarts.
-            warn!(error = %err, "failed to persist provider sync state");
+            self.persist(&state).await;
         }
         Ok(SyncReport {
             workspace: target.workspace,
@@ -234,6 +239,39 @@ impl Context {
 
     async fn forget(&self, secret_ref: &SecretRef) {
         self.state.lock().await.forget(secret_ref);
+    }
+
+    async fn persist(&self, state: &SyncState) {
+        if let Some(store) = &self.store
+            && let Err(err) = store.save(&state.to_persisted()).await
+        {
+            // In-memory state is still right. A lost save costs one extra
+            // restart of these agents, or a forgotten pending start, only if
+            // this controller restarts before the next save.
+            warn!(error = %err, "failed to persist provider sync state");
+        }
+    }
+
+    /// Claim `sandbox` for a restart and persist the pending start before it
+    /// is stopped. False when a restart of it is already in progress.
+    pub async fn begin_restart(&self, secret: &SecretRef, workspace: &str, sandbox: &str) -> bool {
+        let mut state = self.state.lock().await;
+        if !state.begin_restart(secret, workspace, sandbox) {
+            return false;
+        }
+        self.persist(&state).await;
+        true
+    }
+
+    pub async fn end_restart(&self, workspace: &str, sandbox: &str) {
+        let mut state = self.state.lock().await;
+        state.end_restart(workspace, sandbox);
+        self.persist(&state).await;
+    }
+
+    /// Sandboxes stopped by an earlier run that must still be started.
+    pub async fn pending_starts(&self) -> Vec<crate::state::PendingStart> {
+        self.state.lock().await.pending_starts()
     }
 }
 
@@ -273,7 +311,7 @@ async fn reconcile(secret: Arc<Secret>, runtime: Arc<Runtime>) -> Result<Action,
             warn!(secret = %secret_ref, error = %err, "provider sync failed");
             publish(
                 &runtime,
-                &secret,
+                &secret_ref,
                 EventType::Warning,
                 err.reason(),
                 err.to_string(),
@@ -303,7 +341,14 @@ async fn reconcile(secret: Arc<Secret>, runtime: Arc<Runtime>) -> Result<Action,
                     "Updated {} on provider {workspace}/{provider}",
                     keys.join(", ")
                 );
-                publish(&runtime, &secret, EventType::Normal, "ProviderSynced", note).await;
+                publish(
+                    &runtime,
+                    &secret_ref,
+                    EventType::Normal,
+                    "ProviderSynced",
+                    note,
+                )
+                .await;
             }
             Ok(Outcome::Unchanged) => {
                 debug!(secret = %secret_ref, workspace, provider, "provider credentials unchanged");
@@ -322,7 +367,7 @@ async fn reconcile(secret: Arc<Secret>, runtime: Arc<Runtime>) -> Result<Action,
                 );
                 publish(
                     &runtime,
-                    &secret,
+                    &secret_ref,
                     EventType::Normal,
                     "ProviderSyncSkipped",
                     note,
@@ -338,7 +383,14 @@ async fn reconcile(secret: Arc<Secret>, runtime: Arc<Runtime>) -> Result<Action,
                     "provider sync failed"
                 );
                 let note = format!("Provider {workspace}/{provider}: {err}");
-                publish(&runtime, &secret, EventType::Warning, err.reason(), note).await;
+                publish(
+                    &runtime,
+                    &secret_ref,
+                    EventType::Warning,
+                    err.reason(),
+                    note,
+                )
+                .await;
             }
         }
     }
@@ -347,7 +399,7 @@ async fn reconcile(secret: Arc<Secret>, runtime: Arc<Runtime>) -> Result<Action,
             tokio::spawn(restart_sandbox(
                 Arc::clone(restarter),
                 Arc::clone(&runtime),
-                Arc::clone(&secret),
+                secret_ref.clone(),
                 report.workspace.clone(),
                 sandbox,
             ));
@@ -363,20 +415,27 @@ async fn reconcile(secret: Arc<Secret>, runtime: Arc<Runtime>) -> Result<Action,
 async fn restart_sandbox(
     restarter: Arc<dyn SandboxRestarter>,
     runtime: Arc<Runtime>,
-    secret: Arc<Secret>,
+    secret: SecretRef,
     workspace: String,
     sandbox: String,
 ) {
-    let secret_ref = secret_ref(&secret);
-    match restarter.restart(&workspace, &sandbox).await {
-        Ok(Restart::Restarted) => {
-            info!(secret = %secret_ref, workspace, sandbox, "restarted agent after credential rotation");
-            let note =
-                format!("Restarted sandbox {workspace}/{sandbox} after its credentials rotated");
-            publish(&runtime, &secret, EventType::Normal, "AgentRestarted", note).await;
+    if !runtime
+        .ctx
+        .begin_restart(&secret, &workspace, &sandbox)
+        .await
+    {
+        // A restart of this sandbox is already under way and will start it
+        // with current values.
+        debug!(secret = %secret, workspace, sandbox, "agent restart already pending");
+        return;
+    }
+    match restarter.stop(&workspace, &sandbox).await {
+        Ok(Stop::Stopped) => {
+            start_until_running(restarter, runtime, secret, workspace, sandbox).await;
         }
-        Ok(Restart::Skipped { phase }) => {
-            info!(secret = %secret_ref, workspace, sandbox, phase, "agent not running; left alone");
+        Ok(Stop::Skipped { phase }) => {
+            runtime.ctx.end_restart(&workspace, &sandbox).await;
+            info!(secret = %secret, workspace, sandbox, phase, "agent not running; left alone");
             let note = format!("Did not restart sandbox {workspace}/{sandbox}: it is {phase}");
             publish(
                 &runtime,
@@ -388,8 +447,12 @@ async fn restart_sandbox(
             .await;
         }
         Err(err) => {
-            warn!(secret = %secret_ref, workspace, sandbox, error = %err, "agent restart failed");
-            let note = format!("Restarting sandbox {workspace}/{sandbox} failed: {err}");
+            // Nothing was stopped, so the agent keeps running.
+            runtime.ctx.end_restart(&workspace, &sandbox).await;
+            warn!(secret = %secret, workspace, sandbox, error = %err, "agent restart failed");
+            let note = format!(
+                "Restarting sandbox {workspace}/{sandbox} failed before it stopped; it keeps running: {err}"
+            );
             publish(
                 &runtime,
                 &secret,
@@ -402,11 +465,131 @@ async fn restart_sandbox(
     }
 }
 
+/// What one look at a stopped sandbox found.
+enum StartStep {
+    /// It runs again, or reached a state no start applies to.
+    Done,
+    /// It no longer exists.
+    Gone,
+    /// It is still stopping.
+    Stopping,
+    Failed(UpdateError),
+}
+
+/// Start a sandbox this controller stopped, retrying with capped backoff
+/// until it runs again or is deleted. Never gives up on a stopped agent.
+async fn start_until_running(
+    restarter: Arc<dyn SandboxRestarter>,
+    runtime: Arc<Runtime>,
+    secret: SecretRef,
+    workspace: String,
+    sandbox: String,
+) {
+    let mut backoff = START_BACKOFF_FIRST;
+    let mut attempts: u32 = 0;
+    let mut stopping_since: Option<tokio::time::Instant> = None;
+    loop {
+        // Look before starting: a start that succeeded but whose reply was
+        // lost must not be retried against a running sandbox forever.
+        let step = match restarter.phase(&workspace, &sandbox).await {
+            Ok(None | Some(SandboxPhase::Deleting)) => StartStep::Gone,
+            Ok(Some(SandboxPhase::Stopping)) => StartStep::Stopping,
+            Ok(Some(SandboxPhase::Stopped | SandboxPhase::Unknown | SandboxPhase::Unspecified)) => {
+                match restarter.start(&workspace, &sandbox).await {
+                    Ok(()) => StartStep::Done,
+                    Err(err) => StartStep::Failed(err),
+                }
+            }
+            Ok(Some(_)) => StartStep::Done,
+            Err(err) => StartStep::Failed(err),
+        };
+        let delay = match step {
+            StartStep::Done => {
+                runtime.ctx.end_restart(&workspace, &sandbox).await;
+                info!(secret = %secret, workspace, sandbox, "restarted agent after credential rotation");
+                let note = format!(
+                    "Restarted sandbox {workspace}/{sandbox} after its credentials rotated"
+                );
+                publish(&runtime, &secret, EventType::Normal, "AgentRestarted", note).await;
+                return;
+            }
+            StartStep::Gone => {
+                runtime.ctx.end_restart(&workspace, &sandbox).await;
+                warn!(secret = %secret, workspace, sandbox, "sandbox deleted before it started again");
+                let note =
+                    format!("Did not start sandbox {workspace}/{sandbox} again: it was deleted");
+                publish(
+                    &runtime,
+                    &secret,
+                    EventType::Warning,
+                    "AgentRestartFailed",
+                    note,
+                )
+                .await;
+                return;
+            }
+            StartStep::Stopping => {
+                let since = *stopping_since.get_or_insert_with(tokio::time::Instant::now);
+                if since.elapsed() >= STOPPING_GRACE {
+                    let note = format!(
+                        "Sandbox {workspace}/{sandbox} is still stopping after {}s; it will be started once stopped",
+                        since.elapsed().as_secs()
+                    );
+                    publish(
+                        &runtime,
+                        &secret,
+                        EventType::Warning,
+                        "AgentStartPending",
+                        note,
+                    )
+                    .await;
+                    stopping_since = Some(tokio::time::Instant::now());
+                }
+                STOPPING_POLL
+            }
+            StartStep::Failed(err) => {
+                attempts += 1;
+                warn!(
+                    secret = %secret,
+                    workspace,
+                    sandbox,
+                    attempts,
+                    retry_in_secs = backoff.as_secs(),
+                    error = %err,
+                    "starting stopped agent failed; retrying"
+                );
+                let note = format!(
+                    "Starting sandbox {workspace}/{sandbox} failed (attempt {attempts}); retrying in {}s: {err}",
+                    backoff.as_secs()
+                );
+                publish(
+                    &runtime,
+                    &secret,
+                    EventType::Warning,
+                    "AgentStartPending",
+                    note,
+                )
+                .await;
+                let delay = backoff;
+                backoff = (backoff * 2).min(START_BACKOFF_MAX);
+                delay
+            }
+        };
+        tokio::time::sleep(delay).await;
+    }
+}
+
 fn error_policy(_secret: Arc<Secret>, err: &SyncError, _runtime: Arc<Runtime>) -> Action {
     Action::requeue(err.retry_after())
 }
 
-async fn publish(runtime: &Runtime, secret: &Secret, type_: EventType, reason: &str, note: String) {
+async fn publish(
+    runtime: &Runtime,
+    secret: &SecretRef,
+    type_: EventType,
+    reason: &str,
+    note: String,
+) {
     let Some(recorder) = &runtime.recorder else {
         return;
     };
@@ -417,7 +600,14 @@ async fn publish(runtime: &Runtime, secret: &Secret, type_: EventType, reason: &
         action: "UpdateProviderCredentials".to_string(),
         secondary: None,
     };
-    if let Err(err) = recorder.publish(&event, &secret.object_ref(&())).await {
+    let reference = k8s_openapi::api::core::v1::ObjectReference {
+        api_version: Some("v1".to_string()),
+        kind: Some("Secret".to_string()),
+        namespace: Some(secret.namespace.clone()),
+        name: Some(secret.name.clone()),
+        ..Default::default()
+    };
+    if let Err(err) = recorder.publish(&event, &reference).await {
         debug!(error = %err, "failed to publish Kubernetes event");
     }
 }
@@ -450,6 +640,23 @@ pub async fn run(client: Client, ctx: Context, options: Options) {
             .reporter
             .map(|reporter| Recorder::new(client, reporter)),
     });
+    // An earlier run may have stopped agents it had not started yet.
+    if let Some(restarter) = &runtime.ctx.restarter {
+        for pending in runtime.ctx.pending_starts().await {
+            info!(
+                workspace = pending.workspace,
+                sandbox = pending.sandbox,
+                "resuming the start of an agent stopped for a restart"
+            );
+            tokio::spawn(start_until_running(
+                Arc::clone(restarter),
+                Arc::clone(&runtime),
+                pending.secret,
+                pending.workspace,
+                pending.sandbox,
+            ));
+        }
+    }
     controller
         .shutdown_on_signal()
         .run(reconcile, error_policy, runtime)
@@ -488,16 +695,17 @@ mod tests {
         attached: StdMutex<Option<Vec<String>>>,
     }
 
+    /// Keeps every save, newest last.
     #[derive(Default)]
-    struct MemoryStore(StdMutex<Option<crate::state::PersistedState>>);
+    struct MemoryStore(StdMutex<Vec<crate::state::PersistedState>>);
 
     #[async_trait::async_trait]
     impl StateStore for MemoryStore {
         async fn load(&self) -> Result<Option<crate::state::PersistedState>, String> {
-            Ok(self.0.lock().unwrap().clone())
+            Ok(self.0.lock().unwrap().last().cloned())
         }
         async fn save(&self, state: &crate::state::PersistedState) -> Result<(), String> {
-            *self.0.lock().unwrap() = Some(state.clone());
+            self.0.lock().unwrap().push(state.clone());
             Ok(())
         }
     }
@@ -783,6 +991,210 @@ mod tests {
         let (r, s) = agent(&with(PM_CREDENTIALS, "LINEAR_API_KEY", "lin-2"));
         let report = second.sync(&r, &s, |_| true).await.unwrap();
         assert_eq!(report.sandboxes_to_restart(), ["linear-agent"]);
+    }
+
+    /// Scripted sandbox lifecycle: phases returned in order (the last
+    /// repeats), and start results in order (then success).
+    #[derive(Default)]
+    struct FakeRestarter {
+        stop_skipped: StdMutex<Option<String>>,
+        phases: StdMutex<Vec<Option<SandboxPhase>>>,
+        start_failures: StdMutex<u32>,
+        stops: StdMutex<u32>,
+        starts: StdMutex<u32>,
+    }
+
+    #[async_trait::async_trait]
+    impl SandboxRestarter for FakeRestarter {
+        async fn stop(&self, _: &str, _: &str) -> Result<Stop, UpdateError> {
+            *self.stops.lock().unwrap() += 1;
+            Ok(self
+                .stop_skipped
+                .lock()
+                .unwrap()
+                .clone()
+                .map_or(Stop::Stopped, |phase| Stop::Skipped { phase }))
+        }
+        async fn phase(&self, _: &str, _: &str) -> Result<Option<SandboxPhase>, UpdateError> {
+            let mut phases = self.phases.lock().unwrap();
+            Ok(if phases.len() > 1 {
+                phases.remove(0)
+            } else {
+                phases.first().copied().flatten()
+            })
+        }
+        async fn start(&self, _: &str, _: &str) -> Result<(), UpdateError> {
+            *self.starts.lock().unwrap() += 1;
+            let mut failures = self.start_failures.lock().unwrap();
+            if *failures > 0 {
+                *failures -= 1;
+                return Err(UpdateError::Transient(
+                    "Unavailable: gateway down".to_string(),
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    fn runtime(ctx: Context) -> Arc<Runtime> {
+        let (store, _writer) = kube::runtime::reflector::store();
+        Arc::new(Runtime {
+            ctx,
+            store,
+            recorder: None,
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stopped_agent_is_started_however_long_the_gateway_is_down() {
+        let store = Arc::new(MemoryStore::default());
+        let runtime = runtime(
+            Context::new(Arc::new(FakeUpdater::default()), "default")
+                .with_state(SyncState::new(), store.clone()),
+        );
+        let restarter = Arc::new(FakeRestarter::default());
+        *restarter.phases.lock().unwrap() = vec![Some(SandboxPhase::Stopped)];
+        // Far longer than any fixed deadline: 30 failures at up to 5 minutes.
+        *restarter.start_failures.lock().unwrap() = 30;
+
+        let (secret, _) = github("v1");
+        restart_sandbox(
+            restarter.clone(),
+            runtime.clone(),
+            secret.clone(),
+            "oncall".to_string(),
+            "triage".to_string(),
+        )
+        .await;
+        // The pending start was persisted before anything was stopped.
+        let first_save = store.0.lock().unwrap().first().cloned().unwrap();
+        assert_eq!(
+            SyncState::from_persisted(first_save).pending_starts().len(),
+            1,
+            "pending start saved before the stop"
+        );
+        assert_eq!(*restarter.stops.lock().unwrap(), 1);
+        assert_eq!(*restarter.starts.lock().unwrap(), 31);
+        assert!(runtime.ctx.pending_starts().await.is_empty());
+        let saved = store.load().await.unwrap().unwrap();
+        assert!(SyncState::from_persisted(saved).pending_starts().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_controller_restart_resumes_a_pending_start() {
+        let store = Arc::new(MemoryStore::default());
+        let mut before = SyncState::new();
+        let (secret, _) = github("v1");
+        assert!(before.begin_restart(&secret, "oncall", "triage"));
+        store.save(&before.to_persisted()).await.unwrap();
+
+        let persisted = store.load().await.unwrap().unwrap();
+        let runtime = runtime(
+            Context::new(Arc::new(FakeUpdater::default()), "default")
+                .with_state(SyncState::from_persisted(persisted), store.clone()),
+        );
+        let pending = runtime.ctx.pending_starts().await;
+        assert_eq!(pending.len(), 1);
+
+        let restarter = Arc::new(FakeRestarter::default());
+        // Still stopping at first, then stopped.
+        *restarter.phases.lock().unwrap() = vec![
+            Some(SandboxPhase::Stopping),
+            Some(SandboxPhase::Stopping),
+            Some(SandboxPhase::Stopped),
+        ];
+        let pending = pending.into_iter().next().unwrap();
+        start_until_running(
+            restarter.clone(),
+            runtime.clone(),
+            pending.secret,
+            pending.workspace,
+            pending.sandbox,
+        )
+        .await;
+        assert_eq!(
+            *restarter.stops.lock().unwrap(),
+            0,
+            "resuming never stops again"
+        );
+        assert_eq!(*restarter.starts.lock().unwrap(), 1);
+        assert!(runtime.ctx.pending_starts().await.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_start_that_already_happened_is_not_repeated() {
+        let runtime = runtime(Context::new(Arc::new(FakeUpdater::default()), "default"));
+        let restarter = Arc::new(FakeRestarter::default());
+        *restarter.phases.lock().unwrap() = vec![Some(SandboxPhase::Ready)];
+        let (secret, _) = github("v1");
+        start_until_running(
+            restarter.clone(),
+            runtime,
+            secret,
+            "oncall".to_string(),
+            "triage".to_string(),
+        )
+        .await;
+        assert_eq!(*restarter.starts.lock().unwrap(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_deleted_sandbox_ends_the_pending_start() {
+        let runtime = runtime(Context::new(Arc::new(FakeUpdater::default()), "default"));
+        let (secret, _) = github("v1");
+        assert!(runtime.ctx.begin_restart(&secret, "oncall", "triage").await);
+        let restarter = Arc::new(FakeRestarter::default());
+        *restarter.phases.lock().unwrap() = vec![None];
+        start_until_running(
+            restarter.clone(),
+            runtime.clone(),
+            secret,
+            "oncall".to_string(),
+            "triage".to_string(),
+        )
+        .await;
+        assert_eq!(*restarter.starts.lock().unwrap(), 0);
+        assert!(runtime.ctx.pending_starts().await.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_sandbox_someone_else_stopped_is_left_alone() {
+        let runtime = runtime(Context::new(Arc::new(FakeUpdater::default()), "default"));
+        let restarter = Arc::new(FakeRestarter::default());
+        *restarter.stop_skipped.lock().unwrap() = Some("SANDBOX_PHASE_STOPPED".to_string());
+        let (secret, _) = github("v1");
+        restart_sandbox(
+            restarter.clone(),
+            runtime.clone(),
+            secret,
+            "oncall".to_string(),
+            "triage".to_string(),
+        )
+        .await;
+        assert_eq!(*restarter.starts.lock().unwrap(), 0);
+        assert!(runtime.ctx.pending_starts().await.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_second_rotation_does_not_restart_a_sandbox_already_restarting() {
+        let runtime = runtime(Context::new(Arc::new(FakeUpdater::default()), "default"));
+        let (secret, _) = github("v1");
+        assert!(runtime.ctx.begin_restart(&secret, "oncall", "triage").await);
+        let restarter = Arc::new(FakeRestarter::default());
+        restart_sandbox(
+            restarter.clone(),
+            runtime.clone(),
+            secret,
+            "oncall".to_string(),
+            "triage".to_string(),
+        )
+        .await;
+        assert_eq!(*restarter.stops.lock().unwrap(), 0);
+        assert_eq!(
+            runtime.ctx.pending_starts().await.len(),
+            1,
+            "the first restart still owns it"
+        );
     }
 
     #[tokio::test]
