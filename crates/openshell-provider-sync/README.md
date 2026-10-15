@@ -43,19 +43,32 @@ accident, and one Secret key may be listed only once.
   changed keys of that provider as a value-only `UpdateProvider`. The gateway
   merges them into the provider, and attached sandboxes refetch on their next
   provider poll, every 10s by default.
-- **Restarting affected agents.** After a successful update the controller
+- **Restarting affected agents.** After a successful rotation the controller
   restarts every sandbox the gateway reports attached to that provider, with
   `StopSandbox` then `StartSandbox`, so the agent starts fresh and no open
   connection keeps using the old value. Sandboxes of other providers are not
   touched, and a sandbox restarts once even when several of its providers
-  rotate together. A sandbox that is stopped, stopping, completed or being
-  deleted is left alone. Once the controller has stopped a sandbox it keeps
-  starting it until it runs again, however long the gateway is unavailable,
-  backing off from 10 seconds to 5 minutes between attempts. The pending start
-  is saved in the state Secret before the stop, so a controller restart resumes
-  it. Only deleting the sandbox ends it. Agents must therefore
-  tolerate a restart at any time: keep state outside the sandbox or resume
-  from it. `--no-restart` turns this off.
+  rotate together. A rotation that lands while a sandbox is already restarting
+  restarts it once more afterwards. Agents must therefore tolerate a restart at
+  any time: keep state outside the sandbox or resume from it. `--no-restart`
+  turns this off.
+- **Never leaving an agent stopped.** Each restart is a saved state machine:
+  requested, then stopping, then awaiting running. The request is saved in the
+  same write as the rotation's fingerprints, and the controller saves that it
+  owns the stop before it stops anything, so after a controller restart it
+  resumes every restart where it was. Every gateway failure and every failed
+  save is retried, backing off from 10 seconds to 5 minutes. A restart is done
+  only when the sandbox is ready again. This holds with `--state-secret`;
+  without it a restart in progress is lost when the controller restarts, which
+  can leave an agent stopped, and the controller warns about it at startup.
+- **What a restart leaves to others.** A sandbox that is stopped, stopping,
+  completed, in Error or being deleted when the restart begins is left alone,
+  and so is one someone else stops after the restart started it. A sandbox that
+  ends in Error is left to the gateway's own recovery, with an
+  `AgentRestartFailed` event. One race remains: if someone stops a sandbox in
+  the moment between the controller reading its phase and stopping it, the
+  controller starts it again afterwards. The gateway has no conditional stop
+  to close that window.
 - **What it leaves alone.** It never creates or deletes providers, never clears
   a credential when its Secret is deleted or unlabelled, and never touches
   credential keys that no Secret lists. Providers are still created by whatever
@@ -95,9 +108,10 @@ accident, and one Secret key may be listed only once.
 - **Audit.** Each outcome is published as a Kubernetes Event on the Secret
   (`ProviderSynced`, `ProviderSyncSkipped`, `ProviderNotFound`,
   `ProviderSyncConflict`, `InvalidProviderSync`, `ProviderSyncFailed`,
-  `AgentRestarted`, `AgentRestartSkipped`, `AgentStartPending`,
-  `AgentRestartFailed`). `AgentStartPending` is a Warning at each retry of a
-  start that has not succeeded yet. The
+  `AgentRestarted`, `AgentRestartSkipped`, `AgentRestartPending`,
+  `AgentRestartFailed`). `AgentRestartPending` is a Warning at each retry after
+  a failure, and when a sandbox takes over 2 minutes to stop or start; repeats
+  of the same failure aggregate into one Event with a count. The
   gateway separately audits each `UpdateProvider` with the controller's
   principal. Neither carries values.
 

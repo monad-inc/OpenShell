@@ -16,5 +16,6 @@
 pub mod controller;
 pub mod gateway;
 pub mod mapping;
+pub mod restart;
 pub mod state;
 pub mod state_store;

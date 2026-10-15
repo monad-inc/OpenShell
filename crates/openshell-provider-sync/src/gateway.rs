@@ -161,30 +161,21 @@ impl ProviderUpdater for GatewayUpdater {
     }
 }
 
-/// What stopping a sandbox for a restart did.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Stop {
-    Stopped,
-    /// Stopped, stopping, completed, being deleted or gone: someone or
-    /// something else decided it should not run, so it is left alone.
-    Skipped {
-        phase: String,
-    },
-}
-
-/// Stops and starts sandboxes so their agents start fresh with current
-/// credentials. Retrying is the caller's job.
+/// Gateway calls a restart needs. Each is one attempt; deciding what to do
+/// next and retrying is the caller's job (see [`crate::restart`]).
 #[async_trait::async_trait]
 pub trait SandboxRestarter: Send + Sync + 'static {
-    /// Stop the sandbox unless it is already meant to stay down.
-    async fn stop(&self, workspace: &str, sandbox: &str) -> Result<Stop, UpdateError>;
     /// The sandbox's phase, or `None` when it no longer exists.
     async fn phase(
         &self,
         workspace: &str,
         sandbox: &str,
     ) -> Result<Option<SandboxPhase>, UpdateError>;
-    /// One start attempt.
+    /// Ask the gateway to stop the sandbox. A sandbox that no longer exists
+    /// is not an error; the next phase read reports it.
+    async fn stop(&self, workspace: &str, sandbox: &str) -> Result<(), UpdateError>;
+    /// Ask the gateway to start the sandbox, with the same treatment of a
+    /// sandbox that no longer exists.
     async fn start(&self, workspace: &str, sandbox: &str) -> Result<(), UpdateError>;
 }
 
@@ -228,41 +219,22 @@ impl GatewayRestarter {
     }
 }
 
-/// A sandbox in one of these phases is meant to stay down.
-pub(crate) fn left_alone(phase: SandboxPhase) -> bool {
-    matches!(
-        phase,
-        SandboxPhase::Stopping
-            | SandboxPhase::Stopped
-            | SandboxPhase::Completed
-            | SandboxPhase::Deleting
-    )
+fn sandbox_error(status: &tonic::Status, workspace: &str, sandbox: &str) -> UpdateError {
+    let message = format!(
+        "sandbox {workspace}/{sandbox}: {:?}: {}",
+        status.code(),
+        status.message()
+    );
+    match status.code() {
+        Code::InvalidArgument | Code::FailedPrecondition | Code::PermissionDenied => {
+            UpdateError::Rejected(message)
+        }
+        _ => UpdateError::Transient(message),
+    }
 }
 
 #[async_trait::async_trait]
 impl SandboxRestarter for GatewayRestarter {
-    async fn stop(&self, workspace: &str, sandbox: &str) -> Result<Stop, UpdateError> {
-        let Some(phase) = self.phase(workspace, sandbox).await? else {
-            return Ok(Stop::Skipped {
-                phase: "deleted".to_string(),
-            });
-        };
-        if left_alone(phase) {
-            return Ok(Stop::Skipped {
-                phase: phase.as_str_name().to_string(),
-            });
-        }
-        // A request id makes a retried stop a replay, not a repeat.
-        let stop = StopSandboxRequest {
-            workspace_scope: Some(workspace_selector(workspace)),
-            name: sandbox.to_string(),
-            request_id: uuid::Uuid::new_v4().to_string(),
-        };
-        call_refreshing!(&self.client, stop_sandbox, stop)
-            .map_err(|status| UpdateError::from_status(&status, workspace, sandbox))?;
-        Ok(Stop::Stopped)
-    }
-
     async fn phase(
         &self,
         workspace: &str,
@@ -281,7 +253,21 @@ impl SandboxRestarter for GatewayRestarter {
                     .map_or(SandboxPhase::Unspecified, |status| status.phase()),
             )),
             Err(status) if status.code() == Code::NotFound => Ok(None),
-            Err(status) => Err(UpdateError::from_status(&status, workspace, sandbox)),
+            Err(status) => Err(sandbox_error(&status, workspace, sandbox)),
+        }
+    }
+
+    async fn stop(&self, workspace: &str, sandbox: &str) -> Result<(), UpdateError> {
+        // A request id makes a retried call a replay, not a repeat.
+        let stop = StopSandboxRequest {
+            workspace_scope: Some(workspace_selector(workspace)),
+            name: sandbox.to_string(),
+            request_id: uuid::Uuid::new_v4().to_string(),
+        };
+        match call_refreshing!(&self.client, stop_sandbox, stop) {
+            Ok(_) => Ok(()),
+            Err(status) if status.code() == Code::NotFound => Ok(()),
+            Err(status) => Err(sandbox_error(&status, workspace, sandbox)),
         }
     }
 
@@ -291,9 +277,11 @@ impl SandboxRestarter for GatewayRestarter {
             name: sandbox.to_string(),
             request_id: uuid::Uuid::new_v4().to_string(),
         };
-        call_refreshing!(&self.client, start_sandbox, start)
-            .map(|_| ())
-            .map_err(|status| UpdateError::from_status(&status, workspace, sandbox))
+        match call_refreshing!(&self.client, start_sandbox, start) {
+            Ok(_) => Ok(()),
+            Err(status) if status.code() == Code::NotFound => Ok(()),
+            Err(status) => Err(sandbox_error(&status, workspace, sandbox)),
+        }
     }
 }
 
@@ -380,25 +368,13 @@ mod tests {
     }
 
     #[test]
-    fn stopped_sandboxes_are_left_alone() {
-        for phase in [
-            SandboxPhase::Stopping,
-            SandboxPhase::Stopped,
-            SandboxPhase::Completed,
-            SandboxPhase::Deleting,
-        ] {
-            assert!(left_alone(phase), "{phase:?}");
-        }
-        for phase in [
-            SandboxPhase::Ready,
-            SandboxPhase::Error,
-            SandboxPhase::Provisioning,
-            SandboxPhase::Starting,
-            SandboxPhase::Unknown,
-            SandboxPhase::Unspecified,
-        ] {
-            assert!(!left_alone(phase), "{phase:?}");
-        }
+    fn sandbox_errors_name_the_sandbox() {
+        let error = sandbox_error(&tonic::Status::failed_precondition("starting"), "w", "pm");
+        assert!(
+            matches!(&error, UpdateError::Rejected(message) if message.contains("sandbox w/pm"))
+        );
+        let error = sandbox_error(&tonic::Status::unavailable("down"), "w", "pm");
+        assert!(matches!(error, UpdateError::Transient(_)));
     }
 
     #[test]

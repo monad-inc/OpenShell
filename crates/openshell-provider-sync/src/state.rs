@@ -71,17 +71,41 @@ pub struct SyncState {
     salt: [u8; 32],
     applied: HashMap<AppliedKey, Applied>,
     owners: HashMap<CredentialSlot, SecretRef>,
-    pending_starts: BTreeMap<(String, String), SecretRef>,
+    restarts: BTreeMap<(String, String), Restart>,
 }
 
-/// A sandbox this controller stopped for a restart and has not yet seen
-/// start again. Kept across restarts so a stopped agent is never forgotten.
+/// How far a restart has got. Persisted before each step, so a controller
+/// restart resumes it and never forgets a sandbox it stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestartStage {
+    /// A rotation needs this agent restarted; nothing has been stopped yet.
+    Requested,
+    /// This controller is stopping the sandbox, or has stopped it.
+    Stopping,
+    /// The start was accepted; waiting for the sandbox to run.
+    AwaitingRunning,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Restart {
+    secret: SecretRef,
+    stage: RestartStage,
+    /// Another rotation landed while this restart was under way, so the
+    /// agent may have started on the earlier value: restart once more.
+    rerun: bool,
+}
+
+/// One sandbox restart in progress.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct PendingStart {
+pub struct PendingRestart {
     pub workspace: String,
     pub sandbox: String,
     /// The Secret whose rotation caused the restart, for its Events.
     pub secret: SecretRef,
+    pub stage: RestartStage,
+    #[serde(default)]
+    pub rerun: bool,
 }
 
 /// Fingerprints of applied values, kept across controller restarts.
@@ -93,7 +117,7 @@ pub struct PersistedState {
     salt: String,
     applied: Vec<PersistedApplied>,
     #[serde(default)]
-    pending_starts: Vec<PendingStart>,
+    restarts: Vec<PendingRestart>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -148,15 +172,34 @@ impl SyncState {
             salt: rand::random(),
             applied: HashMap::new(),
             owners: HashMap::new(),
-            pending_starts: BTreeMap::new(),
+            restarts: BTreeMap::new(),
         }
     }
 
     /// Resume from persisted fingerprints. Entries that do not parse are
     /// dropped, which only makes their next value a baseline.
     pub fn from_persisted(persisted: PersistedState) -> Self {
+        // Restarts in progress are kept whatever else is unreadable: losing
+        // one could leave an agent stopped.
+        let restarts = persisted
+            .restarts
+            .into_iter()
+            .map(|pending| {
+                (
+                    (pending.workspace, pending.sandbox),
+                    Restart {
+                        secret: pending.secret,
+                        stage: pending.stage,
+                        rerun: pending.rerun,
+                    },
+                )
+            })
+            .collect();
         let Some(salt) = from_hex(&persisted.salt) else {
-            return Self::new();
+            return Self {
+                restarts,
+                ..Self::new()
+            };
         };
         let applied = persisted
             .applied
@@ -182,16 +225,11 @@ impl SyncState {
                 ))
             })
             .collect();
-        let pending_starts = persisted
-            .pending_starts
-            .into_iter()
-            .map(|pending| ((pending.workspace, pending.sandbox), pending.secret))
-            .collect();
         Self {
             salt,
             applied,
             owners: HashMap::new(),
-            pending_starts,
+            restarts,
         }
     }
 
@@ -222,38 +260,91 @@ impl SyncState {
         PersistedState {
             salt: to_hex(&self.salt),
             applied,
-            pending_starts: self.pending_starts(),
+            restarts: self.pending_restarts(),
         }
     }
 
-    /// Record that this controller is about to stop `sandbox` and must start
-    /// it again. Returns false when a start is already pending, so one restart
-    /// at a time owns the sandbox.
-    pub fn begin_restart(&mut self, secret: &SecretRef, workspace: &str, sandbox: &str) -> bool {
+    /// Ask for `sandbox` to be restarted. Returns true when this starts a
+    /// new restart; when one is already under way it is marked to run once
+    /// more, so the agent cannot keep a value from before this rotation.
+    pub fn request_restart(&mut self, secret: &SecretRef, workspace: &str, sandbox: &str) -> bool {
         let key = (workspace.to_string(), sandbox.to_string());
-        if self.pending_starts.contains_key(&key) {
+        if let Some(restart) = self.restarts.get_mut(&key) {
+            restart.rerun = true;
             return false;
         }
-        self.pending_starts.insert(key, secret.clone());
+        self.restarts.insert(
+            key,
+            Restart {
+                secret: secret.clone(),
+                stage: RestartStage::Requested,
+                rerun: false,
+            },
+        );
         true
     }
 
-    /// The sandbox runs again, or will never need starting.
-    pub fn end_restart(&mut self, workspace: &str, sandbox: &str) {
-        self.pending_starts
+    pub fn restart_stage(&self, workspace: &str, sandbox: &str) -> Option<RestartStage> {
+        self.restarts
+            .get(&(workspace.to_string(), sandbox.to_string()))
+            .map(|restart| restart.stage)
+    }
+
+    pub fn set_restart_stage(&mut self, workspace: &str, sandbox: &str, stage: RestartStage) {
+        if let Some(restart) = self
+            .restarts
+            .get_mut(&(workspace.to_string(), sandbox.to_string()))
+        {
+            restart.stage = stage;
+        }
+    }
+
+    /// The sandbox runs again. Returns true when another rotation asked for
+    /// one more restart, which is then requested afresh.
+    pub fn finish_restart(&mut self, workspace: &str, sandbox: &str) -> bool {
+        let key = (workspace.to_string(), sandbox.to_string());
+        match self.restarts.get_mut(&key) {
+            Some(restart) if restart.rerun => {
+                restart.rerun = false;
+                restart.stage = RestartStage::Requested;
+                true
+            }
+            Some(_) => {
+                self.restarts.remove(&key);
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// The restart ends without the sandbox running, as when someone else
+    /// stopped or deleted it.
+    pub fn abandon_restart(&mut self, workspace: &str, sandbox: &str) {
+        self.restarts
             .remove(&(workspace.to_string(), sandbox.to_string()));
     }
 
-    /// Sandboxes stopped for a restart and not yet seen running again.
-    pub fn pending_starts(&self) -> Vec<PendingStart> {
-        self.pending_starts
+    /// Restarts in progress.
+    pub fn pending_restarts(&self) -> Vec<PendingRestart> {
+        self.restarts
             .iter()
-            .map(|((workspace, sandbox), secret)| PendingStart {
+            .map(|((workspace, sandbox), restart)| PendingRestart {
                 workspace: workspace.clone(),
                 sandbox: sandbox.clone(),
-                secret: secret.clone(),
+                secret: restart.secret.clone(),
+                stage: restart.stage,
+                rerun: restart.rerun,
             })
             .collect()
+    }
+
+    /// Drop applied fingerprints of Secrets that no longer exist, so
+    /// persisted state does not grow without bound. Returns whether any were
+    /// dropped. Claims are left to the watch.
+    pub fn prune_applied(&mut self, exists: impl Fn(&SecretRef) -> bool) -> bool {
+        let before = self.applied.len();
+        self.applied.retain(|(secret, _), _| exists(secret));
+        self.applied.len() != before
     }
 
     /// Whether `secret` has applied values to `provider` before, so a change
@@ -601,24 +692,54 @@ mod tests {
     }
 
     #[test]
-    fn a_pending_start_survives_a_restart_and_blocks_a_second_restart() {
+    fn a_restart_survives_a_controller_restart_at_every_stage() {
         let mut state = SyncState::new();
-        assert!(state.begin_restart(&secret("pm"), "pm", "pm"));
-        assert!(!state.begin_restart(&secret("pm"), "pm", "pm"));
-
-        let restarted = SyncState::from_persisted(state.to_persisted());
+        assert!(state.request_restart(&secret("pm"), "pm", "pm"));
+        for stage in [
+            RestartStage::Requested,
+            RestartStage::Stopping,
+            RestartStage::AwaitingRunning,
+        ] {
+            state.set_restart_stage("pm", "pm", stage);
+            let restarted = SyncState::from_persisted(state.to_persisted());
+            assert_eq!(restarted.restart_stage("pm", "pm"), Some(stage));
+        }
+        // Even with an unreadable salt, restarts in progress are kept.
+        let mut persisted = state.to_persisted();
+        persisted.salt = "not hex".to_string();
         assert_eq!(
-            restarted.pending_starts(),
-            [PendingStart {
-                workspace: "pm".to_string(),
-                sandbox: "pm".to_string(),
-                secret: secret("pm"),
-            }]
+            SyncState::from_persisted(persisted).restart_stage("pm", "pm"),
+            Some(RestartStage::AwaitingRunning)
         );
+    }
 
-        state.end_restart("pm", "pm");
-        assert!(state.pending_starts().is_empty());
-        assert!(state.begin_restart(&secret("pm"), "pm", "pm"));
+    #[test]
+    fn a_rotation_during_a_restart_restarts_once_more() {
+        let mut state = SyncState::new();
+        assert!(state.request_restart(&secret("pm"), "pm", "pm"));
+        state.set_restart_stage("pm", "pm", RestartStage::AwaitingRunning);
+        assert!(
+            !state.request_restart(&secret("pm"), "pm", "pm"),
+            "one restart at a time"
+        );
+        assert!(state.finish_restart("pm", "pm"), "runs once more");
+        assert_eq!(
+            state.restart_stage("pm", "pm"),
+            Some(RestartStage::Requested)
+        );
+        assert!(!state.finish_restart("pm", "pm"));
+        assert!(state.pending_restarts().is_empty());
+    }
+
+    #[test]
+    fn prune_drops_fingerprints_of_deleted_secrets() {
+        let mut state = SyncState::new();
+        state.commit(&secret("kept"), "w", "p", &values(&[("A", "1")]));
+        state.commit(&secret("gone"), "w", "p", &values(&[("A", "1")]));
+        assert!(state.prune_applied(|secret| secret.name == "kept"));
+        assert!(state.has_applied(&secret("kept"), "w", "p"));
+        assert!(!state.has_applied(&secret("gone"), "w", "p"));
+        assert!(!state.prune_applied(|_| true));
     }
 
     #[test]

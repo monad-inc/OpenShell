@@ -122,22 +122,27 @@ async fn main() -> Result<()> {
     );
     if !cli.no_restart {
         context = context.with_restarter(Arc::new(GatewayRestarter::new(gateway)));
+        if cli.state_secret.is_none() {
+            tracing::warn!(
+                "agent restarts are on without --state-secret: a restart in progress is \
+                 forgotten if this controller restarts, which can leave an agent stopped"
+            );
+        }
     }
     if let Some(name) = &cli.state_secret {
         let namespace = cli.state_namespace.clone().ok_or_else(|| {
             miette::miette!("--state-secret needs --state-namespace or POD_NAMESPACE")
         })?;
         let store = SecretStateStore::new(kube_client.clone(), &namespace, name.clone());
-        let state = match store.load().await {
-            Ok(Some(persisted)) => SyncState::from_persisted(persisted),
-            Ok(None) => SyncState::new(),
-            Err(err) => {
-                // Starting fresh only costs a baseline sync that restarts
-                // nothing; refusing to start would stop all syncing.
-                tracing::warn!(error = %err, "could not load provider sync state; starting fresh");
-                SyncState::new()
-            }
-        };
+        // Refuse to start on state that exists but cannot be read: starting
+        // fresh would overwrite it with the next save and forget restarts in
+        // progress, which could leave an agent stopped. Crash-looping until it
+        // is readable is the safe failure.
+        let state = store
+            .load()
+            .await
+            .map_err(|err| miette::miette!("load provider sync state: {err}"))?
+            .map_or_else(SyncState::new, SyncState::from_persisted);
         context = context.with_state(state, Arc::new(store));
     }
 
