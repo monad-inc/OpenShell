@@ -7,7 +7,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use openshell_core::proto::datamodel::v1::{ObjectMeta, Provider};
-use openshell_core::proto::{UpdateProviderRequest, workspace_selector};
+use openshell_core::proto::{
+    GetSandboxRequest, ProviderResponse, SandboxPhase, StartSandboxRequest, StopSandboxRequest,
+    UpdateProviderRequest, workspace_selector,
+};
 use openshell_sdk::{OpenShellClient, Refresh, RefreshError, RefreshedToken};
 use tonic::Code;
 
@@ -43,17 +46,61 @@ impl UpdateError {
     }
 }
 
+/// What one provider update reached.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Updated {
+    pub mutation_id: String,
+    /// Sandboxes the gateway found attached to the provider when it applied
+    /// the update, by name.
+    pub sandboxes: Vec<String>,
+}
+
+impl Updated {
+    fn from_response(response: ProviderResponse) -> Self {
+        let mut sandboxes: Vec<String> = response
+            .target_receipts
+            .iter()
+            .filter_map(|receipt| receipt.desired.as_ref())
+            .map(|desired| desired.sandbox.clone())
+            .filter(|sandbox| !sandbox.is_empty())
+            .collect();
+        sandboxes.sort();
+        sandboxes.dedup();
+        Self {
+            mutation_id: response.mutation_id,
+            sandboxes,
+        }
+    }
+}
+
 /// Writes credential values to a provider.
 #[async_trait::async_trait]
 pub trait ProviderUpdater: Send + Sync + 'static {
     /// Merge `values` into the provider's credentials. Keys not in `values`
-    /// are left unchanged. Returns the gateway's mutation receipt id.
+    /// are left unchanged.
     async fn update_credentials(
         &self,
         workspace: &str,
         provider: &str,
         values: &CredentialValues,
-    ) -> Result<String, UpdateError>;
+    ) -> Result<Updated, UpdateError>;
+}
+
+/// What restarting one sandbox did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Restart {
+    Restarted,
+    /// Stopped, stopping, completed or being deleted: someone or something
+    /// else decided it should not run, so it is left alone.
+    Skipped {
+        phase: String,
+    },
+}
+
+/// Restarts a sandbox so its agent starts fresh with current credentials.
+#[async_trait::async_trait]
+pub trait SandboxRestarter: Send + Sync + 'static {
+    async fn restart(&self, workspace: &str, sandbox: &str) -> Result<Restart, UpdateError>;
 }
 
 /// [`ProviderUpdater`] over the gateway's `UpdateProvider` RPC.
@@ -101,7 +148,7 @@ impl ProviderUpdater for GatewayUpdater {
         workspace: &str,
         provider: &str,
         values: &CredentialValues,
-    ) -> Result<String, UpdateError> {
+    ) -> Result<Updated, UpdateError> {
         let mut retried_auth = false;
         loop {
             let mut grpc = self
@@ -113,7 +160,7 @@ impl ProviderUpdater for GatewayUpdater {
                 .update_provider(update_request(workspace, provider, values))
                 .await
             {
-                Ok(response) => return Ok(response.into_inner().mutation_id),
+                Ok(response) => return Ok(Updated::from_response(response.into_inner())),
                 Err(status) if status.code() == Code::Unauthenticated && !retried_auth => {
                     retried_auth = true;
                     let refreshed = self
@@ -126,6 +173,124 @@ impl ProviderUpdater for GatewayUpdater {
                     }
                 }
                 Err(status) => return Err(UpdateError::from_status(&status, workspace, provider)),
+            }
+        }
+    }
+}
+
+/// How long a restart keeps trying to start a sandbox it stopped.
+const START_DEADLINE: std::time::Duration = std::time::Duration::from_mins(10);
+/// Pause between start attempts while the sandbox is still stopping.
+const START_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Call one gateway RPC, refreshing the bearer token once if it is rejected.
+macro_rules! call_refreshing {
+    ($client:expr, $method:ident, $request:expr) => {{
+        let client = $client;
+        let first = client
+            .raw_grpc_fresh()
+            .await
+            .map_err(|err| UpdateError::Transient(err.to_string()))?
+            .$method($request.clone())
+            .await;
+        match first {
+            Err(status) if status.code() == Code::Unauthenticated => {
+                client
+                    .force_refresh()
+                    .await
+                    .map_err(|err| UpdateError::Transient(err.to_string()))?;
+                client
+                    .raw_grpc_fresh()
+                    .await
+                    .map_err(|err| UpdateError::Transient(err.to_string()))?
+                    .$method($request)
+                    .await
+            }
+            other => other,
+        }
+    }};
+}
+
+/// [`SandboxRestarter`] over the gateway's `StopSandbox` and `StartSandbox`.
+pub struct GatewayRestarter {
+    client: OpenShellClient,
+}
+
+impl GatewayRestarter {
+    pub fn new(client: OpenShellClient) -> Self {
+        Self { client }
+    }
+
+    async fn phase(&self, workspace: &str, sandbox: &str) -> Result<SandboxPhase, UpdateError> {
+        let request = GetSandboxRequest {
+            workspace_scope: Some(workspace_selector(workspace)),
+            name: sandbox.to_string(),
+        };
+        let response = call_refreshing!(&self.client, get_sandbox, request)
+            .map_err(|status| UpdateError::from_status(&status, workspace, sandbox))?;
+        Ok(response
+            .into_inner()
+            .sandbox
+            .and_then(|sandbox| sandbox.status)
+            .map_or(SandboxPhase::Unspecified, |status| status.phase()))
+    }
+}
+
+/// A sandbox in one of these phases is meant to stay down.
+fn left_alone(phase: SandboxPhase) -> bool {
+    matches!(
+        phase,
+        SandboxPhase::Stopping
+            | SandboxPhase::Stopped
+            | SandboxPhase::Completed
+            | SandboxPhase::Deleting
+    )
+}
+
+#[async_trait::async_trait]
+impl SandboxRestarter for GatewayRestarter {
+    async fn restart(&self, workspace: &str, sandbox: &str) -> Result<Restart, UpdateError> {
+        let phase = self.phase(workspace, sandbox).await?;
+        if left_alone(phase) {
+            return Ok(Restart::Skipped {
+                phase: phase.as_str_name().to_string(),
+            });
+        }
+        // Request ids make a retried stop or start a replay, not a repeat.
+        let stop = StopSandboxRequest {
+            workspace_scope: Some(workspace_selector(workspace)),
+            name: sandbox.to_string(),
+            request_id: uuid::Uuid::new_v4().to_string(),
+        };
+        call_refreshing!(&self.client, stop_sandbox, stop)
+            .map_err(|status| UpdateError::from_status(&status, workspace, sandbox))?;
+
+        // A stopped agent must not stay down because this restart gave up:
+        // keep starting until the gateway accepts or the deadline passes.
+        let start = StartSandboxRequest {
+            workspace_scope: Some(workspace_selector(workspace)),
+            name: sandbox.to_string(),
+            request_id: uuid::Uuid::new_v4().to_string(),
+        };
+        let deadline = tokio::time::Instant::now() + START_DEADLINE;
+        loop {
+            match call_refreshing!(&self.client, start_sandbox, start.clone()) {
+                Ok(_) => return Ok(Restart::Restarted),
+                Err(status)
+                    if matches!(
+                        status.code(),
+                        Code::FailedPrecondition | Code::Unavailable | Code::Aborted
+                    ) && tokio::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(START_RETRY).await;
+                }
+                Err(status) => {
+                    return Err(UpdateError::Transient(format!(
+                        "sandbox {workspace}/{sandbox} was stopped but did not start: {:?}: {}",
+                        status.code(),
+                        status.message()
+                    )));
+                }
             }
         }
     }
@@ -187,6 +352,52 @@ mod tests {
         assert_eq!(provider.credentials.len(), 1);
         assert_eq!(provider.credentials["A"], "1");
         assert_eq!(request.workspace_scope, Some(workspace_selector("oncall")));
+    }
+
+    #[test]
+    fn update_reports_the_attached_sandboxes_once_each() {
+        use openshell_core::proto::{ProviderDesiredIdentity, ProviderMutationReceipt};
+        let receipt = |sandbox: &str| ProviderMutationReceipt {
+            desired: Some(ProviderDesiredIdentity {
+                sandbox: sandbox.to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let updated = Updated::from_response(ProviderResponse {
+            mutation_id: "m".to_string(),
+            target_receipts: vec![
+                receipt("pm"),
+                receipt("gtm-bot"),
+                receipt("pm"),
+                receipt(""),
+            ],
+            ..Default::default()
+        });
+        assert_eq!(updated.mutation_id, "m");
+        assert_eq!(updated.sandboxes, ["gtm-bot", "pm"]);
+    }
+
+    #[test]
+    fn stopped_sandboxes_are_left_alone() {
+        for phase in [
+            SandboxPhase::Stopping,
+            SandboxPhase::Stopped,
+            SandboxPhase::Completed,
+            SandboxPhase::Deleting,
+        ] {
+            assert!(left_alone(phase), "{phase:?}");
+        }
+        for phase in [
+            SandboxPhase::Ready,
+            SandboxPhase::Error,
+            SandboxPhase::Provisioning,
+            SandboxPhase::Starting,
+            SandboxPhase::Unknown,
+            SandboxPhase::Unspecified,
+        ] {
+            assert!(!left_alone(phase), "{phase:?}");
+        }
     }
 
     #[test]

@@ -966,13 +966,19 @@ kubectl -n <sync-namespace> logs deployment/<provider-sync> --tail=200
 | `ProviderSyncConflict` | Another live Secret already feeds the same workspace, provider and key |
 | `InvalidProviderSync` | Bad annotations, or only some of a provider's keys are set, or a value is not UTF-8 |
 | `ProviderSyncFailed` | The gateway rejected the update or was unreachable |
+| `AgentRestarted` | A rotation restarted a sandbox attached to that provider |
+| `AgentRestartSkipped` | The attached sandbox was stopped, stopping, completed or deleting, so it was left alone |
+| `AgentRestartFailed` | Stopping or starting the sandbox failed; a sandbox stopped but not started stays down until started by hand |
 
 No Events at all means the controller is not watching the Secret: check the
 label, its `OPENSHELL_PROVIDER_SYNC_NAMESPACE`, and its RBAC (`get`, `list` and
 `watch` on Secrets, `create` and `patch` on `events.k8s.io` Events). A
-`ProviderSynced` event without the change reaching a running process usually
-means the credential's profile lacks `stable_placeholder: true`; only processes
-started after the update see the new value. Avoid rotating while gateways are
+`ProviderSynced` event with no `AgentRestarted` after it means the values were a
+baseline (the first values the controller saw, or the first sync after it
+restarted without `--state-secret`), restarts are off (`--no-restart`), or no
+sandbox was attached to the provider. Every agent restarting after a
+provider-sync restart means its state Secret is missing or unreadable. Avoid
+rotating while gateways are
 rolling: a supervisor whose provider refetch fails revokes its static
 credentials.
 

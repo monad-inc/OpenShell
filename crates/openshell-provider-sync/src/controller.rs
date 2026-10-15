@@ -16,9 +16,10 @@ use kube::{Api, Client, Resource, ResourceExt};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
-use crate::gateway::{ProviderUpdater, UpdateError};
+use crate::gateway::{ProviderUpdater, Restart, SandboxRestarter, UpdateError};
 use crate::mapping::{self, Extracted, MappingError};
 use crate::state::{Conflict, SecretRef, SyncState};
+use crate::state_store::StateStore;
 
 /// How long to wait before retrying a provider that does not exist yet.
 const PROVIDER_MISSING_RETRY: Duration = Duration::from_secs(30);
@@ -35,6 +36,10 @@ pub enum Outcome {
     Updated {
         keys: Vec<String>,
         mutation_id: String,
+        /// Sandboxes attached to the provider whose agents must restart to
+        /// pick up the new values. Empty for a baseline: values this
+        /// controller had not applied before, such as at first sight.
+        restart: Vec<String>,
     },
     /// Nothing changed since the last push.
     Unchanged,
@@ -92,10 +97,31 @@ impl SyncReport {
     }
 }
 
+impl SyncReport {
+    /// Every sandbox to restart, once each even when several of its
+    /// providers rotated.
+    pub fn sandboxes_to_restart(&self) -> Vec<String> {
+        let mut sandboxes: Vec<String> = self
+            .providers
+            .iter()
+            .filter_map(|(_, result)| match result {
+                Ok(Outcome::Updated { restart, .. }) => Some(restart.iter().cloned()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        sandboxes.sort();
+        sandboxes.dedup();
+        sandboxes
+    }
+}
+
 /// Shared by every reconcile.
 pub struct Context {
     updater: Arc<dyn ProviderUpdater>,
+    restarter: Option<Arc<dyn SandboxRestarter>>,
     state: Mutex<SyncState>,
+    store: Option<Arc<dyn StateStore>>,
     default_workspace: String,
 }
 
@@ -103,9 +129,27 @@ impl Context {
     pub fn new(updater: Arc<dyn ProviderUpdater>, default_workspace: impl Into<String>) -> Self {
         Self {
             updater,
+            restarter: None,
             state: Mutex::new(SyncState::new()),
+            store: None,
             default_workspace: default_workspace.into(),
         }
+    }
+
+    /// Restart the agents attached to a provider whose values rotated.
+    #[must_use]
+    pub fn with_restarter(mut self, restarter: Arc<dyn SandboxRestarter>) -> Self {
+        self.restarter = Some(restarter);
+        self
+    }
+
+    /// Resume from persisted state and keep it current, so a restart of this
+    /// controller does not mistake values it already applied for rotations.
+    #[must_use]
+    pub fn with_state(mut self, state: SyncState, store: Arc<dyn StateStore>) -> Self {
+        self.state = Mutex::new(state);
+        self.store = Some(store);
+        self
     }
 
     /// Sync one Secret: parse its annotations, then for each provider read
@@ -153,18 +197,34 @@ impl Context {
                 if changed.is_empty() {
                     return Ok(Outcome::Unchanged);
                 }
-                let mutation_id = self
+                let rotation = state.has_applied(secret_ref, &target.workspace, provider);
+                let updated = self
                     .updater
                     .update_credentials(&target.workspace, provider, &changed)
                     .await?;
                 state.commit(secret_ref, &target.workspace, provider, &values);
                 Ok(Outcome::Updated {
                     keys: changed.keys().cloned().collect(),
-                    mutation_id,
+                    mutation_id: updated.mutation_id,
+                    restart: if rotation {
+                        updated.sandboxes
+                    } else {
+                        Vec::new()
+                    },
                 })
             }
             .await;
             providers.push((provider.clone(), result));
+        }
+        if let Some(store) = &self.store
+            && providers
+                .iter()
+                .any(|(_, result)| matches!(result, Ok(Outcome::Updated { .. })))
+            && let Err(err) = store.save(&state.to_persisted()).await
+        {
+            // In-memory state is still right. The cost of a lost save is one
+            // extra restart of these agents after this controller restarts.
+            warn!(error = %err, "failed to persist provider sync state");
         }
         Ok(SyncReport {
             workspace: target.workspace,
@@ -225,13 +285,18 @@ async fn reconcile(secret: Arc<Secret>, runtime: Arc<Runtime>) -> Result<Action,
     let workspace = &report.workspace;
     for (provider, result) in &report.providers {
         match result {
-            Ok(Outcome::Updated { keys, mutation_id }) => {
+            Ok(Outcome::Updated {
+                keys,
+                mutation_id,
+                restart,
+            }) => {
                 info!(
                     secret = %secret_ref,
                     workspace,
                     provider,
                     keys = ?keys,
                     mutation_id,
+                    restart = ?restart,
                     "provider credentials updated from Secret"
                 );
                 let note = format!(
@@ -277,9 +342,64 @@ async fn reconcile(secret: Arc<Secret>, runtime: Arc<Runtime>) -> Result<Action,
             }
         }
     }
+    if let Some(restarter) = &runtime.ctx.restarter {
+        for sandbox in report.sandboxes_to_restart() {
+            tokio::spawn(restart_sandbox(
+                Arc::clone(restarter),
+                Arc::clone(&runtime),
+                Arc::clone(&secret),
+                report.workspace.clone(),
+                sandbox,
+            ));
+        }
+    }
     Ok(report
         .retry_after()
         .map_or_else(Action::await_change, Action::requeue))
+}
+
+/// Restart one agent so it starts fresh with the rotated values. Runs apart
+/// from the reconcile: a restart waits for the sandbox to stop and start.
+async fn restart_sandbox(
+    restarter: Arc<dyn SandboxRestarter>,
+    runtime: Arc<Runtime>,
+    secret: Arc<Secret>,
+    workspace: String,
+    sandbox: String,
+) {
+    let secret_ref = secret_ref(&secret);
+    match restarter.restart(&workspace, &sandbox).await {
+        Ok(Restart::Restarted) => {
+            info!(secret = %secret_ref, workspace, sandbox, "restarted agent after credential rotation");
+            let note =
+                format!("Restarted sandbox {workspace}/{sandbox} after its credentials rotated");
+            publish(&runtime, &secret, EventType::Normal, "AgentRestarted", note).await;
+        }
+        Ok(Restart::Skipped { phase }) => {
+            info!(secret = %secret_ref, workspace, sandbox, phase, "agent not running; left alone");
+            let note = format!("Did not restart sandbox {workspace}/{sandbox}: it is {phase}");
+            publish(
+                &runtime,
+                &secret,
+                EventType::Normal,
+                "AgentRestartSkipped",
+                note,
+            )
+            .await;
+        }
+        Err(err) => {
+            warn!(secret = %secret_ref, workspace, sandbox, error = %err, "agent restart failed");
+            let note = format!("Restarting sandbox {workspace}/{sandbox} failed: {err}");
+            publish(
+                &runtime,
+                &secret,
+                EventType::Warning,
+                "AgentRestartFailed",
+                note,
+            )
+            .await;
+        }
+    }
 }
 
 fn error_policy(_secret: Arc<Secret>, err: &SyncError, _runtime: Arc<Runtime>) -> Action {
@@ -363,6 +483,23 @@ mod tests {
     struct FakeUpdater {
         calls: StdMutex<Vec<UpdateCall>>,
         fail_with: StdMutex<Option<FailRule>>,
+        /// Sandboxes every provider reports attached; `<provider>-agent`
+        /// when unset.
+        attached: StdMutex<Option<Vec<String>>>,
+    }
+
+    #[derive(Default)]
+    struct MemoryStore(StdMutex<Option<crate::state::PersistedState>>);
+
+    #[async_trait::async_trait]
+    impl StateStore for MemoryStore {
+        async fn load(&self) -> Result<Option<crate::state::PersistedState>, String> {
+            Ok(self.0.lock().unwrap().clone())
+        }
+        async fn save(&self, state: &crate::state::PersistedState) -> Result<(), String> {
+            *self.0.lock().unwrap() = Some(state.clone());
+            Ok(())
+        }
     }
 
     #[async_trait::async_trait]
@@ -372,7 +509,7 @@ mod tests {
             workspace: &str,
             provider: &str,
             values: &CredentialValues,
-        ) -> Result<String, UpdateError> {
+        ) -> Result<crate::gateway::Updated, UpdateError> {
             let fail_with = *self.fail_with.lock().unwrap();
             if let Some((only, fail)) = fail_with
                 && only.is_none_or(|only| only == provider)
@@ -384,7 +521,16 @@ mod tests {
                 provider.to_string(),
                 values.0.clone(),
             ));
-            Ok("mutation-1".to_string())
+            let sandboxes = self
+                .attached
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| vec![format!("{provider}-agent")]);
+            Ok(crate::gateway::Updated {
+                mutation_id: "mutation-1".to_string(),
+                sandboxes,
+            })
         }
     }
 
@@ -547,6 +693,96 @@ mod tests {
             calls[0].2,
             BTreeMap::from([("SLACK_BOT_TOKEN".to_string(), "bot-2".to_string())])
         );
+    }
+
+    const PM_CREDENTIALS: [(&str, &str); 4] = [
+        ("SLACK_BOT_TOKEN", "bot"),
+        ("SLACK_APP_TOKEN", "app"),
+        ("LINEAR_API_KEY", "lin"),
+        ("ANTHROPIC_API_KEY", "ant"),
+    ];
+
+    fn with(
+        base: [(&'static str, &'static str); 4],
+        key: &str,
+        value: &'static str,
+    ) -> [(&'static str, &'static str); 4] {
+        base.map(|(name, current)| {
+            if name == key {
+                (name, value)
+            } else {
+                (name, current)
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn a_rotation_restarts_only_the_agents_attached_to_its_provider() {
+        let updater = Arc::new(FakeUpdater::default());
+        let ctx = Context::new(updater.clone(), "default");
+        let (r, s) = agent(&PM_CREDENTIALS);
+        let report = ctx.sync(&r, &s, |_| true).await.unwrap();
+        assert!(
+            report.sandboxes_to_restart().is_empty(),
+            "first sight is a baseline, not a rotation"
+        );
+
+        let (r, s) = agent(&with(PM_CREDENTIALS, "SLACK_BOT_TOKEN", "bot-2"));
+        let report = ctx.sync(&r, &s, |_| true).await.unwrap();
+        assert_eq!(report.sandboxes_to_restart(), ["slack-pm-agent"]);
+        assert!(matches!(
+            outcome(&report, "slack-pm"),
+            Ok(Outcome::Updated { restart, .. }) if restart == &["slack-pm-agent"]
+        ));
+        assert!(matches!(outcome(&report, "linear"), Ok(Outcome::Unchanged)));
+
+        // Unchanged values restart nothing.
+        let report = ctx.sync(&r, &s, |_| true).await.unwrap();
+        assert!(report.sandboxes_to_restart().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_agent_restarts_once_when_several_of_its_providers_rotate() {
+        let updater = Arc::new(FakeUpdater::default());
+        *updater.attached.lock().unwrap() = Some(vec!["pm".to_string()]);
+        let ctx = Context::new(updater.clone(), "default");
+        let (r, s) = agent(&PM_CREDENTIALS);
+        ctx.sync(&r, &s, |_| true).await.unwrap();
+
+        let rotated = with(
+            with(PM_CREDENTIALS, "SLACK_BOT_TOKEN", "bot-2"),
+            "LINEAR_API_KEY",
+            "lin-2",
+        );
+        let (r, s) = agent(&rotated);
+        let report = ctx.sync(&r, &s, |_| true).await.unwrap();
+        assert_eq!(report.sandboxes_to_restart(), ["pm"]);
+    }
+
+    #[tokio::test]
+    async fn persisted_state_keeps_a_controller_restart_from_restarting_agents() {
+        let store = Arc::new(MemoryStore::default());
+        let updater = Arc::new(FakeUpdater::default());
+        let first =
+            Context::new(updater.clone(), "default").with_state(SyncState::new(), store.clone());
+        let (r, s) = agent(&PM_CREDENTIALS);
+        first.sync(&r, &s, |_| true).await.unwrap();
+        updater.calls.lock().unwrap().clear();
+
+        // A new controller process resumes from the saved fingerprints.
+        let persisted = store.load().await.unwrap().expect("state saved");
+        let second = Context::new(updater.clone(), "default")
+            .with_state(SyncState::from_persisted(persisted), store.clone());
+        let report = second.sync(&r, &s, |_| true).await.unwrap();
+        assert!(report.sandboxes_to_restart().is_empty());
+        assert!(
+            updater.calls.lock().unwrap().is_empty(),
+            "nothing re-pushed"
+        );
+
+        let (r, s) = agent(&with(PM_CREDENTIALS, "LINEAR_API_KEY", "lin-2"));
+        let report = second.sync(&r, &s, |_| true).await.unwrap();
+        assert_eq!(report.sandboxes_to_restart(), ["linear-agent"]);
     }
 
     #[tokio::test]

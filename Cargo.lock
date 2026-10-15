@@ -4899,12 +4899,15 @@ dependencies = [
  "openshell-core",
  "openshell-sdk",
  "rand 0.9.4",
+ "serde",
+ "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.20",
  "tokio",
  "tonic",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

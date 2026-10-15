@@ -3,10 +3,12 @@
 
 //! What has been pushed to the gateway, so only changed keys are sent.
 //!
-//! State is in memory only. Values are never stored: each applied value is
-//! kept as a salted SHA-256 fingerprint, and the salt is random per process so
-//! a fingerprint is useless outside it. After a restart every Secret is pushed
-//! once more, which is a value-only update and harmless to running sandboxes.
+//! Values are never stored: each applied value is kept as a salted SHA-256
+//! fingerprint. The salt and fingerprints can be persisted (see
+//! [`PersistedState`]) so a restart of this controller recognizes values it
+//! already applied, and does not treat them as rotations that restart agents.
+//! Without persisted state every Secret is pushed once more after a restart,
+//! as a baseline that restarts nothing.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
@@ -69,6 +71,46 @@ pub struct SyncState {
     owners: HashMap<CredentialSlot, SecretRef>,
 }
 
+/// Fingerprints of applied values, kept across controller restarts.
+///
+/// Holds no values. It is stored in a Secret because the salt and the
+/// fingerprints together would let anyone who reads them test guesses.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PersistedState {
+    salt: String,
+    applied: Vec<PersistedApplied>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct PersistedApplied {
+    namespace: String,
+    secret: String,
+    provider: String,
+    workspace: String,
+    fingerprints: BTreeMap<String, String>,
+}
+
+fn to_hex(bytes: &[u8; 32]) -> String {
+    use std::fmt::Write as _;
+    bytes
+        .iter()
+        .fold(String::with_capacity(64), |mut hex, byte| {
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        })
+}
+
+fn from_hex(text: &str) -> Option<[u8; 32]> {
+    if text.len() != 64 {
+        return None;
+    }
+    let mut bytes = [0u8; 32];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(text.get(index * 2..index * 2 + 2)?, 16).ok()?;
+    }
+    Some(bytes)
+}
+
 impl Default for SyncState {
     fn default() -> Self {
         Self::new()
@@ -92,6 +134,81 @@ impl SyncState {
             applied: HashMap::new(),
             owners: HashMap::new(),
         }
+    }
+
+    /// Resume from persisted fingerprints. Entries that do not parse are
+    /// dropped, which only makes their next value a baseline.
+    pub fn from_persisted(persisted: PersistedState) -> Self {
+        let Some(salt) = from_hex(&persisted.salt) else {
+            return Self::new();
+        };
+        let applied = persisted
+            .applied
+            .into_iter()
+            .filter_map(|entry| {
+                let fingerprints = entry
+                    .fingerprints
+                    .into_iter()
+                    .map(|(key, fingerprint)| Some((key, from_hex(&fingerprint)?)))
+                    .collect::<Option<BTreeMap<_, _>>>()?;
+                Some((
+                    (
+                        SecretRef {
+                            namespace: entry.namespace,
+                            name: entry.secret,
+                        },
+                        entry.provider,
+                    ),
+                    Applied {
+                        workspace: entry.workspace,
+                        fingerprints,
+                    },
+                ))
+            })
+            .collect();
+        Self {
+            salt,
+            applied,
+            owners: HashMap::new(),
+        }
+    }
+
+    /// The fingerprints to persist. Claims are rebuilt from the watch.
+    pub fn to_persisted(&self) -> PersistedState {
+        let mut applied: Vec<PersistedApplied> = self
+            .applied
+            .iter()
+            .map(|((secret, provider), applied)| PersistedApplied {
+                namespace: secret.namespace.clone(),
+                secret: secret.name.clone(),
+                provider: provider.clone(),
+                workspace: applied.workspace.clone(),
+                fingerprints: applied
+                    .fingerprints
+                    .iter()
+                    .map(|(key, fingerprint)| (key.clone(), to_hex(fingerprint)))
+                    .collect(),
+            })
+            .collect();
+        applied.sort_by(|left, right| {
+            (&left.namespace, &left.secret, &left.provider).cmp(&(
+                &right.namespace,
+                &right.secret,
+                &right.provider,
+            ))
+        });
+        PersistedState {
+            salt: to_hex(&self.salt),
+            applied,
+        }
+    }
+
+    /// Whether `secret` has applied values to `provider` before, so a change
+    /// now is a rotation rather than a baseline.
+    pub fn has_applied(&self, secret: &SecretRef, workspace: &str, provider: &str) -> bool {
+        self.applied
+            .get(&(secret.clone(), provider.to_string()))
+            .is_some_and(|applied| applied.workspace == workspace)
     }
 
     fn fingerprint(&self, value: &str) -> [u8; 32] {
@@ -406,6 +523,37 @@ mod tests {
             changed_keys(&state.changed(&secret("second"), "default", "github", &v)),
             ["A"]
         );
+    }
+
+    #[test]
+    fn persisted_state_recognizes_applied_values_after_a_restart() {
+        let mut state = SyncState::new();
+        let secret = secret("a");
+        let applied = values(&[("TOKEN", "v1")]);
+        state.commit(&secret, "w", "p", &applied);
+        assert!(state.has_applied(&secret, "w", "p"));
+
+        let persisted = state.to_persisted();
+        let serialized = serde_json::to_string(&persisted).unwrap();
+        assert!(!serialized.contains("v1"), "values are never persisted");
+        let restarted = SyncState::from_persisted(serde_json::from_str(&serialized).unwrap());
+
+        assert!(restarted.has_applied(&secret, "w", "p"));
+        assert!(changed_keys(&restarted.changed(&secret, "w", "p", &applied)).is_empty());
+        assert_eq!(
+            changed_keys(&restarted.changed(&secret, "w", "p", &values(&[("TOKEN", "v2")]))),
+            ["TOKEN"]
+        );
+        assert!(!restarted.has_applied(&secret, "other", "p"));
+    }
+
+    #[test]
+    fn unreadable_persisted_state_starts_fresh() {
+        let restarted = SyncState::from_persisted(PersistedState {
+            salt: "not hex".to_string(),
+            applied: Vec::new(),
+        });
+        assert!(!restarted.has_applied(&secret("a"), "w", "p"));
     }
 
     #[test]

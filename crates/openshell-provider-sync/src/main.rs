@@ -10,7 +10,9 @@ use clap::Parser;
 use kube::runtime::events::Reporter;
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_provider_sync::controller::{self, Context, Options};
-use openshell_provider_sync::gateway::{GatewayUpdater, TokenFile};
+use openshell_provider_sync::gateway::{GatewayRestarter, GatewayUpdater, TokenFile};
+use openshell_provider_sync::state::SyncState;
+use openshell_provider_sync::state_store::{SecretStateStore, StateStore};
 use openshell_sdk::{AuthConfig, ClientConfig, OpenShellClient};
 use tracing_subscriber::EnvFilter;
 
@@ -63,6 +65,21 @@ struct Cli {
     #[arg(long)]
     no_events: bool,
 
+    /// Do not restart the agents attached to a provider whose values rotated.
+    /// They then keep running with connections opened on the old values.
+    #[arg(long, env = "OPENSHELL_PROVIDER_SYNC_NO_RESTART")]
+    no_restart: bool,
+
+    /// Secret, in this controller's own namespace, that keeps fingerprints of
+    /// applied values across restarts. Without it, the first sync after a
+    /// restart is a baseline that restarts no agents.
+    #[arg(long, env = "OPENSHELL_PROVIDER_SYNC_STATE_SECRET")]
+    state_secret: Option<String>,
+
+    /// Namespace of the state Secret; usually this pod's namespace.
+    #[arg(long, env = "POD_NAMESPACE", requires = "state_secret")]
+    state_namespace: Option<String>,
+
     /// Log as JSON lines.
     #[arg(long, env = "OPENSHELL_LOG_JSON")]
     log_json: bool,
@@ -99,6 +116,31 @@ async fn main() -> Result<()> {
         .into_diagnostic()
         .wrap_err("build Kubernetes client")?;
 
+    let mut context = Context::new(
+        Arc::new(GatewayUpdater::new(gateway.clone())),
+        cli.default_workspace.clone(),
+    );
+    if !cli.no_restart {
+        context = context.with_restarter(Arc::new(GatewayRestarter::new(gateway)));
+    }
+    if let Some(name) = &cli.state_secret {
+        let namespace = cli.state_namespace.clone().ok_or_else(|| {
+            miette::miette!("--state-secret needs --state-namespace or POD_NAMESPACE")
+        })?;
+        let store = SecretStateStore::new(kube_client.clone(), &namespace, name.clone());
+        let state = match store.load().await {
+            Ok(Some(persisted)) => SyncState::from_persisted(persisted),
+            Ok(None) => SyncState::new(),
+            Err(err) => {
+                // Starting fresh only costs a baseline sync that restarts
+                // nothing; refusing to start would stop all syncing.
+                tracing::warn!(error = %err, "could not load provider sync state; starting fresh");
+                SyncState::new()
+            }
+        };
+        context = context.with_state(state, Arc::new(store));
+    }
+
     let reporter = (!cli.no_events).then_some(Reporter {
         controller: cli.reporter,
         instance: cli.reporter_instance,
@@ -107,14 +149,13 @@ async fn main() -> Result<()> {
         gateway = %cli.gateway,
         namespace = cli.namespace.as_deref().unwrap_or("<all>"),
         default_workspace = %cli.default_workspace,
+        restart_agents = !cli.no_restart,
+        state_secret = cli.state_secret.as_deref().unwrap_or("<none>"),
         "starting provider sync"
     );
     controller::run(
         kube_client,
-        Context::new(
-            Arc::new(GatewayUpdater::new(gateway)),
-            cli.default_workspace,
-        ),
+        context,
         Options {
             namespace: cli.namespace,
             reporter,
