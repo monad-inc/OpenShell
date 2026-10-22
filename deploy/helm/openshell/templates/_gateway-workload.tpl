@@ -134,7 +134,7 @@ spec:
         - name: SSL_CERT_FILE
           value: /etc/openshell-tls/oidc-ca/ca.crt
         {{- end }}
-        {{- with .Values.server.otlp.headersSecret }}
+        {{- with (.Values.server.otlp | default dict).headersSecret }}
         {{- if .name }}
         # OTLP collector authentication. The gateway reads the standard
         # OpenTelemetry header variables; there is no `headers` field in the
