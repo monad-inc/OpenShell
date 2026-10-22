@@ -63,6 +63,7 @@ pub mod spiffe;
 pub mod telemetry;
 pub mod time;
 pub mod transport_errors;
+pub mod upload;
 
 pub use config::{
     AppArmorProfile, Config, GatewayAuditConfig, GatewayAuthConfig,

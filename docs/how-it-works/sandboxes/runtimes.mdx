@@ -224,6 +224,8 @@ Common options in `[openshell.drivers.vm]` are `default_image`, `bootstrap_image
 
 The driver looks up sandbox images in local Docker or Podman before pulling from a registry. On Linux with Podman, start `podman.socket` so the driver can find local images.
 
+Registry downloads must match the resolved image digest, including the selected platform for multi-platform images. A mismatch fails image preparation. After upgrading, the driver rebuilds older bootstrap and prepared-image cache entries on first use, so the first sandbox start can take longer.
+
 VM sandboxes have no network interface. All traffic flows through the OpenShell supervisor on the host. For networks that require a corporate proxy, the VM driver accepts the same `https_proxy` and `proxy_*` options as Podman. To reach a proxy on the gateway host, use `http://host.openshell.internal:<port>`.
 
 If the gateway is briefly unavailable while a VM starts, its supervisor retries the session connection. The sandbox stays in provisioning until the gateway accepts the session.
@@ -251,6 +253,8 @@ Only the OpenShell gateway and the Agent Sandbox controller should be able to ma
 | `supervisor_image` | `supervisor.image.*` | Override the supervisor image. |
 | `workspace_default_storage_size` | `server.workspaceDefaultStorageSize` | Default workspace PVC size. |
 | `workspace_storage_class` | `server.workspaceStorageClass` | `StorageClass` for workspace PVCs. Set this if the cluster has no default `StorageClass`. |
+| `allowed_pod_annotations` | `gatewayConfig["openshell.drivers.kubernetes"].allowed_pod_annotations` | Pod annotation keys that sandbox templates may set, as exact keys or `<domain>/*` wildcards. Empty (default) rejects all template annotations. Keys under `openshell.ai` and `agents.x-k8s.io` are reserved and can't be allowlisted. |
+| `allowed_pod_labels` | `gatewayConfig["openshell.drivers.kubernetes"].allowed_pod_labels` | Pod label keys that sandbox templates may set, in the same format as `allowed_pod_annotations`. Empty (default) rejects all template labels. Labels select pods for NetworkPolicy rules and Services, so only allow keys that no other rule in the sandbox namespace selects on. |
 | `sandbox_uid` / `sandbox_gid` | `server.sandboxUid` / `server.sandboxGid` | Sandbox pod UID and GID. Takes priority over OpenShift SCC namespace annotations. `sandbox_gid` defaults to the UID. |
 | `https_proxy` | `upstreamProxy.url` | Corporate proxy for sandbox egress. |
 | `no_proxy` | `upstreamProxy.noProxy` | Destinations that bypass the corporate proxy. |

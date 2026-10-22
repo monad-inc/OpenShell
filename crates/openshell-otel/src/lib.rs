@@ -167,15 +167,30 @@ pub(crate) fn validated_endpoint(endpoint: &str) -> Result<(&str, http::Uri), Se
 ///
 /// `opentelemetry-otlp` falls back to `ClientTlsConfig::new()` for an `https://`
 /// endpoint, and that config starts with an empty root store, so every server
-/// certificate is rejected. Supplying the config explicitly with the compiled-in
-/// public roots lets the gateway (and the compute-driver providers built through
-/// [`build_provider`]) reach a hosted OTLP collector. The roots travel with the
-/// binary rather than coming from the host trust store, so a gateway on a
-/// minimal image trusts the same anchors as one on a full distribution.
-/// Collectors fronted by a private CA are not reachable over `https://` yet.
+/// certificate is rejected. Supplying the config explicitly lets the gateway,
+/// the supervisor and the compute-driver providers built through
+/// [`build_provider`] reach a hosted OTLP collector.
+///
+/// The compiled-in public roots are always trusted, so a binary on a minimal
+/// image (or inside a sandbox image without a CA bundle) trusts the same
+/// anchors as one on a full distribution. The platform trust store
+/// (`SSL_CERT_FILE`, `SSL_CERT_DIR` or the OS bundle) is added when it holds
+/// any certificate, which is how a collector behind a private CA is trusted.
+/// It is skipped when empty, because tonic refuses to build a channel when
+/// native roots are requested and none load.
 pub(crate) fn tls_config_for(uri: &http::Uri) -> Option<ClientTlsConfig> {
-    (uri.scheme() == Some(&http::uri::Scheme::HTTPS))
-        .then(|| ClientTlsConfig::new().with_webpki_roots())
+    (uri.scheme() == Some(&http::uri::Scheme::HTTPS)).then(|| {
+        let config = ClientTlsConfig::new().with_webpki_roots();
+        if platform_roots_available() {
+            config.with_native_roots()
+        } else {
+            config
+        }
+    })
+}
+
+fn platform_roots_available() -> bool {
+    !rustls_native_certs::load_native_certs().certs.is_empty()
 }
 
 fn resource_attributes(config: &OtlpTraceConfig<'_>) -> Vec<KeyValue> {

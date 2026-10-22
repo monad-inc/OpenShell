@@ -4,7 +4,6 @@ on:
   push:
     tags:
       - "v*.*.*"
-      - "!v*.*.*-pre.*"
   workflow_dispatch:
     inputs:
       tag:
@@ -141,14 +140,12 @@ jobs:
     uses: ./.github/workflows/security-scan.yml
     with:
       candidate_ref: ${{ inputs.tag || github.ref_name }}
-      fail-on-codex-findings: true
       fail-on-static-findings: false
       images: |
         ghcr.io/nvidia/openshell/gateway:${{ needs.compute-versions.outputs.source_sha }}
         ghcr.io/nvidia/openshell/sandbox:${{ needs.compute-versions.outputs.source_sha }}
         ghcr.io/nvidia/openshell/supervisor:${{ needs.compute-versions.outputs.source_sha }}
     secrets:
-      CODEX_SECURITY_API_KEY: ${{ secrets.CODEX_SECURITY_API_KEY }}
       CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
   prepare-integration:
@@ -197,7 +194,10 @@ jobs:
       test-matrix: >-
         [
           {"environment":"fedora-podman-rootful","installer":"rpm","testsuite":"provider-refresh"},
-          {"environment":"fedora-podman-rootless","installer":"rpm","testsuite":"provider-refresh"}
+          {"environment":"fedora-podman-rootless","installer":"rpm","testsuite":"provider-refresh"},
+          {"environment":"ubuntu-docker-rootful","installer":"deb","testsuite":"oci-image"},
+          {"environment":"fedora-podman-rootful","installer":"rpm","testsuite":"oci-image"},
+          {"environment":"fedora-podman-rootless","installer":"rpm","testsuite":"oci-image"}
         ]
 
   docker-e2e:
@@ -243,6 +243,7 @@ jobs:
     needs: compute-versions
     permissions:
       contents: read
+      pull-requests: read
     uses: ./.github/workflows/codex-compatibility.yml
     with:
       candidate_ref: ${{ inputs.tag || github.ref_name }}

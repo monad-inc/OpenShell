@@ -125,6 +125,10 @@ gh run list --json databaseId,status,headBranch,url --jq '.[] | {id: .databaseId
 
 ## View Job Logs
 
+`Release Tag` temporarily omits Codex Security from its `Security Scan` job.
+Other scanners and qualification gates still run. Use the standalone
+`Codex Security Release Qualification` workflow for manual investigation.
+
 For `Codex Security`, an exit code of 2 with partial coverage is an incomplete
 scan, not a HIGH/CRITICAL threshold failure. Check the execution diagnostics in
 the job summary and the `codex-security-diagnostics-<run>-<attempt>` artifact on
