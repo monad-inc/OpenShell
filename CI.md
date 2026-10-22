@@ -72,14 +72,32 @@ Windows checks are not required for merging and do not run in merge queues.
 Main and manual runs also build release binaries, with `continue-on-error: true`
 so Windows failures do not fail the workflow.
 
-### Advisory release compatibility review
+### Advisory compatibility review
 
-`Codex Compatibility Review` runs alongside tagged release qualification. It
-reviews the cumulative diff from the previous reachable stable release to the
-exact candidate commit, using the same tag-derived patch/minor policy as the
-protobuf check. It reviews public Rust, Python, Go, and TypeScript SDKs, API
-behavior, CLI contracts, configuration, policy, Helm, and persisted state.
+`Codex Compatibility Review` runs in Branch Checks and alongside tagged release
+qualification. Branch checks compare the prospective merge tree with its target,
+using workflow-revision review tooling and the target's tag-derived train policy.
+Release qualification reviews the cumulative diff from the previous reachable
+stable release to the exact candidate commit, using the same tag-derived
+patch/minor policy as the protobuf check. It reviews public Rust, Python, Go,
+and TypeScript SDKs, API behavior, CLI contracts, configuration, policy, Helm,
+and persisted state.
 It does not replace Buf or change the release train's version.
+
+The agent inspects code first, then uses `gh` with a read-only GitHub token to
+look up the introducing PR and its discussion for each finding. Release reviews
+resolve introducing PRs from commit associations. Findings show `ACKED`
+only for explicit acceptance of the specific risk by the PR author or a verified
+maintainer. Missing context produces `UNKNOWN` when acceptance cannot be
+established; acknowledgement does not override release policy. Reports lead with
+the concrete change, consumer impact, action, and PR, with coverage details
+collapsed.
+
+Mirrored PR branch runs with findings post a fresh PR comment on every run,
+including reruns. Runs without findings post no comment. The publisher checks
+that the PR is still open at the reviewed head before commenting. Merge-group
+and manual branch runs retain reports without posting PR comments. The reviewer
+has read access; a separate branch job has permission to publish comments.
 
 The reviewer uses the Python Codex SDK (`openai-codex==0.160.0`) and its bundled
 runtime through the same NVIDIA endpoint, model, medium reasoning effort, and
@@ -87,12 +105,17 @@ runtime through the same NVIDIA endpoint, model, medium reasoning effort, and
 existing Nix devShell; the SDK is not an OpenShell package dependency.
 It runs on a GitHub-hosted runner with a read-only sandbox and reads a bare Git
 repository; candidate-side agent configuration and instructions are not loaded.
+Its permission profile keeps files read-only and routes shell network access
+through the Codex network proxy, allowing only `api.github.com` for GitHub
+lookups. Upstream proxy chaining and SOCKS access are disabled.
+Only the GitHub token and tool/certificate paths are passed to
+agent shell commands; the inference credential is excluded.
 It does not run candidate builds or tests. The review has a 30-minute execution
 limit inside a 40-minute job timeout.
 
 This rollout is report-only: findings and review failures cannot block
-publication. The job is independent of the required qualification dependency
-chain. Its summary distinguishes complete, incomplete, and failed execution
+merging or publication. The job is independent of the required qualification
+dependency chain. Its summary distinguishes complete, incomplete, and failed execution
 from the agent's compatibility assessment. Missing credentials, invalid
 baselines, source mismatches, malformed reports, and timeouts are not clean
 reviews. A completed review still does not prove that no breaks exist.
@@ -100,8 +123,9 @@ reviews. A completed review still does not prove that no breaks exist.
 Each run retains `report.json` and `report.md` for 90 days in
 `compatibility-review-run-<run-id>-attempt-<attempt>`. The report records both
 revisions, the train, tool/model metadata, coverage gaps, and actionable
-findings. Raw agent transcripts are not published. The qualification summary
-links this separate advisory evidence without waiting for it; compatibility
+findings. Raw agent transcripts and PR discussions are not published.
+The qualification summary links this separate advisory evidence without waiting
+for it; compatibility
 review remains missing from the blocking RFC profile during this rollout.
 
 After the workflow is available on the default branch, run a review without
@@ -201,9 +225,10 @@ scanners upload results directly:
   E2E test code are excluded. It runs nightly on `main`, remains manually
   dispatchable for diagnostics, uploads results to Code Scanning, and retains
   workflow artifacts.
-- `Codex Security Release Qualification` analyzes each `vX.Y.Z-pre.N`
-  candidate against the previous stable release. Every candidate in a release
-  train therefore rescans the cumulative stable-to-candidate diff. It calls
+- `Codex Security Release Qualification` can manually analyze a `vX.Y.Z-pre.N`
+  candidate against the previous stable release. It is temporarily excluded
+  from tagged-release qualification. Each scan reviews the cumulative
+  stable-to-candidate diff. It calls
   `https://inference-api.nvidia.com/v1` with
   `openai/openai/gpt-5.6-sol` at medium reasoning effort. The
   `CODEX_SECURITY_API_KEY` secret must contain an API key authorized for that
@@ -232,13 +257,13 @@ nix develop --command zizmor --offline --persona=regular --min-severity=high --n
 
 `Security Scan` (`.github/workflows/security-scan.yml`) calls CodeQL, Trivy,
 Cargo Deny, and Workflow Security Reports (Actionlint/Zizmor) in parallel for a
-release tag. It additionally calls Codex Security for `vX.Y.Z-pre.N` tags, which
-Codex compares with the previous stable release. Run the parent manually from
+release tag. Codex Security is temporarily excluded; its standalone workflow
+remains available for manual investigation. Run the parent manually from
 Actions or call it from another workflow. All applicable children analyze the
 candidate snapshot. Cargo Deny uses its existing NVIDIA self-hosted runner and
 CI container.
 
-Tagged releases treat Cargo Deny and Codex Security findings as failures of the
+Tagged releases treat Cargo Deny findings as failures of the
 currently implemented qualification profile. A profile failure prevents both
 pre-release and stable publication. CodeQL, Trivy, and Zizmor findings are
 temporarily informational for tagged releases: the existing findings were
@@ -255,7 +280,6 @@ webhook skips sending; an unset mention sends without a mention.
 ```shell
 gh workflow run security-scan.yml --ref main \
   -f candidate_ref=v0.1.1-pre.1 \
-  -F fail-on-codex-findings=false \
   -F fail-on-static-findings=false
 ```
 
@@ -277,15 +301,12 @@ jobs:
       security-events: write
     with:
       candidate_ref: ${{ needs.build.outputs.candidate_tag }}
-      stable_ref: v0.1.0 # Optional; otherwise resolved automatically.
       images: |
         ${{ needs.build.outputs.gateway_image }}
         ${{ needs.build.outputs.sandbox_image }}
       charts: ${{ needs.build.outputs.chart_ref }}
-      fail-on-codex-findings: true
       fail-on-static-findings: true
     secrets:
-      CODEX_SECURITY_API_KEY: ${{ secrets.CODEX_SECURITY_API_KEY }}
       CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 ```
 
@@ -305,29 +326,28 @@ The summary contains qualification results and policy coverage only; artifact
 identity belongs in the release manifest. The run ID and attempt distinguish
 reruns without overwriting earlier evidence.
 
-`CODEX_SECURITY_API_KEY` is required; `CACHIX_AUTH_TOKEN` is optional. The parent
-publishes SARIF, including Codex results for manual parent runs. Codex keeps its
-release-train category on `main`; CodeQL, Trivy, and workflow reports publish
-against the candidate tag and commit. Existing standalone triggers stay active.
+`CACHIX_AUTH_TOKEN` is optional. The parent publishes SARIF from CodeQL, Trivy,
+and workflow reports against the candidate tag and commit. Existing standalone
+triggers stay active.
 
-The parent fails on Codex findings when `fail-on-codex-findings` is `true` and
-on HIGH/CRITICAL findings from CodeQL, Trivy, and Zizmor when
-`fail-on-static-findings` is `true`. Both inputs default to `true`. Set either
-input to `false` to make only that finding class informational. Scanner setup,
+The parent fails on HIGH/CRITICAL findings from CodeQL, Trivy, and Zizmor when
+`fail-on-static-findings` is `true`, which is the default. Set it to `false`
+to make those findings informational. Scanner setup,
 execution, and report publication errors still fail. Reports are published
 before the finding threshold is enforced.
 
-Codex uses each finding's severity; CodeQL uses the rule's security score
+CodeQL uses the rule's security score
 (at least 7.0); Trivy uses `HIGH,CRITICAL`, including vulnerabilities without an
 upstream fix; Zizmor uses its High severity. Actionlint remains informational.
 Existing scanner exceptions still apply.
 
 Cargo Deny runs only `cargo deny check advisories` in the parent. It keeps its
-native failure behavior and configured exceptions regardless of either finding
+native failure behavior and configured exceptions regardless of the finding
 threshold input; it has no HIGH/CRITICAL filter. Its standalone runs still check
 all dependency policies.
 
-Codex scans the cumulative diff from `stable_ref` to `candidate_ref`. Both inputs
+The standalone Codex workflow scans the cumulative diff from `stable_ref` to
+`candidate_ref`. Both inputs
 are tag names, not arbitrary commit SHAs. Omit `stable_ref` to resolve the previous
 stable automatically; set `allow_full_bootstrap: true` to permit a full scan when
 no previous stable exists.
@@ -537,7 +557,7 @@ The bot's full administrator documentation is internal to NVIDIA. The only comma
 | `.github/workflows/dependency-review.yml` | Reports dependency changes when GitHub Dependency Graph is available; otherwise publishes a neutral warning. |
 | `.github/workflows/codeql.yml` | Runs nightly informational CodeQL analysis on `main` for Rust and the Go, Python, and TypeScript SDKs and retains SARIF artifacts. |
 | `.github/workflows/codex-security.yml` | Scans the cumulative diff from the previous stable release to each pre-release candidate and publishes train-scoped SARIF on `main`. |
-| `.github/workflows/codex-compatibility.yml` | Reviews cumulative tagged-release compatibility with Codex and retains advisory findings and coverage; it does not gate publication. |
+| `.github/workflows/codex-compatibility.yml` | Reviews branch and cumulative tagged-release compatibility with Codex and retains advisory findings, PR acknowledgements, and coverage; it does not gate merging or publication. |
 | `.github/workflows/trivy-changes.yml` | Blocks pull requests and merge groups that introduce new High or Critical Helm or Dockerfile misconfigurations. |
 | `.github/workflows/trivy-scan.yml` | Manual or reusable scan of supplied OCI image/chart references and deployment configuration. Findings are informational by default and can be configured to fail the workflow. |
 
@@ -548,7 +568,7 @@ These workflows run after merge to publish dev/tagged artifacts and verify them.
 | File | Role |
 |---|---|
 | `.github/workflows/release-dev.yml` | Publishes the rolling `dev` build on every push to `main`. Builds gateway, sandbox, and supervisor images and binaries, packages, wheels, and pushes the Helm chart as `oci://ghcr.io/nvidia/openshell/helm-chart:0.0.0-dev` (plus an immutable `0.0.0-dev.<sha>` pin). Also dispatchable manually. |
-| `.github/workflows/release-tag.yml` | Publishes tagged stable releases and manually dispatched pre-releases. Its automatic tag trigger excludes `-pre.*`. Both require the currently implemented qualification profile to pass before publication; the summary identifies the remaining RFC 0014 coverage. Failed candidates retain build artifacts and evidence in Actions storage. Source-SHA OCI images remain available as qualification inputs. |
+| `.github/workflows/release-tag.yml` | Publishes stable releases and pre-releases on tag pushes or manual dispatch. Release Auto-Tag dispatches it explicitly because its `GITHUB_TOKEN` pushes do not trigger workflows. Both require the currently implemented qualification profile to pass before publication; the summary identifies the remaining RFC 0014 coverage. Failed candidates retain build artifacts and evidence in Actions storage. Source-SHA OCI images remain available as qualification inputs. |
 | `.github/workflows/snap-package.yml` | Builds snap and component artifacts for Release Dev and Release Tag without Store credentials or publication. |
 | `.github/workflows/snap-publish.yml` | Uploads existing snap and component artifacts to the Store without rebuilding. Release Dev calls it directly for `latest/edge` after snap builds and requires it to succeed before creating the dev release. Release Tag calls it for `latest/stable` only for stable releases, after qualification and release assembly succeed. |
 | `.github/workflows/release-canary.yml` | Smoke-tests published dev artifacts in the `macos`, `ubuntu-deb`, `ubuntu-snap-system-docker`, `fedora`, and `kubernetes` (kind + Helm) jobs. Each job reaches its gateway and creates, exercises, and deletes a sandbox. The `ubuntu-snap-system-docker` job verifies a compatible system Docker lifecycle, while `ubuntu-snap-docker-preflight` tests fail-fast behavior when Docker is absent or supplied by the Docker snap. The positive snap lane also runs a local policy containment check with the packaged prover. It runs automatically after `Release Dev` succeeds and supports manual dispatch (`gh workflow run release-canary.yml --ref <branch>`). See the `test-release-canary` skill for the playbook and local kind reproduction. |

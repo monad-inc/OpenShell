@@ -27,6 +27,7 @@ pub use endpoint_status::{
 use crate::ServerState;
 use crate::auth::principal::Principal;
 use crate::auth::workspace_authz::{MinWorkspaceRole, require_platform_admin};
+use crate::compute::MutationScope;
 use crate::pagination::Pagination;
 use crate::persistence::{
     DraftChunkRecord, ObjectId, ObjectListQuery, ObjectName, ObjectType, ObjectWorkspace,
@@ -818,15 +819,12 @@ fn validation_result_for_agent_proposal(
             return "validation unavailable".to_string();
         }
     };
-    // If the baseline prover run fails (e.g. the current policy uses a shape
-    // the prover hasn't caught up to yet), fall back to an empty baseline so
-    // every merged finding surfaces as new. Safer to over-warn than miss a
-    // real regression introduced by the proposal.
+    // A delta requires conclusive results for both policies.
     let base_findings = match run_prover_findings(&current_policy, credentials) {
         Ok(findings) => findings,
         Err(error) => {
-            warn!(error = %error, "prover baseline run failed; treating baseline as empty");
-            Vec::new()
+            warn!(error = %error, "prover validation unavailable for baseline policy");
+            return "validation unavailable".to_string();
         }
     };
 
@@ -886,8 +884,8 @@ fn proposal_prover_result(
     let base_findings = match run_prover_findings(current_effective_policy, credentials) {
         Ok(findings) => findings,
         Err(error) => {
-            warn!(error = %error, "prover baseline run failed; treating baseline as empty");
-            Vec::new()
+            warn!(error = %error, "prover validation unavailable for baseline policy");
+            return "validation unavailable".to_string();
         }
     };
     let new_findings = finding_delta(&base_findings, &candidate_findings);
@@ -914,7 +912,7 @@ fn compute_proposal_review_token(
     credentials: &CredentialSet,
 ) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"openshell-proposal-evaluator-v2\0");
+    hasher.update(b"openshell-proposal-evaluator-v3\0");
     hasher.update(rule_name.as_bytes());
     hasher.update(canonical_rule_bytes(rule));
     hasher.update(deterministic_policy_hash(current_effective_policy).as_bytes());
@@ -952,7 +950,7 @@ fn compute_failed_proposal_evaluation_hash(
     application_error: &str,
 ) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"openshell-proposal-evaluator-v2-failed\0");
+    hasher.update(b"openshell-proposal-evaluator-v3-failed\0");
     hasher.update(rule_name.as_bytes());
     hasher.update(canonical_rule_bytes(rule));
     hasher.update(deterministic_policy_hash(current_effective_policy).as_bytes());
@@ -1156,7 +1154,7 @@ fn run_prover_findings(
     let registry =
         load_embedded_binary_registry().map_err(|e| format!("load registry failed: {e}"))?;
     let model = build_model(prover_policy, credentials.clone(), registry);
-    Ok(run_all_queries(&model))
+    run_all_queries(&model).map_err(|e| format!("prover analysis failed: {e}"))
 }
 
 /// Build a `CredentialSet` for the sandbox by walking its attached providers.
@@ -1463,7 +1461,7 @@ fn background_pending_refreshes() -> &'static std::sync::Mutex<HashMap<String, b
 }
 
 /// Refresh pending proposals off the request path. Used where the policy
-/// change runs under the gateway-wide sandbox sync guard (`UpdateConfig`) or
+/// change runs under the sandbox's mutation guard (`UpdateConfig`) or
 /// is driven by the sandbox itself (auto-approval), so the refresh neither
 /// extends the guard nor adds agent-controlled work to the response. At most
 /// one refresh runs per sandbox; changes that arrive meanwhile coalesce into
@@ -3804,6 +3802,50 @@ pub(super) async fn handle_get_gateway_config(
     }))
 }
 
+/// Resolve the effective create-time policy without exporting credential state.
+/// Provider refresh and secret delivery remain in the supervisor session.
+pub(super) async fn resolve_sandbox_create_runtime_inputs(
+    state: &ServerState,
+    sandbox: &Sandbox,
+) -> Result<crate::compute::SandboxCreateRuntimeInputs, Status> {
+    let sandbox_id = sandbox.object_id();
+    let workspace = sandbox.object_workspace();
+    let provider_names = sandbox
+        .spec
+        .as_ref()
+        .map(|spec| spec.providers.as_slice())
+        .unwrap_or_default();
+    let provider_profile_catalog = state
+        .provider_profile_sources
+        .snapshot_catalog(state.store.as_ref(), workspace)
+        .await?;
+    let provider_records = super::provider::load_provider_environment_records(
+        state.store.as_ref(),
+        workspace,
+        provider_names,
+    )
+    .await?;
+    let (effective_policy, _) = current_effective_policy_from_records(
+        state,
+        &provider_profile_catalog,
+        sandbox,
+        sandbox_id,
+        &provider_records,
+    )
+    .await?;
+    let policy_credential_bindings =
+        policy_static_credential_endpoint_bindings(Some(&effective_policy))?;
+    validate_policy_credential_binding_context(
+        &provider_profile_catalog,
+        &provider_records,
+        &effective_policy,
+        &policy_credential_bindings,
+    )?;
+    Ok(crate::compute::SandboxCreateRuntimeInputs::new(
+        effective_policy,
+    ))
+}
+
 pub(super) async fn handle_get_sandbox_provider_environment(
     state: &Arc<ServerState>,
     request: Request<GetSandboxProviderEnvironmentRequest>,
@@ -3813,15 +3855,11 @@ pub(super) async fn handle_get_sandbox_provider_environment(
     let supports_stable_placeholder_environment_keys = request
         .get_ref()
         .supports_stable_placeholder_environment_keys;
-    crate::auth::guard::enforce_sandbox_scope(&request, &sandbox_id)?;
+    let principal = crate::auth::guard::enforce_sandbox_scope(&request, &sandbox_id)?;
     drop(request);
 
-    let sandbox = state
-        .store
-        .get_message::<Sandbox>(&sandbox_id)
-        .await
-        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
-        .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    let sandbox =
+        super::sandbox::fetch_and_authorize_sandbox(state, &principal, &sandbox_id).await?;
     let environment = load_sandbox_provider_environment(
         state,
         &sandbox,
@@ -4168,10 +4206,13 @@ async fn handle_update_config_inner(
                 "annotations are only supported for sandbox-scoped updates",
             ));
         }
-        let _settings_guard = state.settings_mutex.lock().await;
-        let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
-            super::persistence_error_to_status(error, "acquire policy mutation lock")
-        })?;
+        let _mutation_guard = state
+            .compute
+            .mutation_guard(MutationScope::Global)
+            .await
+            .map_err(|error| {
+                super::persistence_error_to_status(error, "acquire policy mutation lock")
+            })?;
 
         if has_merge_ops {
             return Err(Status::invalid_argument(
@@ -4322,7 +4363,8 @@ async fn handle_update_config_inner(
         }
 
         // Deleting global policy changes the report's effective configuration.
-        // Keep settings -> sandbox lock order for all global policy mutations.
+        // The global guard taken at the top of this branch excludes every
+        // sandbox-scoped settings, policy, and report mutation.
         let mut global_settings = load_global_settings(state.store.as_ref()).await?;
         let provider_composition_was_enabled =
             provider_policy_composition_enabled_in(&global_settings)?;
@@ -4396,10 +4438,13 @@ async fn handle_update_config_inner(
     let mut response_annotations = sandbox_metadata_annotations(&sandbox);
 
     if has_setting {
-        let _settings_guard = state.settings_mutex.lock().await;
-        let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
-            super::persistence_error_to_status(error, "acquire policy mutation lock")
-        })?;
+        let _mutation_guard = state
+            .compute
+            .mutation_guard(MutationScope::sandbox(&workspace, &sandbox_id))
+            .await
+            .map_err(|error| {
+                super::persistence_error_to_status(error, "acquire policy mutation lock")
+            })?;
 
         if key == POLICY_SETTING_KEY {
             return Err(Status::invalid_argument(
@@ -4420,6 +4465,7 @@ async fn handle_update_config_inner(
             let mut sandbox_settings =
                 load_sandbox_settings(state.store.as_ref(), &workspace, sandbox.object_name())
                     .await?;
+            ensure_sandbox_keeps_name(state, &sandbox).await?;
             let removed_value = sandbox_settings.settings.remove(key);
             let removed = removed_value.is_some();
             if removed {
@@ -4485,6 +4531,7 @@ async fn handle_update_config_inner(
 
         let mut sandbox_settings =
             load_sandbox_settings(state.store.as_ref(), &workspace, sandbox.object_name()).await?;
+        ensure_sandbox_keeps_name(state, &sandbox).await?;
         let audit_before = sandbox_settings.settings.get(key).cloned();
         let audit_after = stored.clone();
         let changed = upsert_setting_value(&mut sandbox_settings.settings, key, stored);
@@ -4537,9 +4584,13 @@ async fn handle_update_config_inner(
         ));
     }
 
-    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
-        super::persistence_error_to_status(error, "acquire policy mutation lock")
-    })?;
+    let _mutation_guard = state
+        .compute
+        .mutation_guard(MutationScope::sandbox(&workspace, &sandbox_id))
+        .await
+        .map_err(|error| {
+            super::persistence_error_to_status(error, "acquire policy mutation lock")
+        })?;
     if has_merge_ops {
         let global_settings = load_global_settings(state.store.as_ref()).await?;
         if global_settings.settings.contains_key(POLICY_SETTING_KEY) {
@@ -5111,9 +5162,16 @@ pub(super) async fn handle_report_sandbox_configuration(
     if reported == ConfigurationAdmissionState::Unspecified {
         return Err(Status::invalid_argument("admission state is required"));
     }
-    let _guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
-        super::persistence_error_to_status(error, "acquire configuration admission lock")
-    })?;
+    let Some(_mutation_guard) = state
+        .compute
+        .sandbox_mutation_guard_by_id(&sandbox_id)
+        .await
+        .map_err(|error| {
+            super::persistence_error_to_status(error, "acquire configuration admission lock")
+        })?
+    else {
+        return Err(Status::not_found("sandbox not found"));
+    };
     let mut sandbox = state
         .store
         .get_message::<Sandbox>(&sandbox_id)
@@ -5313,9 +5371,16 @@ pub(super) async fn handle_report_policy_status(
             .supersede_older_policies(&req.sandbox_id, version)
             .await;
 
-        let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
-            super::persistence_error_to_status(error, "acquire policy mutation lock")
-        })?;
+        let Some(_mutation_guard) = state
+            .compute
+            .sandbox_mutation_guard_by_id(&req.sandbox_id)
+            .await
+            .map_err(|error| {
+                super::persistence_error_to_status(error, "acquire policy mutation lock")
+            })?
+        else {
+            return Err(Status::not_found("sandbox not found"));
+        };
         let sandbox = state
             .store
             .get_message::<Sandbox>(&req.sandbox_id)
@@ -7948,17 +8013,17 @@ async fn sandbox_policy_merge_validation_data_with_catalog(
 ) -> Result<SandboxPolicyMergeValidationData, Status> {
     let global_settings = load_global_settings(state.store.as_ref()).await?;
     let composition_enabled = provider_policy_composition_enabled_in(&global_settings)?;
-    let ProviderPolicyContext {
-        layers,
-        credentialed_scopes,
-        endpointless_provider_names,
-    } = provider_policy_context_with_catalog(
+    let records = super::provider::load_provider_environment_records(
         state.store.as_ref(),
-        catalog,
         workspace,
         provider_names,
     )
     .await?;
+    let ProviderPolicyContext {
+        layers,
+        credentialed_scopes,
+        endpointless_provider_names,
+    } = provider_policy_context_from_records(catalog, &records);
     let provider_layers = if composition_enabled {
         layers
     } else {
@@ -7969,12 +8034,6 @@ async fn sandbox_policy_merge_validation_data_with_catalog(
         provider_layer_count = provider_layers.len(),
         "Composed provider policy and credential context for merge validation"
     );
-    let records = super::provider::load_provider_environment_records(
-        state.store.as_ref(),
-        workspace,
-        provider_names,
-    )
-    .await?;
     Ok(SandboxPolicyMergeValidationData {
         provider_layers,
         catalog: catalog.clone(),
@@ -8389,6 +8448,30 @@ pub(super) async fn save_global_settings(
     .await
 }
 
+/// Sandbox settings are keyed by name, and a sandbox's mutation guard does not
+/// exclude a new sandbox that takes the name once this one is deleted. Called
+/// after loading the settings: sandbox IDs are never reused, so if the sandbox
+/// still exists under its name, the loaded settings are its own.
+async fn ensure_sandbox_keeps_name(state: &ServerState, sandbox: &Sandbox) -> Result<(), Status> {
+    let current = state
+        .store
+        .get_message::<Sandbox>(sandbox.object_id())
+        .await
+        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?;
+    match current {
+        Some(current)
+            if current.object_name() == sandbox.object_name()
+                && current.object_workspace() == sandbox.object_workspace() =>
+        {
+            Ok(())
+        }
+        _ => Err(Status::not_found(format!(
+            "sandbox '{}' was deleted",
+            sandbox.object_name()
+        ))),
+    }
+}
+
 pub(super) async fn load_sandbox_settings(
     store: &Store,
     workspace: &str,
@@ -8427,6 +8510,7 @@ async fn load_settings_record(
         let mut settings = serde_json::from_slice::<StoredSettings>(&record.payload)
             .map_err(|e| Status::internal(format!("decode settings payload failed: {e}")))?;
         settings.resource_version = record.resource_version;
+        settings.record_id = Some(record.id.clone());
         for key in settings.settings.keys() {
             settings
                 .change_clocks
@@ -8477,6 +8561,17 @@ async fn save_settings_record(
             .await
             .map_err(|e| Status::internal(format!("fetch settings for CAS failed: {e}")))?
             .ok_or_else(|| Status::not_found("settings disappeared since load"))?;
+        // Settings are keyed by name. A row recreated under the same name, for
+        // a sandbox that reused it, restarts at the loaded resource version.
+        if settings
+            .record_id
+            .as_deref()
+            .is_some_and(|loaded| loaded != existing.id)
+        {
+            return Err(Status::aborted(
+                "settings were replaced concurrently; please retry",
+            ));
+        }
 
         (
             existing.id,
@@ -8890,8 +8985,14 @@ mod tests {
         // A duplicate report racing the initial registration must share one
         // persisted transition; either may acquire the lifecycle fence first.
         let (first, duplicate) = tokio::join!(
-            handle_report_sandbox_configuration(&state, request()),
-            handle_report_sandbox_configuration(&state, request()),
+            crate::persistence::lock_order::branch(handle_report_sandbox_configuration(
+                &state,
+                request()
+            )),
+            crate::persistence::lock_order::branch(handle_report_sandbox_configuration(
+                &state,
+                request()
+            )),
         );
         first.unwrap();
         duplicate.unwrap();
@@ -9422,6 +9523,18 @@ mod tests {
             .expect("test global policy must be present");
         openshell_core::policy_identity::stamp_global_token_grant_owners(&mut policy);
         policy
+    }
+
+    #[tokio::test]
+    async fn create_runtime_inputs_preserve_base_policy_without_credential_sink() {
+        let state = test_server_state().await;
+        let policy = openshell_policy::restrictive_default_policy();
+        let sandbox = test_sandbox("create-policy", "create-policy", policy.clone(), Vec::new());
+        let inputs = resolve_sandbox_create_runtime_inputs(state.as_ref(), &sandbox)
+            .await
+            .expect("driver-independent effective policy");
+        assert_eq!(inputs.effective_policy, Some(policy));
+        assert!(inputs.launch_authentication.is_none());
     }
 
     #[tokio::test]
@@ -18608,6 +18721,262 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn sibling_endpoint_proposals_do_not_hide_new_findings_from_auto_approval() {
+        use openshell_core::proto::{L7Allow, NetworkEnforcementMode};
+
+        for (first, second, expected) in [
+            ("GET", "*", "credential_reach_expansion"),
+            ("POST", "DELETE", "capability_expansion"),
+        ] {
+            for reverse in [false, true] {
+                let state = test_server_state().await;
+                state
+                    .store
+                    .put_message(&test_provider("github-pat", "github"))
+                    .await
+                    .unwrap();
+                let endpoint = |method: &str| NetworkEndpoint {
+                    host: "api.github.com".to_string(),
+                    port: 443,
+                    protocol: "rest".to_string(),
+                    enforcement: NetworkEnforcementMode::Enforce as i32,
+                    rules: vec![L7Rule {
+                        allow: Some(L7Allow {
+                            method: method.to_string(),
+                            path: "/**".to_string(),
+                            ..Default::default()
+                        }),
+                    }],
+                    ..Default::default()
+                };
+                let mut rule = NetworkPolicyRule {
+                    name: "github_split".to_string(),
+                    endpoints: vec![endpoint(first), endpoint(second)],
+                    binaries: vec![NetworkBinary {
+                        path: "/usr/bin/curl".to_string(),
+                    }],
+                };
+                let mut base = ProtoSandboxPolicy::default();
+                if first == "POST" {
+                    base.network_policies.insert(
+                        "existing".to_string(),
+                        NetworkPolicyRule {
+                            name: "existing".to_string(),
+                            endpoints: vec![endpoint("POST")],
+                            binaries: rule.binaries.clone(),
+                        },
+                    );
+                }
+                if reverse {
+                    rule.endpoints.reverse();
+                }
+                let sandbox = test_sandbox(
+                    "sb-siblings",
+                    "siblings",
+                    base,
+                    vec!["github-pat".to_string()],
+                );
+                state.store.put_message(&sandbox).await.unwrap();
+                seed_sandbox_approval_mode(&state, "siblings", "auto").await;
+                let response = handle_submit_policy_analysis(
+                    &state,
+                    with_sandbox(
+                        Request::new(SubmitPolicyAnalysisRequest {
+                            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                                "default",
+                            )),
+                            name: "siblings".to_string(),
+                            analysis_mode: "agent_authored".to_string(),
+                            proposed_chunks: vec![PolicyChunk {
+                                rule_name: rule.name.clone(),
+                                proposed_rule: Some(rule),
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        }),
+                        "sb-siblings",
+                    ),
+                )
+                .await
+                .unwrap()
+                .into_inner();
+                assert_eq!(
+                    response.accepted_chunks, 1,
+                    "{:?}",
+                    response.rejection_reasons
+                );
+                let chunk = state
+                    .store
+                    .get_draft_chunk(&response.accepted_chunk_ids[0])
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    chunk.application_error.is_empty(),
+                    "{}",
+                    chunk.application_error
+                );
+                assert!(
+                    current_draft_chunk_security_notes(&chunk)
+                        .unwrap()
+                        .is_empty()
+                );
+                assert!(
+                    chunk.validation_result.contains(expected),
+                    "{}",
+                    chunk.validation_result
+                );
+                if first == "POST" {
+                    assert!(chunk.validation_result.contains("DELETE"));
+                }
+                assert_eq!(chunk.status, "pending");
+                let active = current_base_policy_for_sandbox(state.store.as_ref(), &sandbox)
+                    .await
+                    .unwrap();
+                assert!(!active.network_policies.contains_key("github_split"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_approval_refreshes_legacy_verdict_and_blocks_unavailable_validation() {
+        let state = test_server_state().await;
+        let sandbox = test_sandbox(
+            "sb-verdict-refresh",
+            "verdict-refresh",
+            ProtoSandboxPolicy::default(),
+            vec![],
+        );
+        state.store.put_message(&sandbox).await.unwrap();
+        let response = handle_submit_policy_analysis(
+            &state,
+            with_sandbox(
+                Request::new(SubmitPolicyAnalysisRequest {
+                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                    name: "verdict-refresh".to_string(),
+                    analysis_mode: "agent_authored".to_string(),
+                    proposed_chunks: vec![PolicyChunk {
+                        rule_name: "example".to_string(),
+                        proposed_rule: Some(NetworkPolicyRule {
+                            name: "example".to_string(),
+                            endpoints: vec![NetworkEndpoint {
+                                host: "example.com".to_string(),
+                                port: 443,
+                                ..Default::default()
+                            }],
+                            binaries: vec![NetworkBinary {
+                                path: "/usr/bin/curl".to_string(),
+                            }],
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                "sb-verdict-refresh",
+            ),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let chunk_id = &response.accepted_chunk_ids[0];
+        let mut chunk = state
+            .store
+            .get_draft_chunk(chunk_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let evaluation =
+            evaluate_stored_chunk_against_live_inputs(&state, "default", &sandbox, &chunk, None)
+                .await
+                .unwrap();
+
+        // Reconstruct a v2 token for unchanged inputs and no attached credentials.
+        let mut legacy = Sha256::new();
+        legacy.update(b"openshell-proposal-evaluator-v2\0");
+        legacy.update(evaluation.rule_name.as_bytes());
+        legacy.update(canonical_rule_bytes(&evaluation.rule));
+        legacy.update(evaluation.current_hash().as_bytes());
+        legacy.update(evaluation.candidate_hash().as_bytes());
+        chunk.review_token = hex::encode(legacy.finalize());
+        chunk.validation_result = "prover: no new findings".to_string();
+        assert!(
+            state
+                .store
+                .update_draft_chunk_evaluation(&chunk)
+                .await
+                .unwrap()
+        );
+        let principal = audit_test_principal();
+        let context = || AutoApproveChunkContext {
+            sandbox: &sandbox,
+            workspace: "default",
+            source: "agent_authored",
+            resolved_from: "sandbox",
+            principal: &principal,
+        };
+        let error = auto_approve_chunk(&state, chunk_id, context())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        let mut refreshed = state
+            .store
+            .get_draft_chunk(chunk_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(refreshed.review_token, chunk.review_token);
+        assert_eq!(refreshed.review_token, evaluation.review_token);
+        assert_eq!(refreshed.status, "pending");
+
+        refreshed.validation_result = "validation unavailable".to_string();
+        assert!(
+            state
+                .store
+                .update_draft_chunk_evaluation(&refreshed)
+                .await
+                .unwrap()
+        );
+        let error = auto_approve_chunk(&state, chunk_id, context())
+            .await
+            .unwrap_err();
+        assert!(error.message().contains("prover validation unavailable"));
+        let blocked = state
+            .store
+            .get_draft_chunk(chunk_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(blocked.status, "pending");
+        assert!(
+            blocked
+                .application_error
+                .contains("prover validation unavailable")
+        );
+        assert!(
+            current_base_policy_for_sandbox(state.store.as_ref(), &sandbox)
+                .await
+                .unwrap()
+                .network_policies
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn proposal_prover_errors_in_either_policy_block_the_delta() {
+        let valid = ProtoSandboxPolicy::default();
+        let invalid = ProtoSandboxPolicy {
+            version: u32::MAX,
+            ..Default::default()
+        };
+        for (base, candidate) in [(&valid, &invalid), (&invalid, &valid)] {
+            assert_eq!(
+                proposal_prover_result(base, candidate, &CredentialSet::default()),
+                "validation unavailable"
+            );
+        }
+    }
+
     /// `protocol: rest, access: full` on a host where the binary had no
     /// prior credentialed reach: the prover emits
     /// `credential_reach_expansion`. (The per-method `capability_expansion`
@@ -22877,6 +23246,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sandbox_setting_update_does_not_wait_for_unrelated_sandbox_guard() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-setting-target",
+                "setting-target",
+                ProtoSandboxPolicy::default(),
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+        let unrelated_guard = crate::persistence::lock_order::branch(
+            state
+                .compute
+                .mutation_guard(MutationScope::sandbox("default", "sb-setting-unrelated")),
+        )
+        .await
+        .unwrap();
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            handle_update_config(
+                &state,
+                authed_request(UpdateConfigRequest {
+                    sandbox: "setting-target".to_string(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector(
+                        "default".to_string(),
+                    )),
+                    setting_key: "ocsf_json_enabled".to_string(),
+                    setting_value: Some(SettingValue {
+                        value: Some(setting_value::Value::BoolValue(true)),
+                    }),
+                    ..Default::default()
+                }),
+            ),
+        )
+        .await
+        .expect("a sandbox setting update should not wait for an unrelated sandbox")
+        .expect("sandbox setting update succeeds");
+        let settings = load_sandbox_settings(state.store.as_ref(), "default", "setting-target")
+            .await
+            .unwrap();
+        assert!(settings.settings.contains_key("ocsf_json_enabled"));
+        drop(unrelated_guard);
+    }
+
+    #[tokio::test]
     async fn update_config_global_policy_rejects_reserved_provider_key() {
         let state = test_server_state().await;
 
@@ -23624,6 +24041,87 @@ mod tests {
             loaded.settings.get(settings::PROPOSAL_APPROVAL_MODE_KEY),
             Some(&StoredSettingValue::String("auto".to_string()))
         );
+    }
+
+    #[tokio::test]
+    async fn sandbox_settings_save_aborts_when_row_was_recreated() {
+        let store = test_store().await;
+        let sandbox_name = "reused-name";
+        let mut original = StoredSettings::default();
+        original
+            .settings
+            .insert("a_key".to_string(), StoredSettingValue::Bool(true));
+        save_sandbox_settings(&store, "default", sandbox_name, &original)
+            .await
+            .unwrap();
+        let mut loaded = load_sandbox_settings(&store, "default", sandbox_name)
+            .await
+            .unwrap();
+
+        // A new sandbox reuses the name: its settings row restarts at the
+        // version the stale load saw.
+        store
+            .delete_by_name(SANDBOX_SETTINGS_OBJECT_TYPE, "default", sandbox_name)
+            .await
+            .unwrap();
+        let mut replacement = StoredSettings::default();
+        replacement
+            .settings
+            .insert("c_key".to_string(), StoredSettingValue::Bool(true));
+        save_sandbox_settings(&store, "default", sandbox_name, &replacement)
+            .await
+            .unwrap();
+        let recreated = load_sandbox_settings(&store, "default", sandbox_name)
+            .await
+            .unwrap();
+        assert_eq!(recreated.resource_version, loaded.resource_version);
+
+        loaded
+            .settings
+            .insert("r_key".to_string(), StoredSettingValue::Bool(true));
+        let error = save_sandbox_settings(&store, "default", sandbox_name, &loaded)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::Aborted);
+        let current = load_sandbox_settings(&store, "default", sandbox_name)
+            .await
+            .unwrap();
+        assert!(current.settings.contains_key("c_key"));
+        assert!(!current.settings.contains_key("r_key"));
+    }
+
+    #[tokio::test]
+    async fn sandbox_settings_owner_check_rejects_a_reused_name() {
+        let state = test_server_state().await;
+        let original = test_sandbox(
+            "sb-original",
+            "reused-name",
+            ProtoSandboxPolicy::default(),
+            Vec::new(),
+        );
+        state.store.put_message(&original).await.unwrap();
+        ensure_sandbox_keeps_name(&state, &original).await.unwrap();
+
+        state
+            .store
+            .delete(Sandbox::object_type(), original.object_id())
+            .await
+            .unwrap();
+        let replacement = test_sandbox(
+            "sb-replacement",
+            "reused-name",
+            ProtoSandboxPolicy::default(),
+            Vec::new(),
+        );
+        state.store.put_message(&replacement).await.unwrap();
+
+        let error = ensure_sandbox_keeps_name(&state, &original)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::NotFound);
+        ensure_sandbox_keeps_name(&state, &replacement)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -25644,6 +26142,23 @@ mod tests {
             err.code(),
             Code::NotFound,
             "handle_get_sandbox_config must return NotFound, not PermissionDenied"
+        );
+
+        // --- handle_get_sandbox_provider_environment ---
+        let err = handle_get_sandbox_provider_environment(
+            &state,
+            non_member_request(GetSandboxProviderEnvironmentRequest {
+                sandbox_id: "sandbox-other".into(),
+                supports_static_credential_bindings: true,
+                supports_stable_placeholder_environment_keys: true,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::NotFound,
+            "handle_get_sandbox_provider_environment must hide cross-workspace sandboxes"
         );
 
         // --- handle_get_sandbox_logs ---

@@ -12,7 +12,7 @@ use std::sync::atomic::AtomicBool;
 use clap::{Parser, ValueEnum};
 use miette::{IntoDiagnostic, Result};
 use openshell_isolation_interface::contract::BackendDescriptor;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::{Layer as _, layer::SubscriberExt as _, util::SubscriberInitExt as _};
@@ -173,14 +173,16 @@ fn arm_parent_liveness(enabled: bool) -> Result<()> {
     Ok(())
 }
 
-fn backend_descriptor(args: &Args) -> Result<BackendDescriptor> {
+fn backend_descriptor(args: &Args, admitted_backend: Option<&str>) -> Result<BackendDescriptor> {
     let path = args.backend_descriptor_file.as_deref().ok_or_else(|| {
         miette::miette!("--backend-descriptor-file is required for --role=isolation-backend")
     })?;
     let payload = std::fs::read(path)
         .map_err(|error| miette::miette!("read backend descriptor {}: {error}", path.display()))?;
     Ok(BackendDescriptor {
-        backend_name: openshell_sandbox_backend::BACKEND_NAME.to_string(),
+        backend_name: admitted_backend
+            .unwrap_or(openshell_sandbox_backend::BACKEND_NAME)
+            .to_string(),
         payload,
     })
 }
@@ -295,8 +297,10 @@ fn main() -> Result<()> {
     validate_role_arguments(&args)?;
     arm_parent_liveness(args.parent_liveness_stdin)?;
     validate_main_exit_marker(args.main_exit_marker.as_deref())?;
+    let admitted_isolation_backend =
+        std::env::var(openshell_core::sandbox_env::ADMITTED_ISOLATION_BACKEND).ok();
     let isolation_inputs = if args.role == SupervisorRole::IsolationBackend {
-        let descriptor = backend_descriptor(&args)?;
+        let descriptor = backend_descriptor(&args, admitted_isolation_backend.as_deref())?;
         let auth = auth_bundle(&args)?;
         // Install the driver-provisioned session before starting log push or
         // any other gateway client. `run_sandbox` obtains the same Sandbox
@@ -450,6 +454,9 @@ fn main() -> Result<()> {
                     args.main_exit_marker,
                 ))
                 .await;
+                // Map the status first: a workspace validation failure logs
+                // its cause, and that line should be pushed with the rest.
+                let result = supervisor_exit(result);
                 // `process::exit` follows: push what is still queued first, so
                 // the last lines (often an exporting agent's final result)
                 // reach the gateway.
@@ -495,6 +502,29 @@ fn otlp_span_filter(log_level: &str) -> EnvFilter {
         .unwrap_or(LevelFilter::INFO)
         .max(LevelFilter::INFO);
     EnvFilter::new(format!("info,openshell={level}"))
+}
+
+/// Choose the supervisor's exit status for a sandbox run.
+///
+/// The reserved status tells the compute driver that the sandbox rejected the
+/// image working directory. After the workload exits, the supervisor exits
+/// with the workload's status, so a workload that itself exits with the
+/// reserved status is reported as 1 instead. The gateway receives the
+/// workload's exact status separately.
+fn supervisor_exit(result: Result<i32>) -> Result<i32> {
+    use openshell_core::driver_utils::SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED;
+    match result {
+        Ok(SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED) => Ok(1),
+        Err(error)
+            if error
+                .downcast_ref::<openshell_supervisor::WorkspaceValidationFailed>()
+                .is_some() =>
+        {
+            error!(error = ?error, "Image workspace validation failed");
+            Ok(SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED)
+        }
+        other => other,
+    }
 }
 
 #[cfg(test)]
@@ -586,6 +616,50 @@ mod tests {
     }
 
     #[test]
+    fn only_workspace_validation_failure_exits_with_reserved_status() {
+        use miette::WrapErr as _;
+        use openshell_core::driver_utils::{
+            SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED, WORKSPACE_VALIDATION_ERROR_CONTEXT,
+        };
+        // Mirror how the sandbox reports the rejection across the boundary.
+        let sandbox_error = Err::<(), _>(miette::miette!(
+            "workspace path component '/workspace/project' is not writable by the sandbox \
+             identity in the image: Permission denied (os error 13)"
+        ))
+        .wrap_err(WORKSPACE_VALIDATION_ERROR_CONTEXT)
+        .unwrap_err();
+        let error = openshell_supervisor::start_agent_error(format!(
+            "process error: boundary process leaf: start process supervisor leaf: {sandbox_error:?}"
+        ));
+        assert_eq!(
+            supervisor_exit(Err(error)).expect("reserved exit status"),
+            SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED
+        );
+        assert!(
+            supervisor_exit(Err(openshell_supervisor::start_agent_error(
+                "connect failed".into()
+            )))
+            .is_err()
+        );
+        // Only an agent start failure carries the rejection, even when another
+        // error's text contains the same words.
+        assert!(
+            supervisor_exit(Err(miette::miette!(
+                "policy sync failed: {WORKSPACE_VALIDATION_ERROR_CONTEXT}"
+            )))
+            .is_err()
+        );
+
+        // A workload's own exit with the reserved status is not a rejection.
+        assert_eq!(
+            supervisor_exit(Ok(SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED)).unwrap(),
+            1
+        );
+        assert_eq!(supervisor_exit(Ok(0)).unwrap(), 0);
+        assert_eq!(supervisor_exit(Ok(143)).unwrap(), 143);
+    }
+
+    #[test]
     fn isolation_backend_is_the_default_role() {
         let directory = tempfile::tempdir().expect("temporary runtime descriptor directory");
         let descriptor_path = directory.path().join("runtime-descriptor.json");
@@ -605,7 +679,14 @@ mod tests {
         assert_eq!(args.role, SupervisorRole::IsolationBackend);
         assert!(validate_role_arguments(&args).is_ok());
         assert_eq!(
-            backend_descriptor(&args)
+            backend_descriptor(&args, None).unwrap().backend_name,
+            openshell_sandbox_backend::BACKEND_NAME
+        );
+        let admitted = backend_descriptor(&args, Some("openshell-test-backend")).unwrap();
+        assert_eq!(admitted.backend_name, "openshell-test-backend");
+        assert_eq!(admitted.payload, vec![0]);
+        assert_eq!(
+            backend_descriptor(&args, None)
                 .expect("runtime descriptor")
                 .payload,
             vec![0]
@@ -667,6 +748,7 @@ mod tests {
     #[test]
     fn completion_marker_must_be_absolute() {
         assert!(validate_main_exit_marker(Some(Path::new("relative"))).is_err());
-        assert!(validate_main_exit_marker(Some(Path::new("/run/openshell/main-exit"))).is_ok());
+        let absolute = std::env::temp_dir().join("openshell-main-exit");
+        assert!(validate_main_exit_marker(Some(&absolute)).is_ok());
     }
 }
