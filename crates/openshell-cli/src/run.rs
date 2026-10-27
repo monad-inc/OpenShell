@@ -3082,6 +3082,7 @@ fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
             "cleanup_retry_time": record.cleanup_retry_time.as_ref().map(ToString::to_string),
             "driver_operation_pending": record.driver_operation_pending,
             "driver_operation_id": record.driver_operation_id,
+            "driver_operation_owner": record.driver_operation_owner,
         }));
     serde_json::json!({
         "id": sandbox.object_id(),
@@ -8464,6 +8465,7 @@ mod tests {
                 Some(openshell_core::proto::SandboxProvisioning {
                     driver_operation_pending: pending,
                     driver_operation_id: "operation-1".into(),
+                    driver_operation_owner: "gateway-0/process".into(),
                     ..Default::default()
                 });
             assert_eq!(
@@ -8473,6 +8475,10 @@ mod tests {
             assert_eq!(
                 super::sandbox_to_json(&sandbox)["provisioning"]["driver_operation_id"],
                 "operation-1"
+            );
+            assert_eq!(
+                super::sandbox_to_json(&sandbox)["provisioning"]["driver_operation_owner"],
+                "gateway-0/process"
             );
         }
     }

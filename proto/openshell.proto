@@ -3884,7 +3884,9 @@ message SandboxProvisioning {
   google.protobuf.Timestamp admission_start_time = 13;
   // An owned driver create/start future is still pending. Claimed before
   // dispatch and cleared on its actual success or error response. Monitor
-  // interruption, owner loss, and StopSandbox/NotFound do not clear it.
+  // interruption and StopSandbox/NotFound do not clear it. With an in-process
+  // driver, the reconciler clears it once the owning gateway process has
+  // stopped heartbeating (see driver_operation_owner).
   // While set, cleanup cannot complete and retry/deletion remain blocked.
   // This does not strengthen a driver's transport-error settlement contract.
   bool driver_operation_pending = 14;
@@ -3892,6 +3894,11 @@ message SandboxProvisioning {
   // restart. Retained after settlement to reject delayed callbacks from an
   // earlier operation on the same attempt and runtime generation.
   string driver_operation_id = 15;
+  // Gateway process incarnation that claimed the operation. An in-process
+  // driver's operation cannot outlive that process, so a pending operation
+  // whose owner stopped heartbeating is taken over by the reconciler. Empty
+  // on operations claimed before ownership was recorded.
+  string driver_operation_owner = 16;
 }
 
 // Create-time request to expose one loopback HTTP service in a sandbox.
