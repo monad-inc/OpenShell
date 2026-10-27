@@ -690,6 +690,9 @@ pub struct ComputeRuntime {
     ssh_identities: Arc<OnceLock<crate::ssh_identity::SshIdentityStore>>,
     /// This process as the owner of claimed driver operations.
     operation_owner: Arc<operation_owner::OperationOwner>,
+    /// The driver runs inside this process, so its operations cannot outlive
+    /// it. Only then are abandoned operations taken over.
+    driver_in_process: bool,
 }
 
 pub struct SandboxSyncGuard {
@@ -785,12 +788,19 @@ impl ComputeRuntime {
             sync_lock: Arc::new(Mutex::new(())),
             lifecycle_gates: Arc::new(LifecycleGateRegistry::default()),
             operation_owner: Arc::new(operation_owner::OperationOwner::new(&lease::replica_id())),
+            driver_in_process: false,
             replica_id: lease::replica_id(),
             rootfs_tar_staging,
             restart_authority: Arc::new(OnceLock::new()),
             restart_notify: Arc::new(Notify::new()),
             ssh_identities: Arc::new(OnceLock::new()),
         })
+    }
+
+    /// Record that the driver runs inside this gateway process.
+    pub(crate) fn with_driver_in_process(mut self) -> Self {
+        self.driver_in_process = true;
+        self
     }
 
     pub(crate) fn configure_ssh_identities(
@@ -7630,6 +7640,7 @@ pub fn new_test_runtime_with_driver(
         lifecycle_gates: Arc::new(LifecycleGateRegistry::default()),
         replica_id: "test-replica".to_string(),
         operation_owner: Arc::new(operation_owner::OperationOwner::new("test-replica")),
+        driver_in_process: true,
         rootfs_tar_staging: Arc::new(rootfs_tar::RootfsTarStagingRegistry::disabled()),
         restart_authority: Arc::new(OnceLock::new()),
         restart_notify: Arc::new(Notify::new()),
@@ -8725,6 +8736,7 @@ mod tests {
             lifecycle_gates: Arc::new(LifecycleGateRegistry::default()),
             replica_id: "test-replica".to_string(),
             operation_owner: Arc::new(operation_owner::OperationOwner::new("test-replica")),
+            driver_in_process: true,
             rootfs_tar_staging: Arc::new(rootfs_tar::RootfsTarStagingRegistry::disabled()),
             restart_authority: Arc::new(OnceLock::new()),
             restart_notify: Arc::new(Notify::new()),
@@ -19000,6 +19012,13 @@ mod tests {
             .driver_operation_owner
     }
 
+    async fn assert_pending(runtime: &ComputeRuntime, id: &str, pending: bool) {
+        assert_eq!(
+            provisioning_deadline::driver_operation_pending(&stored(runtime, id).await),
+            pending
+        );
+    }
+
     #[tokio::test]
     async fn restart_abandoned_by_a_stopped_gateway_is_taken_over_and_retried() {
         let driver = ControlledDriver::new();
@@ -19011,11 +19030,10 @@ mod tests {
         runtime.restart_due_sandboxes().await.unwrap();
         assert_eq!(driver.stop_calls(), 0);
 
-        // The owner left no presence. It may not have heartbeated yet, so
-        // its operation is held for a full takeover delay first.
-        let mut unknown = operation_owner::UnknownOwners::default();
+        // The owner's presence never changes (here it has none), so its
+        // operation is taken over once that has lasted the takeover delay.
+        let mut observations = operation_owner::Observations::default();
         let first_seen = Instant::now();
-        let now_ms = openshell_core::time::now_ms();
         for elapsed in [
             Duration::ZERO,
             operation_owner::ORPHAN_AFTER
@@ -19023,18 +19041,15 @@ mod tests {
                 .unwrap(),
         ] {
             runtime
-                .take_over_orphaned_operations(&mut unknown, first_seen + elapsed, now_ms)
+                .take_over_orphaned_operations(&mut observations, first_seen + elapsed)
                 .await
                 .unwrap();
-            assert!(provisioning_deadline::driver_operation_pending(
-                &stored(&runtime, "sb-orphan").await
-            ));
+            assert_pending(&runtime, "sb-orphan", true).await;
         }
         runtime
             .take_over_orphaned_operations(
-                &mut unknown,
+                &mut observations,
                 first_seen + operation_owner::ORPHAN_AFTER,
-                now_ms,
             )
             .await
             .unwrap();
@@ -19057,7 +19072,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn operation_is_taken_over_once_its_owner_stops_heartbeating() {
+    async fn heartbeating_owner_keeps_its_operation_until_its_presence_stops_changing() {
         let driver = ControlledDriver::new();
         let runtime = test_runtime(driver.clone()).await;
         let owner = operation_owner::OperationOwner::new("gateway-0");
@@ -19073,30 +19088,157 @@ mod tests {
             Code::FailedPrecondition
         );
 
-        let mut unknown = operation_owner::UnknownOwners::default();
-        let now = Instant::now();
-        let heartbeat_ms = openshell_core::time::now_ms();
-        let orphan_after_ms = i64::try_from(operation_owner::ORPHAN_AFTER.as_millis()).unwrap();
+        let mut observations = operation_owner::Observations::default();
+        let start = Instant::now();
+        let orphan_after = operation_owner::ORPHAN_AFTER;
+        runtime
+            .take_over_orphaned_operations(&mut observations, start)
+            .await
+            .unwrap();
+        // Heartbeats restart the clock however old the owner's own timestamps
+        // look, so skew between replicas cannot cause a takeover.
+        owner.heartbeat(&runtime.store).await.unwrap();
+        runtime
+            .take_over_orphaned_operations(&mut observations, start + orphan_after)
+            .await
+            .unwrap();
+        assert_pending(&runtime, "sb-owned", true).await;
         runtime
             .take_over_orphaned_operations(
-                &mut unknown,
-                now,
-                heartbeat_ms + orphan_after_ms - 1_000,
+                &mut observations,
+                start
+                    + (orphan_after * 2)
+                        .checked_sub(Duration::from_secs(1))
+                        .unwrap(),
             )
             .await
             .unwrap();
-        assert!(provisioning_deadline::driver_operation_pending(
-            &stored(&runtime, "sb-owned").await
-        ));
+        assert_pending(&runtime, "sb-owned", true).await;
 
         runtime
-            .take_over_orphaned_operations(&mut unknown, now, heartbeat_ms + orphan_after_ms)
+            .take_over_orphaned_operations(&mut observations, start + orphan_after * 2)
             .await
             .unwrap();
-        assert!(!provisioning_deadline::driver_operation_pending(
-            &stored(&runtime, "sb-owned").await
-        ));
+        assert_pending(&runtime, "sb-owned", false).await;
         runtime.delete_sandbox("default", "owned").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn operation_without_a_recorded_owner_waits_the_longer_delay() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        // Claimed before owners were recorded, or erased by an older gateway
+        // rewriting the record during a rolling upgrade.
+        let sandbox = abandoned_restart("sb-unowned", "unowned", "");
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let mut observations = operation_owner::Observations::default();
+        let start = Instant::now();
+        for elapsed in [
+            Duration::ZERO,
+            operation_owner::ORPHAN_AFTER,
+            operation_owner::UNOWNED_AFTER
+                .checked_sub(Duration::from_secs(1))
+                .unwrap(),
+        ] {
+            runtime
+                .take_over_orphaned_operations(&mut observations, start + elapsed)
+                .await
+                .unwrap();
+            assert_pending(&runtime, "sb-unowned", true).await;
+        }
+        runtime
+            .take_over_orphaned_operations(
+                &mut observations,
+                start + operation_owner::UNOWNED_AFTER,
+            )
+            .await
+            .unwrap();
+        assert_pending(&runtime, "sb-unowned", false).await;
+    }
+
+    #[tokio::test]
+    async fn late_response_from_the_previous_owner_cannot_settle_a_taken_over_operation() {
+        let driver = ControlledDriver::new();
+        driver.block_start();
+        let runtime = test_runtime(driver.clone()).await;
+        let mut other = runtime.clone();
+        other.sync_lock = Arc::new(Mutex::new(()));
+        other.lifecycle_gates = Arc::new(LifecycleGateRegistry::default());
+        other.operation_owner = Arc::new(operation_owner::OperationOwner::new("gateway-1"));
+        runtime
+            .store
+            .put_message(&lost_runtime_restart("sb-late", "late"))
+            .await
+            .unwrap();
+        let restarting = runtime.clone();
+        let restart =
+            tokio::spawn(async move { restarting.restart_sandbox_runtime("sb-late").await });
+        driver.start_started.notified().await;
+        wait_driver_pending(&runtime, "sb-late", true).await;
+
+        // The owner wrote no presence here, so to the other replica it is gone.
+        let mut observations = operation_owner::Observations::default();
+        let start = Instant::now();
+        for elapsed in [Duration::ZERO, operation_owner::ORPHAN_AFTER] {
+            other
+                .take_over_orphaned_operations(&mut observations, start + elapsed)
+                .await
+                .unwrap();
+        }
+        let taken = stored(&runtime, "sb-late").await;
+        assert!(!provisioning_deadline::driver_operation_pending(&taken));
+
+        driver.release_start();
+        assert!(restart.await.unwrap().is_err());
+        let after = stored(&runtime, "sb-late").await;
+        assert!(provisioning_operation::same_operation(&after, &taken));
+        assert!(!provisioning_deadline::driver_operation_pending(&after));
+        assert_eq!(driver.start_calls(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_that_hangs_fences_and_recovery_unfences() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let owner = Arc::new(operation_owner::OperationOwner::new("gateway-0"));
+        let hang = Arc::new(AtomicBool::new(true));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let started = tokio::time::Instant::now();
+        let heartbeats = tokio::spawn({
+            let owner = owner.clone();
+            let hang = hang.clone();
+            async move {
+                owner
+                    .run_heartbeats(
+                        || {
+                            let hang = hang.load(Ordering::SeqCst);
+                            async move {
+                                if hang {
+                                    std::future::pending::<()>().await;
+                                }
+                                Ok(())
+                            }
+                        },
+                        shutdown_rx,
+                    )
+                    .await;
+            }
+        });
+
+        owner.wait_fenced().await;
+        let fenced_after = started.elapsed();
+        assert!(
+            fenced_after >= operation_owner::FENCE_AFTER,
+            "{fenced_after:?}"
+        );
+        assert!(fenced_after <= Duration::from_secs(75), "{fenced_after:?}");
+
+        hang.store(false, Ordering::SeqCst);
+        tokio::time::sleep(operation_owner::HEARTBEAT_INTERVAL * 2).await;
+        assert!(!owner.is_fenced());
+
+        shutdown_tx.send(true).unwrap();
+        heartbeats.await.unwrap();
+        assert!(owner.is_fenced(), "shutdown fences in-flight operations");
     }
 
     #[tokio::test]
@@ -19117,17 +19259,15 @@ mod tests {
         assert_eq!(operation_owner_of(&pending), runtime.operation_owner.id());
 
         // A process never takes over its own operations, however old.
-        runtime
-            .take_over_orphaned_operations(
-                &mut operation_owner::UnknownOwners::default(),
-                Instant::now() + operation_owner::ORPHAN_AFTER * 2,
-                openshell_core::time::now_ms() + 3_600_000,
-            )
-            .await
-            .unwrap();
-        assert!(provisioning_deadline::driver_operation_pending(
-            &stored(&runtime, "sb-fenced").await
-        ));
+        let mut observations = operation_owner::Observations::default();
+        let start = Instant::now();
+        for elapsed in [Duration::ZERO, operation_owner::UNOWNED_AFTER * 2] {
+            runtime
+                .take_over_orphaned_operations(&mut observations, start + elapsed)
+                .await
+                .unwrap();
+        }
+        assert_pending(&runtime, "sb-fenced", true).await;
 
         runtime.operation_owner.set_fenced(true);
         let error = restart.await.unwrap().unwrap_err();

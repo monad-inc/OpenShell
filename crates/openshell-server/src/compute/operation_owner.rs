@@ -11,20 +11,37 @@
 //! from API requests already sent, which the backend commits or rejects within
 //! its own request timeout. Each process therefore heartbeats a presence row
 //! keyed by a per-process incarnation, so a restarted container is a new owner
-//! even though it keeps its replica ID. A process that cannot heartbeat for
-//! [`FENCE_AFTER`] abandons its own driver operations. The reconciler takes
-//! over a pending operation once its owner's presence is [`ORPHAN_AFTER`] old;
-//! the gap between the two covers requests that were already in flight.
+//! even though it keeps its replica ID.
+//!
+//! - A process whose last successful heartbeat began [`FENCE_AFTER`] ago,
+//!   because writes fail or hang, abandons the operations it owns. So does a
+//!   process that is shutting down.
+//! - The reconciler takes over a pending operation once its owner's presence
+//!   row has not changed for [`ORPHAN_AFTER`], measured on the reconciler's
+//!   own clock, so clock skew between replicas cannot cause a takeover. The
+//!   gap between the two delays covers requests that were already in flight.
+//! - An operation with no recorded owner, claimed before owners were recorded
+//!   or with its owner erased by an older gateway rewriting the record during
+//!   a rolling upgrade, is taken over after [`UNOWNED_AFTER`], longer than any
+//!   driver operation runs.
 //!
 //! Taking over settles the operation with an unknown outcome and rotates its
 //! ID, as a driver error would. An automatic restart becomes due again, and
 //! the restart sweep starts a fresh runtime generation, which stops whatever
-//! the abandoned operation left behind first.
+//! the abandoned operation left behind first. Other operations are not
+//! re-driven: the sandbox can be retried or deleted again, and its
+//! provisioning deadline, if armed, still applies.
 //!
-//! Drivers running in a separate process can keep working after the gateway
-//! stops, so their pending operations keep the original contract.
+//! Residual risk: a process frozen for longer than [`ORPHAN_AFTER`] (for
+//! example a paused VM) cannot fence itself, and may resume one driver call it
+//! had already started after the takeover. The restart that follows the
+//! takeover stops stale generations first, which bounds the damage.
+//!
+//! Drivers that do not run inside the gateway process can keep working after
+//! it stops, so their pending operations keep the original contract.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -46,13 +63,19 @@ const PAGE_SIZE: u32 = 1000;
 
 /// How often each gateway process refreshes its presence.
 pub(super) const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
-/// A process that has not refreshed its presence for this long abandons the
-/// driver operations it owns.
+/// A heartbeat write that takes longer than this counts as failed.
+pub(super) const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
+/// A process whose last successful heartbeat began this long ago abandons the
+/// driver operations it owns. With [`HEARTBEAT_INTERVAL`] and
+/// [`HEARTBEAT_TIMEOUT`] it notices within 75 seconds.
 pub(super) const FENCE_AFTER: Duration = Duration::from_mins(1);
-/// A pending operation whose owner has not refreshed its presence for this
-/// long is taken over. Exceeds [`FENCE_AFTER`] by more than the Kubernetes API
-/// server's request timeout.
-pub(super) const ORPHAN_AFTER: Duration = Duration::from_mins(3);
+/// A pending operation whose owner's presence has not changed for this long
+/// is taken over. Exceeds the 75 seconds a process may take to fence itself
+/// by more than a Kubernetes client timeout (30s) plus the API server's
+/// request timeout (60s).
+pub(super) const ORPHAN_AFTER: Duration = Duration::from_mins(4);
+/// A pending operation with no recorded owner is taken over after this long.
+pub(super) const UNOWNED_AFTER: Duration = Duration::from_mins(15);
 /// Presence rows of processes gone for this long are deleted.
 const PRESENCE_RETENTION: Duration = Duration::from_hours(24);
 
@@ -98,7 +121,7 @@ impl OperationOwner {
         let _ = fenced.wait_for(|fenced| *fenced).await;
     }
 
-    pub(super) async fn heartbeat(&self, store: &Store) -> Result<(), PersistenceError> {
+    pub(super) async fn heartbeat(&self, store: &Store) -> Result<(), String> {
         store
             .put_if(
                 PRESENCE_OBJECT_TYPE,
@@ -111,65 +134,91 @@ impl OperationOwner {
             )
             .await
             .map(|_| ())
+            .map_err(|error| error.to_string())
     }
 
-    /// Refresh this process's presence until shutdown, fencing its operations
-    /// while the store cannot be reached. The row is left behind at shutdown:
-    /// its age is what lets the reconciler take over sooner.
+    /// Refresh this process's presence until shutdown. The row is left behind
+    /// at shutdown; it simply stops changing.
     pub(super) async fn heartbeat_loop(
         self: Arc<Self>,
         store: Arc<Store>,
-        mut shutdown: watch::Receiver<bool>,
+        shutdown: watch::Receiver<bool>,
     ) {
-        let mut last_heartbeat = Instant::now();
+        let owner = self.clone();
+        self.run_heartbeats(|| owner.heartbeat(&store), shutdown)
+            .await;
+    }
+
+    /// Fence on elapsed time since the last successful heartbeat began, so a
+    /// write that hangs fences as surely as one that fails.
+    pub(super) async fn run_heartbeats<F, Fut>(
+        &self,
+        mut heartbeat: F,
+        mut shutdown: watch::Receiver<bool>,
+    ) where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<(), String>>,
+    {
+        let mut last_success = tokio::time::Instant::now();
         loop {
-            match self.heartbeat(&store).await {
-                Ok(()) => {
-                    last_heartbeat = Instant::now();
+            let started = tokio::time::Instant::now();
+            match tokio::time::timeout(HEARTBEAT_TIMEOUT, heartbeat()).await {
+                Ok(Ok(())) => {
+                    last_success = started;
                     if self.is_fenced() {
                         info!(owner = %self.id, "Driver operation ownership restored");
                     }
                     self.set_fenced(false);
                 }
-                Err(error) => {
+                Ok(Err(error)) => {
                     warn!(owner = %self.id, %error, "Failed to refresh gateway process presence");
-                    if last_heartbeat.elapsed() >= FENCE_AFTER && !self.is_fenced() {
-                        warn!(
-                            owner = %self.id,
-                            "Abandoning owned driver operations; the reconciler will take them over"
-                        );
-                        self.set_fenced(true);
-                    }
                 }
+                Err(_) => {
+                    warn!(owner = %self.id, "Timed out refreshing gateway process presence");
+                }
+            }
+            if last_success.elapsed() >= FENCE_AFTER && !self.is_fenced() {
+                warn!(
+                    owner = %self.id,
+                    "Abandoning owned driver operations; the reconciler will take them over"
+                );
+                self.set_fenced(true);
             }
             tokio::select! {
                 () = tokio::time::sleep(HEARTBEAT_INTERVAL) => {}
-                _ = shutdown.changed() => return,
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        // Settle in-flight operations now rather than leave
+                        // them to a takeover once this process is gone.
+                        self.set_fenced(true);
+                        return;
+                    }
+                }
             }
         }
     }
 }
 
-/// Pending operations whose owner's presence could not be found, keyed by
-/// sandbox and operation ID, with when this process first saw them. Covers
-/// operations claimed before owners were recorded and owners that have not
-/// written their first heartbeat yet.
+/// What the takeover sweep has seen, on this process's clock.
 #[derive(Debug, Default)]
-pub(super) struct UnknownOwners(HashMap<(String, String), Instant>);
+pub(super) struct Observations {
+    /// Per owner: its presence row's version and when that last changed.
+    /// `None` while the owner has no row.
+    owners: HashMap<String, (Option<(u64, i64)>, Instant)>,
+    /// Pending operations with no recorded owner, by sandbox and operation
+    /// ID, with when they were first seen.
+    unowned: HashMap<(String, String), Instant>,
+}
 
 impl ComputeRuntime {
     pub(super) async fn operation_takeover_loop(
         self: Arc<Self>,
         mut cancel: watch::Receiver<bool>,
     ) {
-        let mut unknown = UnknownOwners::default();
+        let mut observations = Observations::default();
         loop {
             if let Err(error) = self
-                .take_over_orphaned_operations(
-                    &mut unknown,
-                    Instant::now(),
-                    openshell_core::time::now_ms(),
-                )
+                .take_over_orphaned_operations(&mut observations, Instant::now())
                 .await
             {
                 warn!(%error, "Driver operation takeover sweep failed");
@@ -181,19 +230,17 @@ impl ComputeRuntime {
         }
     }
 
-    /// `now` measures how long an owner has been unknown on this process's
-    /// clock; `now_ms` is compared with the store's heartbeat times.
     pub(super) async fn take_over_orphaned_operations(
         &self,
-        unknown: &mut UnknownOwners,
+        observations: &mut Observations,
         now: Instant,
-        now_ms: i64,
     ) -> Result<(), String> {
-        if self.driver_process.is_some() {
+        if !self.driver_in_process {
             return Ok(());
         }
-        let presence = self.read_presence(now_ms).await?;
-        let mut still_unknown = HashSet::new();
+        let presence = self.read_presence().await?;
+        let mut seen_owners = HashSet::new();
+        let mut seen_unowned = HashSet::new();
         let mut offset = 0;
         loop {
             let records = self
@@ -222,16 +269,25 @@ impl ComputeRuntime {
                 if owner == self.operation_owner.id() {
                     continue;
                 }
-                let orphaned = if let Some(&updated_at_ms) = presence.get(owner) {
-                    now_ms.saturating_sub(updated_at_ms) >= millis(ORPHAN_AFTER)
-                } else {
+                let orphaned = if owner.is_empty() {
                     let key = (
                         sandbox.object_id().to_string(),
                         provisioning.driver_operation_id.clone(),
                     );
-                    let first_seen = *unknown.0.entry(key.clone()).or_insert(now);
-                    still_unknown.insert(key);
-                    now.saturating_duration_since(first_seen) >= ORPHAN_AFTER
+                    let first_seen = *observations.unowned.entry(key.clone()).or_insert(now);
+                    seen_unowned.insert(key);
+                    now.saturating_duration_since(first_seen) >= UNOWNED_AFTER
+                } else {
+                    let version = presence.get(owner).copied();
+                    let observed = observations
+                        .owners
+                        .entry(owner.to_string())
+                        .or_insert((version, now));
+                    if observed.0 != version {
+                        *observed = (version, now);
+                    }
+                    seen_owners.insert(owner.to_string());
+                    now.saturating_duration_since(observed.1) >= ORPHAN_AFTER
                 };
                 if orphaned && let Err(error) = self.take_over_operation(&sandbox).await {
                     warn!(
@@ -247,12 +303,20 @@ impl ComputeRuntime {
             }
             offset += u32::try_from(page_len).expect("takeover page length is capped");
         }
-        unknown.0.retain(|key, _| still_unknown.contains(key));
+        observations
+            .owners
+            .retain(|owner, _| seen_owners.contains(owner));
+        observations
+            .unowned
+            .retain(|key, _| seen_unowned.contains(key));
         Ok(())
     }
 
-    /// Latest heartbeat per owner. Deletes presence rows past retention.
-    async fn read_presence(&self, now_ms: i64) -> Result<HashMap<String, i64>, String> {
+    /// Each owner's presence version (resource version, update time). Deletes
+    /// rows untouched for [`PRESENCE_RETENTION`]; that comparison is the only
+    /// one made against another process's clock, and a day dwarfs any skew.
+    async fn read_presence(&self) -> Result<HashMap<String, (u64, i64)>, String> {
+        let now_ms = openshell_core::time::now_ms();
         let mut presence = HashMap::new();
         let mut offset = 0;
         loop {
@@ -270,7 +334,7 @@ impl ComputeRuntime {
                         .delete_if(PRESENCE_OBJECT_TYPE, &record.id, record.resource_version)
                         .await;
                 }
-                presence.insert(record.id, record.updated_at_ms);
+                presence.insert(record.id, (record.resource_version, record.updated_at_ms));
             }
             if page_len < PAGE_SIZE as usize {
                 break;

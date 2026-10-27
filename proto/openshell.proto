@@ -3897,7 +3897,8 @@ message SandboxProvisioning {
   // Gateway process incarnation that claimed the operation. An in-process
   // driver's operation cannot outlive that process, so a pending operation
   // whose owner stopped heartbeating is taken over by the reconciler. Empty
-  // on operations claimed before ownership was recorded.
+  // on operations claimed before ownership was recorded, or rewritten by a
+  // gateway that predates this field; those wait a longer takeover delay.
   string driver_operation_owner = 16;
 }
 

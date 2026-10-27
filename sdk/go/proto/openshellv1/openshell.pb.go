@@ -18031,7 +18031,8 @@ type SandboxProvisioning struct {
 	// Gateway process incarnation that claimed the operation. An in-process
 	// driver's operation cannot outlive that process, so a pending operation
 	// whose owner stopped heartbeating is taken over by the reconciler. Empty
-	// on operations claimed before ownership was recorded.
+	// on operations claimed before ownership was recorded, or rewritten by a
+	// gateway that predates this field; those wait a longer takeover delay.
 	DriverOperationOwner string `protobuf:"bytes,16,opt,name=driver_operation_owner,json=driverOperationOwner,proto3" json:"driver_operation_owner,omitempty"`
 	unknownFields        protoimpl.UnknownFields
 	sizeCache            protoimpl.SizeCache
