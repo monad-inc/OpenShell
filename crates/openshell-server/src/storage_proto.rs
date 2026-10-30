@@ -146,10 +146,13 @@ mod tests {
     // Legacy payloads decode empty owners; the gateway rebuilds their authority
     // from effective policy rather than trusting persisted owner stamps.
     // Operator credential export adds four public messages and no durable types.
+    // SandboxProvisioning.driver_operation_owner adds one string. Legacy
+    // payloads decode an empty owner, which the takeover sweep watches for the
+    // full takeover delay before treating it as gone.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "5ae8334d9f6212a00c38ba965ff62e567d2846b15f4df8faf85954023da542e7";
+        "644d9dd5df95f763784b21c1dd941e7f0f0e5e31cb342394f07b2c8a4c9a2fd3";
     const DURABLE_SCHEMA_SHA256: &str =
-        "5281143e2825539af6148785c91f9df67f654eb74d215f57940af9314867a55f";
+        "5e929e2f6e07dc976859e38cec5f6af3734fcdb741a7345a6a8988bc7f3135c6";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
         "761dea31a521b0650840fe2a823ad6e36a265ed323ba4506889781d630df0ee3";
     // Encoded with the schema that omitted stable_placeholder. Keep these

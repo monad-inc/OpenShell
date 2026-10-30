@@ -1683,6 +1683,7 @@ async fn build_compute_runtime(
                     supervisor_sessions,
                 )
                 .await
+                .map(ComputeRuntime::with_driver_in_process)
                 .map_err(|error| {
                     Error::execution(format!("failed to create compute runtime: {error}"))
                 })?,

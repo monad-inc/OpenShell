@@ -39,7 +39,8 @@ fn operation_id(sandbox: &Sandbox) -> Option<&str> {
 
 /// Called only inside a CAS that has checked the prior operation is settled.
 /// Legacy rows without an attempt retain their existing lifecycle contract.
-pub(super) fn claim_record(sandbox: &mut Sandbox) {
+/// `owner` is the claiming process; see [`super::operation_owner`].
+pub(super) fn claim_record(sandbox: &mut Sandbox, owner: &str) {
     if let Some(record) = sandbox
         .status
         .as_mut()
@@ -47,6 +48,7 @@ pub(super) fn claim_record(sandbox: &mut Sandbox) {
     {
         record.driver_operation_pending = true;
         record.driver_operation_id = uuid::Uuid::new_v4().to_string();
+        record.driver_operation_owner = owner.to_string();
     }
 }
 
@@ -129,7 +131,18 @@ impl ComputeRuntime {
         // Dropping a JoinHandle detaches its task. Do not abort it on a monitor
         // error or deadline: the remote side may still commit the request.
         let worker = async move {
-            let result = operation.await;
+            // A fenced process can no longer prove it owns the operation, and
+            // the reconciler may take it over. Stop driving it, before dispatch
+            // if already fenced. Requests already sent may still commit; the
+            // takeover delay covers them.
+            let fenced = runtime.operation_owner.clone();
+            let result = tokio::select! {
+                biased;
+                () = fenced.wait_fenced() => Err(Status::unavailable(
+                    "gateway process lost driver operation ownership; outcome remains unknown",
+                )),
+                result = operation => result,
+            };
             let settled = if tracked {
                 let settled = runtime
                     .settle_provisioning_operation(&owned_attempt)
@@ -233,7 +246,7 @@ impl ComputeRuntime {
                 .update_message_cas::<Sandbox, _>(
                     starting.object_id(),
                     sandbox_resource_version(&current),
-                    claim_record,
+                    |sandbox| claim_record(sandbox, self.operation_owner.id()),
                 )
                 .await
             {
@@ -254,7 +267,8 @@ impl ComputeRuntime {
     async fn settle_provisioning_operation(&self, starting: &Sandbox) -> Result<Sandbox, Status> {
         // Keep the observed response in this task across transient persistence
         // failures. A process crash still leaves the durable claim intact;
-        // neither lease expiry nor backend absence can safely clear it.
+        // neither lease expiry nor backend absence can safely clear it. Only
+        // the owner's stopped heartbeat can (see `operation_owner`).
         loop {
             let result = self.try_settle_provisioning_operation(starting).await;
             match result {
