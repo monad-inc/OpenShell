@@ -77,7 +77,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::{OnceCell, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 pub type WatchStream =
     Pin<Box<dyn Stream<Item = Result<WatchSandboxesEvent, KubernetesDriverError>> + Send>>;
@@ -4395,6 +4395,15 @@ impl KubernetesComputeDriver {
         let Some(name) = object.metadata.name.as_deref() else {
             return;
         };
+        // A fail-closed suspension is permanent and otherwise looks like a
+        // deliberate stop, so it has to say so.
+        if cause == SandboxRuntimeSuspensionCause::FailClosed {
+            error!(
+                sandbox = name,
+                operation = sandbox_runtime_bootstrap_operation(object).unwrap_or("<none>"),
+                "suspending sandbox-runtime fail-closed; the sandbox stays stopped until someone acts on it"
+            );
+        }
         let namespace = object
             .metadata
             .namespace
@@ -4443,12 +4452,13 @@ impl KubernetesComputeDriver {
         if sandbox_runtime_bootstrap_operation(object) != Some("create") {
             warn!(
                 sandbox = object.metadata.name.as_deref().unwrap_or("<unknown>"),
-                "suspending stale sandbox-runtime restart bootstrap"
+                operation = sandbox_runtime_bootstrap_operation(object).unwrap_or("<none>"),
+                "suspending stale sandbox-runtime bootstrap"
             );
             self.suspend_sandbox_runtime_after_dependency_failure(
                 lookup_api,
                 object,
-                SandboxRuntimeSuspensionCause::FailClosed,
+                stale_bootstrap_suspension_cause(object),
             )
             .await;
             return;
@@ -4948,6 +4958,21 @@ fn sandbox_runtime_bootstrap_phase_patch(
             }
         }
     })
+}
+
+/// Why a stale bootstrap that is not a create gets suspended. A restart that
+/// outlasts the grace is usually waiting for somewhere to run, as during a node
+/// rotation. The sandbox was meant to be running, so it is a lost runtime: the
+/// workload is suspended all the same, and the gateway starts a fresh generation
+/// under its restart backoff. Failing closed here would leave it Stopped for
+/// good, with nothing to say it did not stop on purpose. Anything else, a stop
+/// above all, stays stopped.
+fn stale_bootstrap_suspension_cause(object: &DynamicObject) -> SandboxRuntimeSuspensionCause {
+    if sandbox_runtime_bootstrap_operation(object) == Some("restart") {
+        SandboxRuntimeSuspensionCause::RuntimeLost
+    } else {
+        SandboxRuntimeSuspensionCause::FailClosed
+    }
 }
 
 fn sandbox_runtime_bootstrap_is_stale(
@@ -8843,6 +8868,51 @@ mod tests {
             .unwrap()
             .remove(ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAPPING);
         assert!(!sandbox_runtime_bootstrap_in_progress(&object));
+    }
+
+    #[test]
+    fn stale_restart_bootstrap_is_a_lost_runtime_and_a_stale_stop_stays_stopped() {
+        let with_operation = |operation: Option<&str>| {
+            let mut annotations = serde_json::Map::new();
+            annotations.insert(
+                ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAPPING.to_string(),
+                serde_json::json!("true"),
+            );
+            if let Some(operation) = operation {
+                annotations.insert(
+                    ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_OPERATION.to_string(),
+                    serde_json::json!(operation),
+                );
+            }
+            serde_json::from_value::<DynamicObject>(serde_json::json!({
+                "metadata": {"annotations": annotations}
+            }))
+            .unwrap()
+        };
+        assert_eq!(
+            stale_bootstrap_suspension_cause(&with_operation(Some("restart"))),
+            SandboxRuntimeSuspensionCause::RuntimeLost
+        );
+        for operation in [Some("stop"), None] {
+            assert_eq!(
+                stale_bootstrap_suspension_cause(&with_operation(operation)),
+                SandboxRuntimeSuspensionCause::FailClosed,
+                "operation {operation:?}"
+            );
+        }
+
+        // The cause is what the gateway reads to replace the runtime, and the
+        // workload is suspended either way.
+        let patch = sandbox_runtime_dependency_suspension_patch(
+            SANDBOX_VERSION_V1BETA1,
+            "7",
+            stale_bootstrap_suspension_cause(&with_operation(Some("restart"))),
+        );
+        assert_eq!(patch["spec"]["operatingMode"], "Suspended");
+        assert_eq!(
+            patch["metadata"]["annotations"][ANNOTATION_SANDBOX_RUNTIME_SUSPENSION_CAUSE],
+            SANDBOX_RUNTIME_SUSPENSION_CAUSE_RUNTIME_LOST
+        );
     }
 
     #[test]
